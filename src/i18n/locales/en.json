@@ -1,0 +1,60 @@
+{
+  "common": {
+    "save": "Save",
+    "cancel": "Cancel",
+    "delete": "Delete",
+    "edit": "Edit",
+    "create": "Create",
+    "loading": "Loading...",
+    "search": "Search",
+    "filter": "Filter",
+    "reset": "Reset",
+    "export": "Export",
+    "exportCsv": "Export CSV",
+    "exportExcel": "Export Excel"
+  },
+  "auth": {
+    "signIn": "Sign In",
+    "signUp": "Sign Up",
+    "signOut": "Sign Out",
+    "email": "Email",
+    "password": "Password",
+    "fullName": "Full Name",
+    "welcome": "Welcome to LLM Insights",
+    "subtitle": "Track your brand visibility across AI platforms"
+  },
+  "nav": {
+    "projects": "Projects",
+    "groups": "Groups",
+    "users": "Users",
+    "account": "Account",
+    "dashboard": "Dashboard"
+  },
+  "projects": {
+    "title": "Projects",
+    "createProject": "Create Project",
+    "projectName": "Project Name",
+    "domain": "Domain",
+    "country": "Country",
+    "brands": "Brands",
+    "competitors": "Competitors",
+    "prompts": "Prompts",
+    "settings": "Settings",
+    "runAudit": "Run Audit",
+    "lastAudit": "Last Audit",
+    "citations": "Citations",
+    "domains": "Domains",
+    "sentiment": "Sentiment"
+  },
+  "audit": {
+    "runAudit": "Run the audit",
+    "selectLlms": "Select LLMs",
+    "enableSentiment": "Enable Sentiment Analysis",
+    "progress": "Audit Progress",
+    "fetchingData": "Fetching data from LLMs",
+    "parsingCitations": "Parsing citations",
+    "runningSentiment": "Running sentiment analysis",
+    "savingResults": "Saving results",
+    "auditCompleted": "Audit completed"
+  }
+}

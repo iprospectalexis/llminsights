@@ -1,0 +1,149 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --brand-primary: 99 102 241;
+  --brand-secondary: 139 92 246;
+  --brand-tertiary: 59 130 246;
+  --success: 34 197 94;
+  --warning: 251 191 36;
+  --error: 239 68 68;
+  --bg-surface: 255 255 255;
+  --text-primary: 17 24 39;
+  --text-muted: 107 114 128;
+  --border: 229 231 235;
+}
+
+.dark {
+  --bg-surface: 17 24 39;
+  --text-primary: 248 250 252;
+  --text-muted: 203 213 225;
+  --border: 71 85 105;
+  --brand-primary: 129 140 248;
+  --brand-secondary: 167 139 250;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', sans-serif;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Ensure select options and date/time inputs use the same font */
+select, select option, input[type="time"], input[type="date"] {
+  font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', sans-serif !important;
+}
+
+/* Ensure calendar/time picker dropdowns use the same font */
+input[type="time"]::-webkit-calendar-picker-indicator,
+input[type="date"]::-webkit-calendar-picker-indicator,
+input[type="time"]::-webkit-datetime-edit,
+input[type="date"]::-webkit-datetime-edit,
+input[type="time"]::-webkit-datetime-edit-fields-wrapper,
+input[type="date"]::-webkit-datetime-edit-fields-wrapper {
+  font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', sans-serif !important;
+}
+
+.bg-brand-primary {
+  background-color: rgb(var(--brand-primary));
+}
+
+.bg-brand-secondary {
+  background-color: rgb(var(--brand-secondary));
+}
+
+.text-brand-primary {
+  color: rgb(var(--brand-primary));
+}
+
+.text-brand-secondary {
+  color: rgb(var(--brand-secondary));
+}
+
+.border-brand-primary {
+  border-color: rgb(var(--brand-primary));
+}
+
+.ring-brand-primary {
+  --tw-ring-color: rgb(var(--brand-primary) / 0.5);
+}
+
+.focus\:ring-brand-primary\/20:focus {
+  --tw-ring-color: rgb(var(--brand-primary) / 0.2);
+}
+
+/* Custom gradient utilities */
+.bg-brand-gradient {
+  background: linear-gradient(135deg, rgb(var(--brand-primary)) 0%, rgb(var(--brand-secondary)) 100%);
+}
+
+.text-brand-gradient {
+  background: linear-gradient(135deg, rgb(var(--brand-primary)) 0%, rgb(var(--brand-secondary)) 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+/* Smooth transitions */
+* {
+  transition-property: color, background-color, border-color, text-decoration-color, fill, stroke, opacity, box-shadow, transform, filter, backdrop-filter;
+  transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+  transition-duration: 150ms;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgb(var(--text-muted) / 0.3);
+  border-radius: 1rem;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgb(var(--text-muted) / 0.5);
+}
+
+/* Focus styles */
+.focus-ring {
+  @apply focus:outline-none focus:ring-2 focus:ring-brand-primary/20 focus:border-brand-primary;
+}
+
+/* Animation utilities */
+@keyframes fade-in-up {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-fade-in-up {
+  animation: fade-in-up 0.5s ease-out;
+}
+
+/* Glass effect */
+.glass {
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  background: rgba(255, 255, 255, 0.8);
+}
+
+.dark .glass {
+  background: rgba(17, 24, 39, 0.8);
+}

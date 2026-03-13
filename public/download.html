@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Download Project Backup</title>
+    <style>
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+        .container {
+            background: white;
+            padding: 3rem;
+            border-radius: 1rem;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            text-align: center;
+            max-width: 400px;
+        }
+        h1 {
+            margin: 0 0 1rem 0;
+            color: #1a202c;
+            font-size: 1.75rem;
+        }
+        p {
+            color: #4a5568;
+            margin-bottom: 2rem;
+            line-height: 1.6;
+        }
+        .btn {
+            display: inline-block;
+            background: #667eea;
+            color: white;
+            padding: 1rem 2rem;
+            border-radius: 0.5rem;
+            text-decoration: none;
+            font-weight: 600;
+            transition: all 0.2s;
+            border: none;
+            cursor: pointer;
+            font-size: 1rem;
+        }
+        .btn:hover {
+            background: #5568d3;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+        }
+        .file-info {
+            background: #f7fafc;
+            padding: 1rem;
+            border-radius: 0.5rem;
+            margin-top: 1.5rem;
+            font-size: 0.875rem;
+            color: #4a5568;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📦 Project Backup</h1>
+        <p>Your complete project backup is ready to download.</p>
+        <a href="/project-backup.zip" download class="btn">Download Backup</a>
+        <div class="file-info">
+            <strong>File:</strong> project-backup.zip<br>
+            <strong>Size:</strong> ~1.5 MB
+        </div>
+    </div>
+</body>
+</html>

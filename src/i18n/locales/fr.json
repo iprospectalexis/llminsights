@@ -1,0 +1,60 @@
+{
+  "common": {
+    "save": "Enregistrer",
+    "cancel": "Annuler",
+    "delete": "Supprimer",
+    "edit": "Modifier",
+    "create": "Créer",
+    "loading": "Chargement...",
+    "search": "Rechercher",
+    "filter": "Filtrer",
+    "reset": "Réinitialiser",
+    "export": "Exporter",
+    "exportCsv": "Exporter CSV",
+    "exportExcel": "Exporter Excel"
+  },
+  "auth": {
+    "signIn": "Se connecter",
+    "signUp": "S'inscrire",
+    "signOut": "Se déconnecter",
+    "email": "Email",
+    "password": "Mot de passe",
+    "fullName": "Nom complet",
+    "welcome": "Bienvenue sur LLM Insights",
+    "subtitle": "Suivez la visibilité de votre marque sur les plateformes IA"
+  },
+  "nav": {
+    "projects": "Projets",
+    "groups": "Groupes",
+    "users": "Utilisateurs",
+    "account": "Compte",
+    "dashboard": "Tableau de bord"
+  },
+  "projects": {
+    "title": "Projets",
+    "createProject": "Créer un projet",
+    "projectName": "Nom du projet",
+    "domain": "Domaine",
+    "country": "Pays",
+    "brands": "Marques",
+    "competitors": "Concurrents",
+    "prompts": "Prompts",
+    "settings": "Paramètres",
+    "runAudit": "Lancer un audit",
+    "lastAudit": "Dernier audit",
+    "citations": "Citations",
+    "domains": "Domaines",
+    "sentiment": "Sentiment"
+  },
+  "audit": {
+    "runAudit": "Lancer l'audit",
+    "selectLlms": "Sélectionner les LLMs",
+    "enableSentiment": "Activer l'analyse de sentiment",
+    "progress": "Progression de l'audit",
+    "fetchingData": "Récupération des données des LLMs",
+    "parsingCitations": "Analyse des citations",
+    "runningSentiment": "Analyse de sentiment en cours",
+    "savingResults": "Sauvegarde des résultats",
+    "auditCompleted": "Audit terminé"
+  }
+}
