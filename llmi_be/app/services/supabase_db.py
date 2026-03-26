@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 _JSONB_COLUMNS = {
     "raw_response_data", "answer_competitors", "provider_config",
     "metadata", "config", "settings", "extra",
+    "citations", "all_sources", "links_attached",
 }
 
 # Columns that are text[] (PostgreSQL arrays) — pass as native Python lists
