@@ -9,7 +9,8 @@ import { Modal } from '../components/ui/Modal';
 import { supabase } from '../lib/supabase';
 import {
   Calendar, FileText, BarChart3, Globe, ArrowLeft, Brain,
-  Filter, Download, ExternalLink, MessageSquare, Clock, Eye, X
+  Filter, Download, ExternalLink, MessageSquare, Clock, Eye, X,
+  Award, TrendingUp, ThumbsUp, ThumbsDown, Minus, Users
 } from 'lucide-react';
 import { format } from 'date-fns';
 
@@ -40,6 +41,18 @@ interface LLMResponse {
   country: string;
   raw_response_data: any;
   web_search_query?: string | null;
+  answer_competitors?: {
+    brands?: Array<{
+      name: string;
+      strengths?: string[];
+      weaknesses?: string[];
+      mention_type?: 'recommended' | 'compared' | 'mentioned';
+      rank?: number | null;
+    }>;
+    error?: string;
+  } | null;
+  sentiment_score?: number | null;
+  sentiment_label?: 'positive' | 'neutral' | 'negative' | null;
   created_at: string;
   audits: {
     id: string;
@@ -259,6 +272,11 @@ export const PromptDetailPage: React.FC = () => {
       filtered = filtered.filter(response => response.llm === filters.llms);
     }
 
+    // Apply sentiment filter
+    if (filters.sentiment !== 'all') {
+      filtered = filtered.filter(response => response.sentiment_label === filters.sentiment);
+    }
+
     setFilteredResponses(filtered);
   };
 
@@ -298,10 +316,10 @@ export const PromptDetailPage: React.FC = () => {
 
     setLoading(true);
     try {
-      // Fetch project details
+      // Fetch project details with brands
       const { data: projectData } = await supabase
         .from('projects')
-        .select('*')
+        .select('*, brands (*)')
         .eq('id', projectId)
         .single();
 
@@ -333,6 +351,9 @@ export const PromptDetailPage: React.FC = () => {
           country,
           raw_response_data,
           web_search_query,
+          answer_competitors,
+          sentiment_score,
+          sentiment_label,
           created_at,
           audits!inner (
             id,
@@ -530,8 +551,146 @@ export const PromptDetailPage: React.FC = () => {
     })).sort((a: any, b: any) => b.mentions - a.mentions);
   };
 
+  // ── Brand highlighting ──────────────────────────────────────────────
+  const getOwnBrandNames = (): string[] => {
+    return (project?.brands || [])
+      .filter((b: any) => !b.is_competitor)
+      .map((b: any) => b.brand_name?.toLowerCase())
+      .filter(Boolean);
+  };
+
+  const isOwnBrand = (brandName: string): boolean => {
+    const own = getOwnBrandNames();
+    const lower = brandName.toLowerCase();
+    return own.some(ob => lower === ob || lower.includes(ob) || ob.includes(lower));
+  };
+
+  const highlightBrands = (text: string, brands: Array<{ name: string }>) => {
+    if (!brands || brands.length === 0) return <>{text}</>;
+    const brandNames = brands.map(b => b.name).filter(Boolean);
+    if (brandNames.length === 0) return <>{text}</>;
+
+    // Build regex matching all brand names (case-insensitive, longest first)
+    const sorted = [...brandNames].sort((a, b) => b.length - a.length);
+    const escaped = sorted.map(n => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    const regex = new RegExp(`(${escaped.join('|')})`, 'gi');
+
+    const parts = text.split(regex);
+    return (
+      <>
+        {parts.map((part, i) => {
+          const matched = brandNames.find(b => b.toLowerCase() === part.toLowerCase());
+          if (!matched) return <span key={i}>{part}</span>;
+          const own = isOwnBrand(matched);
+          return (
+            <mark
+              key={i}
+              className={
+                own
+                  ? 'bg-amber-200 dark:bg-amber-700/50 text-amber-900 dark:text-amber-100 px-0.5 rounded font-medium'
+                  : 'bg-blue-100 dark:bg-blue-800/40 text-blue-900 dark:text-blue-100 px-0.5 rounded font-medium'
+              }
+              title={own ? 'Your brand' : 'Competitor'}
+            >
+              {part}
+            </mark>
+          );
+        })}
+      </>
+    );
+  };
+
+  const getBrandPillColor = (mentionType?: string, brandName?: string) => {
+    if (brandName && isOwnBrand(brandName)) {
+      return 'bg-amber-100 dark:bg-amber-900/30 text-amber-800 dark:text-amber-200 border border-amber-300 dark:border-amber-700';
+    }
+    switch (mentionType) {
+      case 'recommended':
+        return 'bg-green-100 dark:bg-green-900/30 text-green-800 dark:text-green-200 border border-green-300 dark:border-green-700';
+      case 'compared':
+        return 'bg-blue-100 dark:bg-blue-900/30 text-blue-800 dark:text-blue-200 border border-blue-300 dark:border-blue-700';
+      default:
+        return 'bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300 border border-gray-300 dark:border-gray-600';
+    }
+  };
+
+  const getSentimentIcon = (label?: string | null) => {
+    switch (label) {
+      case 'positive': return <ThumbsUp className="w-3.5 h-3.5" />;
+      case 'negative': return <ThumbsDown className="w-3.5 h-3.5" />;
+      default: return <Minus className="w-3.5 h-3.5" />;
+    }
+  };
+
+  const getSentimentColor = (label?: string | null) => {
+    switch (label) {
+      case 'positive': return 'text-green-600 dark:text-green-400 bg-green-50 dark:bg-green-900/20';
+      case 'negative': return 'text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20';
+      case 'neutral': return 'text-gray-600 dark:text-gray-400 bg-gray-100 dark:bg-gray-700';
+      default: return '';
+    }
+  };
+
+  // ── Competitors aggregation for tab ────────────────────────────────
+  const getCompetitorsAggregation = () => {
+    const brandMap = new Map<string, {
+      name: string;
+      mentions: number;
+      mentionTypes: Map<string, number>;
+      strengths: Set<string>;
+      weaknesses: Set<string>;
+      llms: Set<string>;
+      ranks: number[];
+    }>();
+
+    filteredResponses.forEach(response => {
+      const brands = response.answer_competitors?.brands;
+      if (!brands || !Array.isArray(brands)) return;
+      brands.forEach(brand => {
+        if (!brand.name) return;
+        const key = brand.name.toLowerCase();
+        if (!brandMap.has(key)) {
+          brandMap.set(key, {
+            name: brand.name,
+            mentions: 0,
+            mentionTypes: new Map(),
+            strengths: new Set(),
+            weaknesses: new Set(),
+            llms: new Set(),
+            ranks: [],
+          });
+        }
+        const entry = brandMap.get(key)!;
+        entry.mentions++;
+        entry.llms.add(response.llm);
+        if (brand.mention_type) {
+          entry.mentionTypes.set(brand.mention_type, (entry.mentionTypes.get(brand.mention_type) || 0) + 1);
+        }
+        brand.strengths?.forEach(s => entry.strengths.add(s));
+        brand.weaknesses?.forEach(w => entry.weaknesses.add(w));
+        if (brand.rank != null) entry.ranks.push(brand.rank);
+      });
+    });
+
+    return Array.from(brandMap.values())
+      .map(entry => ({
+        ...entry,
+        isOwnBrand: isOwnBrand(entry.name),
+        topMentionType: entry.mentionTypes.size > 0
+          ? [...entry.mentionTypes.entries()].sort((a, b) => b[1] - a[1])[0][0]
+          : 'mentioned',
+        avgRank: entry.ranks.length > 0 ? (entry.ranks.reduce((a, b) => a + b, 0) / entry.ranks.length).toFixed(1) : null,
+        mentionRate: filteredResponses.length > 0 ? Math.round((entry.mentions / filteredResponses.length) * 100) : 0,
+        llms: Array.from(entry.llms),
+        strengths: Array.from(entry.strengths).slice(0, 5),
+        weaknesses: Array.from(entry.weaknesses).slice(0, 5),
+      }))
+      .sort((a, b) => b.mentions - a.mentions);
+  };
+
   const tabs = [
     { id: 'responses', label: 'LLM Responses', icon: Brain },
+    { id: 'competitors', label: 'Competitors', icon: Users },
     { id: 'citations', label: 'Citations', icon: FileText },
     { id: 'domains', label: 'Domains', icon: Globe },
   ];
@@ -617,7 +776,7 @@ export const PromptDetailPage: React.FC = () => {
               
               <div className="flex items-center space-x-2">
                 <Brain className="w-4 h-4 text-gray-500" />
-                <select 
+                <select
                   value={filters.llms}
                   onChange={(e) => handleFilterChange('llms', e.target.value)}
                   className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-xl bg-white dark:bg-gray-700 text-sm font-sans focus:ring-2 focus:ring-brand-primary/20 focus:border-brand-primary"
@@ -626,6 +785,20 @@ export const PromptDetailPage: React.FC = () => {
                   <option value="searchgpt">SearchGPT</option>
                   <option value="perplexity">Perplexity</option>
                   <option value="gemini">Gemini</option>
+                </select>
+              </div>
+
+              <div className="flex items-center space-x-2">
+                <ThumbsUp className="w-4 h-4 text-gray-500" />
+                <select
+                  value={filters.sentiment}
+                  onChange={(e) => handleFilterChange('sentiment', e.target.value)}
+                  className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-xl bg-white dark:bg-gray-700 text-sm font-sans focus:ring-2 focus:ring-brand-primary/20 focus:border-brand-primary"
+                >
+                  <option value="all">All Sentiments</option>
+                  <option value="positive">Positive</option>
+                  <option value="neutral">Neutral</option>
+                  <option value="negative">Negative</option>
                 </select>
               </div>
             </div>
@@ -824,6 +997,14 @@ export const PromptDetailPage: React.FC = () => {
                   Unique Domains
                 </div>
               </div>
+              <div className="bg-amber-50 dark:bg-amber-900/20 rounded-2xl p-4">
+                <div className="text-2xl font-bold text-amber-600 dark:text-amber-400">
+                  {getCompetitorsAggregation().length}
+                </div>
+                <div className="text-sm text-amber-600 dark:text-amber-400 font-medium">
+                  Brands Detected
+                </div>
+              </div>
             </div>
           </div>
         </CardContent>
@@ -855,7 +1036,7 @@ export const PromptDetailPage: React.FC = () => {
               
               <div className="flex items-center space-x-2">
                 <Brain className="w-4 h-4 text-gray-500" />
-                <select 
+                <select
                   value={filters.llms}
                   onChange={(e) => handleFilterChange('llms', e.target.value)}
                   className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-xl bg-white dark:bg-gray-700 text-sm font-sans focus:ring-2 focus:ring-brand-primary/20 focus:border-brand-primary"
@@ -864,6 +1045,20 @@ export const PromptDetailPage: React.FC = () => {
                   <option value="searchgpt">SearchGPT</option>
                   <option value="perplexity">Perplexity</option>
                   <option value="gemini">Gemini</option>
+                </select>
+              </div>
+
+              <div className="flex items-center space-x-2">
+                <ThumbsUp className="w-4 h-4 text-gray-500" />
+                <select
+                  value={filters.sentiment}
+                  onChange={(e) => handleFilterChange('sentiment', e.target.value)}
+                  className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-xl bg-white dark:bg-gray-700 text-sm font-sans focus:ring-2 focus:ring-brand-primary/20 focus:border-brand-primary"
+                >
+                  <option value="all">All Sentiments</option>
+                  <option value="positive">Positive</option>
+                  <option value="neutral">Neutral</option>
+                  <option value="negative">Negative</option>
                 </select>
               </div>
             </div>
@@ -968,6 +1163,12 @@ export const PromptDetailPage: React.FC = () => {
                                       <FileText className="w-4 h-4 mr-1" />
                                       {citations.length} citations
                                     </div>
+                                    {response.sentiment_label && (
+                                      <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium ${getSentimentColor(response.sentiment_label)}`}>
+                                        {getSentimentIcon(response.sentiment_label)}
+                                        {response.sentiment_label}
+                                      </span>
+                                    )}
                                   </div>
                                   {response.llm === 'searchgpt' && response.web_search_query && (
                                     <div className="mt-2 flex flex-wrap gap-2">
@@ -1007,17 +1208,47 @@ export const PromptDetailPage: React.FC = () => {
                           </CardHeader>
                           <CardContent>
                             <div className="space-y-4">
-                              {/* Response Preview */}
+                              {/* Response Preview with brand highlighting */}
                               {response.answer_text && (
                                 <div>
                                   <h4 className="font-medium text-gray-900 dark:text-gray-100 mb-2">
                                     Response Preview
                                   </h4>
                                   <div className="bg-gray-50 dark:bg-gray-700 rounded-xl p-4">
-                                    <p className="text-gray-700 dark:text-gray-300 text-sm leading-relaxed line-clamp-3">
-                                      {response.answer_text.substring(0, 300)}
-                                      {response.answer_text.length > 300 && '...'}
+                                    <p className="text-gray-700 dark:text-gray-300 text-sm leading-relaxed line-clamp-4">
+                                      {highlightBrands(
+                                        response.answer_text.substring(0, 500) + (response.answer_text.length > 500 ? '...' : ''),
+                                        response.answer_competitors?.brands || []
+                                      )}
                                     </p>
+                                  </div>
+                                </div>
+                              )}
+
+                              {/* Brands Mentioned */}
+                              {response.answer_competitors?.brands && response.answer_competitors.brands.length > 0 && !response.answer_competitors.error && (
+                                <div>
+                                  <h4 className="font-medium text-gray-900 dark:text-gray-100 mb-2">
+                                    Brands Mentioned ({response.answer_competitors.brands.length})
+                                  </h4>
+                                  <div className="flex flex-wrap gap-2">
+                                    {response.answer_competitors.brands.map((brand, bIdx) => (
+                                      <span
+                                        key={bIdx}
+                                        className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-medium ${getBrandPillColor(brand.mention_type, brand.name)}`}
+                                        title={[
+                                          brand.strengths?.length ? `Strengths: ${brand.strengths.join(', ')}` : '',
+                                          brand.weaknesses?.length ? `Weaknesses: ${brand.weaknesses.join(', ')}` : '',
+                                        ].filter(Boolean).join(' | ') || brand.name}
+                                      >
+                                        {isOwnBrand(brand.name) && <Award className="w-3 h-3" />}
+                                        {brand.rank != null && <span className="font-bold">#{brand.rank}</span>}
+                                        {brand.name}
+                                        {brand.mention_type && brand.mention_type !== 'mentioned' && (
+                                          <span className="opacity-60 ml-0.5">{brand.mention_type}</span>
+                                        )}
+                                      </span>
+                                    ))}
                                   </div>
                                 </div>
                               )}
@@ -1077,6 +1308,116 @@ export const PromptDetailPage: React.FC = () => {
                   })}
                 </div>
               )}
+            </div>
+          )}
+
+          {activeTab === 'competitors' && (
+            <div>
+              {(() => {
+                const competitors = getCompetitorsAggregation();
+                if (competitors.length === 0) {
+                  return (
+                    <div className="text-center py-12">
+                      <Users className="w-12 h-12 text-gray-400 mx-auto mb-4" />
+                      <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100 mb-2">
+                        No Competitors Data
+                      </h3>
+                      <p className="text-gray-600 dark:text-gray-400">
+                        No brand mentions extracted from the responses yet.
+                      </p>
+                    </div>
+                  );
+                }
+                return (
+                  <div className="space-y-4">
+                    <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100">
+                      Brands Detected ({competitors.length})
+                    </h3>
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-sm">
+                        <thead>
+                          <tr className="border-b border-gray-200 dark:border-gray-700">
+                            <th className="text-left py-3 px-2 text-gray-900 dark:text-gray-100">Brand</th>
+                            <th className="text-center py-3 px-2 text-gray-900 dark:text-gray-100">Mentions</th>
+                            <th className="text-center py-3 px-2 text-gray-900 dark:text-gray-100">Rate</th>
+                            <th className="text-center py-3 px-2 text-gray-900 dark:text-gray-100">Type</th>
+                            <th className="text-center py-3 px-2 text-gray-900 dark:text-gray-100">Avg Rank</th>
+                            <th className="text-left py-3 px-2 text-gray-900 dark:text-gray-100">LLMs</th>
+                            <th className="text-left py-3 px-2 text-gray-900 dark:text-gray-100">Strengths</th>
+                            <th className="text-left py-3 px-2 text-gray-900 dark:text-gray-100">Weaknesses</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {competitors.map((comp, idx) => (
+                            <tr key={idx} className={`border-b border-gray-100 dark:border-gray-700/50 ${comp.isOwnBrand ? 'bg-amber-50/50 dark:bg-amber-900/10' : ''}`}>
+                              <td className="py-3 px-2">
+                                <div className="flex items-center gap-2">
+                                  {comp.isOwnBrand && <Award className="w-4 h-4 text-amber-500" />}
+                                  <span className={`font-medium ${comp.isOwnBrand ? 'text-amber-700 dark:text-amber-300' : 'text-gray-900 dark:text-gray-100'}`}>
+                                    {comp.name}
+                                  </span>
+                                  {comp.isOwnBrand && (
+                                    <span className="text-xs px-1.5 py-0.5 rounded bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-300">
+                                      your brand
+                                    </span>
+                                  )}
+                                </div>
+                              </td>
+                              <td className="py-3 px-2 text-center font-semibold text-gray-900 dark:text-gray-100">
+                                {comp.mentions}
+                              </td>
+                              <td className="py-3 px-2 text-center">
+                                <span className="px-2 py-0.5 rounded-full text-xs font-medium bg-brand-primary/10 text-brand-primary">
+                                  {comp.mentionRate}%
+                                </span>
+                              </td>
+                              <td className="py-3 px-2 text-center">
+                                <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${getBrandPillColor(comp.topMentionType)}`}>
+                                  {comp.topMentionType}
+                                </span>
+                              </td>
+                              <td className="py-3 px-2 text-center text-gray-700 dark:text-gray-300">
+                                {comp.avgRank ? `#${comp.avgRank}` : '-'}
+                              </td>
+                              <td className="py-3 px-2">
+                                <div className="flex gap-1">
+                                  {comp.llms.map(llm => (
+                                    <img
+                                      key={llm}
+                                      src={LLM_ICONS[llm as keyof typeof LLM_ICONS]}
+                                      alt={llm}
+                                      className="w-5 h-5 object-contain"
+                                      title={llm}
+                                    />
+                                  ))}
+                                </div>
+                              </td>
+                              <td className="py-3 px-2 max-w-48">
+                                <div className="flex flex-wrap gap-1">
+                                  {comp.strengths.map((s, si) => (
+                                    <span key={si} className="text-xs px-1.5 py-0.5 rounded bg-green-50 dark:bg-green-900/20 text-green-700 dark:text-green-300 truncate max-w-32" title={s}>
+                                      {s}
+                                    </span>
+                                  ))}
+                                </div>
+                              </td>
+                              <td className="py-3 px-2 max-w-48">
+                                <div className="flex flex-wrap gap-1">
+                                  {comp.weaknesses.map((w, wi) => (
+                                    <span key={wi} className="text-xs px-1.5 py-0.5 rounded bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-300 truncate max-w-32" title={w}>
+                                      {w}
+                                    </span>
+                                  ))}
+                                </div>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                );
+              })()}
             </div>
           )}
 
@@ -1235,7 +1576,7 @@ export const PromptDetailPage: React.FC = () => {
               
               <div className="overflow-y-auto max-h-[calc(90vh-80px)] p-6 space-y-6">
                 {/* Response Metadata */}
-                <div className="grid grid-cols-2 gap-4">
+                <div className="grid grid-cols-2 lg:grid-cols-3 gap-4">
                   <div className="bg-gray-50 dark:bg-gray-700 rounded-xl p-4">
                     <h4 className="font-medium text-gray-900 dark:text-gray-100 mb-2">Query Settings</h4>
                     <div className="space-y-2 text-sm">
@@ -1246,7 +1587,7 @@ export const PromptDetailPage: React.FC = () => {
                       <div className="flex justify-between">
                         <span className="text-gray-600 dark:text-gray-400">Timestamp:</span>
                         <span className="text-gray-900 dark:text-gray-100">
-                          {selectedResponse.response_timestamp ? 
+                          {selectedResponse.response_timestamp ?
                             format(new Date(selectedResponse.response_timestamp), 'MMM d, yyyy HH:mm') :
                             format(new Date(selectedResponse.created_at), 'MMM d, yyyy HH:mm')
                           }
@@ -1255,9 +1596,9 @@ export const PromptDetailPage: React.FC = () => {
                       {selectedResponse.response_url && (
                         <div className="flex justify-between">
                           <span className="text-gray-600 dark:text-gray-400">Source URL:</span>
-                          <a 
-                            href={selectedResponse.response_url} 
-                            target="_blank" 
+                          <a
+                            href={selectedResponse.response_url}
+                            target="_blank"
                             rel="noopener noreferrer"
                             className="text-brand-primary hover:underline"
                           >
@@ -1265,9 +1606,19 @@ export const PromptDetailPage: React.FC = () => {
                           </a>
                         </div>
                       )}
+                      {selectedResponse.sentiment_label && (
+                        <div className="flex justify-between items-center">
+                          <span className="text-gray-600 dark:text-gray-400">Sentiment:</span>
+                          <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium ${getSentimentColor(selectedResponse.sentiment_label)}`}>
+                            {getSentimentIcon(selectedResponse.sentiment_label)}
+                            {selectedResponse.sentiment_label}
+                            {selectedResponse.sentiment_score != null && ` (${selectedResponse.sentiment_score})`}
+                          </span>
+                        </div>
+                      )}
                     </div>
                   </div>
-                  
+
                   <div className="bg-gray-50 dark:bg-gray-700 rounded-xl p-4">
                     <h4 className="font-medium text-gray-900 dark:text-gray-100 mb-2">Citations Summary</h4>
                     <div className="space-y-2 text-sm">
@@ -1282,6 +1633,37 @@ export const PromptDetailPage: React.FC = () => {
                         </span>
                       </div>
                     </div>
+                  </div>
+
+                  {/* Brands Detected summary */}
+                  <div className="bg-gray-50 dark:bg-gray-700 rounded-xl p-4">
+                    <h4 className="font-medium text-gray-900 dark:text-gray-100 mb-2">Brands Detected</h4>
+                    {selectedResponse.answer_competitors?.brands && selectedResponse.answer_competitors.brands.length > 0 && !selectedResponse.answer_competitors.error ? (
+                      <div className="space-y-2 text-sm">
+                        <div className="flex justify-between">
+                          <span className="text-gray-600 dark:text-gray-400">Total Brands:</span>
+                          <span className="text-gray-900 dark:text-gray-100">{selectedResponse.answer_competitors.brands.length}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-gray-600 dark:text-gray-400">Recommended:</span>
+                          <span className="text-green-600 dark:text-green-400 font-medium">
+                            {selectedResponse.answer_competitors.brands.filter(b => b.mention_type === 'recommended').length}
+                          </span>
+                        </div>
+                        <div className="flex flex-wrap gap-1 mt-2">
+                          {selectedResponse.answer_competitors.brands.slice(0, 6).map((brand, i) => (
+                            <span key={i} className={`text-xs px-1.5 py-0.5 rounded ${getBrandPillColor(brand.mention_type, brand.name)}`}>
+                              {brand.name}
+                            </span>
+                          ))}
+                          {selectedResponse.answer_competitors.brands.length > 6 && (
+                            <span className="text-xs text-gray-500">+{selectedResponse.answer_competitors.brands.length - 6}</span>
+                          )}
+                        </div>
+                      </div>
+                    ) : (
+                      <p className="text-sm text-gray-500 dark:text-gray-400">No brands extracted</p>
+                    )}
                   </div>
                 </div>
 
@@ -1324,7 +1706,10 @@ export const PromptDetailPage: React.FC = () => {
                     ) : selectedResponse.answer_text ? (
                       <div className="bg-gray-50 dark:bg-gray-700 p-4 rounded-xl max-h-96 overflow-auto">
                         <div className="text-sm text-gray-800 dark:text-gray-200 whitespace-pre-wrap">
-                          {selectedResponse.answer_text}
+                          {highlightBrands(
+                            selectedResponse.answer_text,
+                            selectedResponse.answer_competitors?.brands || []
+                          )}
                         </div>
                       </div>
                     ) : (

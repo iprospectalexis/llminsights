@@ -66,12 +66,7 @@ export const AuditProgressModal: React.FC<AuditProgressModalProps> = ({
     setIsInitialLoad(true);
     fetchAuditData();
 
-    // Set up polling instead of multiple realtime subscriptions to reduce DB load
-    const pollInterval = setInterval(() => {
-      fetchAuditData();
-    }, 3000); // Poll every 3 seconds only when modal is open
-
-    // Subscribe to critical audit status changes only
+    // Realtime for audit status only (filter by PK 'id' works reliably)
     const auditChannel = supabase
       .channel(`audit-modal-${auditId}`)
       .on(
@@ -85,18 +80,27 @@ export const AuditProgressModal: React.FC<AuditProgressModalProps> = ({
         (payload) => {
           console.log('AuditProgressModal: Audit updated:', payload.new);
           setAudit(payload.new);
-
-          // Stop polling if audit is completed
           if (payload.new.status === 'completed' || payload.new.status === 'failed') {
-            clearInterval(pollInterval);
+            // Final fetch to get latest data
+            fetchAuditSteps();
+            fetchLlmResponses();
+            fetchCitations();
           }
         }
       )
       .subscribe();
 
+    // Refresh UI data every 30s (read-only queries)
+    // Polling is handled by the backend scheduler — no edge function invocation needed
+    const dataInterval = setInterval(() => {
+      fetchAuditSteps();
+      fetchLlmResponses();
+      fetchCitations();
+    }, 30000);
+
     return () => {
-      clearInterval(pollInterval);
       supabase.removeChannel(auditChannel);
+      clearInterval(dataInterval);
     };
   }, [isOpen, auditId]);
 
@@ -108,7 +112,7 @@ export const AuditProgressModal: React.FC<AuditProgressModalProps> = ({
     try {
       const { data: auditData } = await supabase
         .from('audits')
-        .select('*')
+        .select('id, status, progress, llms, sentiment, created_at')
         .eq('id', auditId)
         .single();
 
@@ -139,7 +143,7 @@ export const AuditProgressModal: React.FC<AuditProgressModalProps> = ({
   const fetchAuditSteps = async () => {
     const { data } = await supabase
       .from('audit_steps')
-      .select('*')
+      .select('id, audit_id, step, status, message, created_at')
       .eq('audit_id', auditId)
       .order('created_at');
 
@@ -185,7 +189,7 @@ export const AuditProgressModal: React.FC<AuditProgressModalProps> = ({
   const fetchCitations = async () => {
     const { data } = await supabase
       .from('citations')
-      .select('*')
+      .select('id, audit_id, position')
       .eq('audit_id', auditId)
       .order('position');
 

@@ -2,7 +2,7 @@ import React from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Button } from '../ui/Button';
 import { supabase } from '../../lib/supabase';
-import { User, LogOut, PanelLeftClose, PanelLeftOpen, Moon, Sun } from 'lucide-react';
+import { User, LogOut, PanelLeftClose, PanelLeftOpen, Moon, Sun, Menu } from 'lucide-react';
 import { motion } from 'framer-motion';
 import { useTheme } from '../../contexts/ThemeContext';
 
@@ -11,9 +11,10 @@ interface NavbarProps {
   userProfile: any;
   onToggleCollapse: () => void;
   isCollapsed: boolean;
+  onMobileMenuToggle?: () => void;
 }
 
-export const Navbar: React.FC<NavbarProps> = ({ user, userProfile, onToggleCollapse, isCollapsed }) => {
+export const Navbar: React.FC<NavbarProps> = ({ user, userProfile, onToggleCollapse, isCollapsed, onMobileMenuToggle }) => {
   const navigate = useNavigate();
   const { isDarkMode, toggleDarkMode } = useTheme();
 
@@ -32,14 +33,26 @@ export const Navbar: React.FC<NavbarProps> = ({ user, userProfile, onToggleColla
       animate={{ y: 0, opacity: 1 }}
       className="bg-white/90 dark:bg-gray-900/95 backdrop-blur-md border-b border-gray-200 dark:border-gray-600 z-30"
     >
-      <div className="px-6">
-        <div className="flex justify-between h-16">
+      <div className="px-3 md:px-6">
+        <div className="flex justify-between h-14 md:h-16">
           <div className="flex items-center">
+            {/* Mobile: hamburger menu */}
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={onMobileMenuToggle}
+              className="p-2 mr-2 md:hidden"
+              title="Open menu"
+            >
+              <Menu className="w-5 h-5" />
+            </Button>
+
+            {/* Desktop: collapse toggle */}
             <Button
               variant="ghost"
               size="sm"
               onClick={onToggleCollapse}
-              className="p-2 mr-2"
+              className="p-2 mr-2 hidden md:inline-flex"
               title={isCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
             >
               {isCollapsed ? (
@@ -50,8 +63,7 @@ export const Navbar: React.FC<NavbarProps> = ({ user, userProfile, onToggleColla
             </Button>
           </div>
 
-          <div className="flex items-center space-x-4">
-
+          <div className="flex items-center space-x-2 sm:space-x-4">
             {/* Dark Mode Toggle */}
             <Button
               variant="ghost"

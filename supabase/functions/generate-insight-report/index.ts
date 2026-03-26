@@ -326,15 +326,14 @@ IMPORTANT: Ne retournez PAS de markdown (\`\`\`json), PAS de texte explicatif, U
       'Content-Type': 'application/json'
     },
     body: JSON.stringify({
-      model: 'gpt-4o',
+      model: 'gpt-5-mini',
       messages: [
         {
           role: 'user',
           content: prompt
         }
       ],
-      temperature: 0.7,
-      max_tokens: 16384
+      max_completion_tokens: 16384
     })
   });
 

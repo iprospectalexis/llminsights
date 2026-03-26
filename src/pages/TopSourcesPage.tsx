@@ -70,47 +70,125 @@ export function TopSourcesPage() {
     setDomainLoading(true);
 
     try {
-      const { data: { session } } = await supabase.auth.getSession();
-      if (!session) {
-        console.error('No session found');
-        return;
-      }
-
-      const params = new URLSearchParams({
-        page: pagination.page.toString(),
-        pageSize: pagination.pageSize.toString(),
-        sortBy,
-        sortOrder,
-      });
+      // Query the materialized view directly via Supabase client
+      // (GRANT SELECT ON domain_citations_mv TO authenticated)
+      // When "all" LLMs, we aggregate across all LLMs client-side
+      const ascending = sortOrder === 'asc';
 
       if (selectedLLM && selectedLLM !== 'all') {
-        params.append('llm', selectedLLM);
-      }
+        // Specific LLM: query directly with pagination
+        let query = supabase
+          .from('domain_citations_mv' as any)
+          .select('*', { count: 'exact' })
+          .eq('llm', selectedLLM);
 
-      if (domainSearch) {
-        params.append('domain', domainSearch);
-      }
-
-      const response = await fetch(
-        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/get-domain-citations?${params.toString()}`,
-        {
-          headers: {
-            'Authorization': `Bearer ${session.access_token}`,
-            'Content-Type': 'application/json',
-          },
+        if (domainSearch) {
+          query = query.ilike('domain', `%${domainSearch}%`);
         }
-      );
 
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error('Error response:', errorText);
-        throw new Error(`Failed to fetch domain citations: ${response.status}`);
+        query = query
+          .order(sortBy, { ascending })
+          .order('domain', { ascending: true })
+          .range(
+            (pagination.page - 1) * pagination.pageSize,
+            pagination.page * pagination.pageSize - 1
+          );
+
+        const { data, count, error } = await query;
+
+        if (error) {
+          console.error('Error fetching domain citations:', error);
+          throw error;
+        }
+
+        setDomainCitations(data || []);
+        setPagination({
+          ...pagination,
+          total: count || 0,
+          totalPages: Math.ceil((count || 0) / pagination.pageSize),
+        });
+      } else {
+        // All LLMs: fetch all rows, aggregate by domain, then paginate client-side
+        const batchSize = 1000;
+        let allData: any[] = [];
+        let currentPage = 0;
+        let hasMore = true;
+
+        while (hasMore) {
+          let query = supabase
+            .from('domain_citations_mv' as any)
+            .select('*')
+            .range(currentPage * batchSize, (currentPage + 1) * batchSize - 1);
+
+          if (domainSearch) {
+            query = query.ilike('domain', `%${domainSearch}%`);
+          }
+
+          const { data: batch, error } = await query;
+
+          if (error) {
+            console.error('Error fetching batch:', error);
+            break;
+          }
+
+          if (batch && batch.length > 0) {
+            allData = allData.concat(batch);
+            currentPage++;
+            hasMore = batch.length === batchSize;
+          } else {
+            hasMore = false;
+          }
+        }
+
+        // Aggregate by domain across all LLMs
+        const aggregated = new Map<string, any>();
+        for (const row of allData) {
+          const key = row.domain;
+          if (!aggregated.has(key)) {
+            aggregated.set(key, {
+              domain: row.domain,
+              llm: 'all',
+              cited_count: 0,
+              more_count: 0,
+              total_citations: 0,
+              first_seen: row.first_seen,
+              last_seen: row.last_seen,
+            });
+          }
+          const agg = aggregated.get(key);
+          agg.cited_count += row.cited_count || 0;
+          agg.more_count += row.more_count || 0;
+          agg.total_citations += row.total_citations || 0;
+          if (row.first_seen && (!agg.first_seen || row.first_seen < agg.first_seen)) {
+            agg.first_seen = row.first_seen;
+          }
+          if (row.last_seen && (!agg.last_seen || row.last_seen > agg.last_seen)) {
+            agg.last_seen = row.last_seen;
+          }
+        }
+
+        // Sort
+        let sorted = Array.from(aggregated.values());
+        sorted.sort((a, b) => {
+          const aVal = a[sortBy];
+          const bVal = b[sortBy];
+          if (typeof aVal === 'string' && typeof bVal === 'string') {
+            return ascending ? aVal.localeCompare(bVal) : bVal.localeCompare(aVal);
+          }
+          return ascending ? (aVal || 0) - (bVal || 0) : (bVal || 0) - (aVal || 0);
+        });
+
+        const total = sorted.length;
+        const offset = (pagination.page - 1) * pagination.pageSize;
+        const paginated = sorted.slice(offset, offset + pagination.pageSize);
+
+        setDomainCitations(paginated);
+        setPagination({
+          ...pagination,
+          total,
+          totalPages: Math.ceil(total / pagination.pageSize),
+        });
       }
-
-      const result = await response.json();
-      console.log('Domain citations result:', result);
-      setDomainCitations(result.data || []);
-      setPagination(result.pagination);
     } catch (error) {
       console.error('Error fetching domain citations:', error);
       setDomainCitations([]);

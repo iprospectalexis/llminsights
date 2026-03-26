@@ -60,14 +60,13 @@ Ne retourne que du JSON. Aucun texte avant ou après. Pas de balises Markdown. P
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-        model: 'gpt-4',
+        model: 'gpt-5-mini',
         messages: [
           {
             role: 'user',
             content: prompt
           }
         ],
-        temperature: 0.7
       })
     })
 

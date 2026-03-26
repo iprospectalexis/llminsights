@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { Card, CardContent, CardHeader } from '../components/ui/Card';
@@ -8,6 +9,7 @@ import { Modal } from '../components/ui/Modal';
 import { Input } from '../components/ui/Input';
 import { Progress } from '../components/ui/Progress';
 import { supabase } from '../lib/supabase';
+import { queryCache } from '../lib/queryCache';
 import { Calendar, FileText, ChartBar as BarChart3, Globe, Users, Play, ArrowLeft, Brain, Download, Settings as SettingsIcon, PencilLine, X, MessageSquare, Crown, TrendingUp, Lightbulb, Trash2, Info, Settings, CalendarCheck, ArrowUpDown, ArrowUp, ArrowDown, BadgeCheck, MessageCircle, List, ChevronDown } from 'lucide-react';
 import { PieChart, Pie, Cell, ResponsiveContainer, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, LineChart, Line, Legend } from 'recharts';
 import { RadarChart, Radar, PolarGrid, PolarAngleAxis, PolarRadiusAxis } from 'recharts';
@@ -128,6 +130,8 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
   });
   const [showPromptGroupDropdown, setShowPromptGroupDropdown] = useState(false);
   const [showLlmDropdown, setShowLlmDropdown] = useState(false);
+  const [llmDropdownPos, setLlmDropdownPos] = useState<{ top: number; left: number; minWidth: number } | null>(null);
+  const llmButtonRef = useRef<HTMLButtonElement>(null);
   const [showCustomDatePicker, setShowCustomDatePicker] = useState(false);
   const [customDateRange, setCustomDateRange] = useState({
     startDate: '',
@@ -139,7 +143,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     domain: '',
     country: '',
     domainMode: 'exact' as 'exact' | 'subdomains',
-    groupId: '',
+    groupIds: [] as string[],
     myBrands: '',
     competitors: '',
     prompts: '',
@@ -865,11 +869,12 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
       let urls: any[] = [];
 
       // Extract URLs based on LLM type
-      if (response.llm === 'perplexity' && response.raw_response_data.sources) {
-        urls = response.raw_response_data.sources.map((source: any, index: number) => ({
+      if (response.llm === 'perplexity' && (response.raw_response_data.sources || response.raw_response_data.citations)) {
+        const sources = response.raw_response_data.sources || response.raw_response_data.citations || [];
+        urls = sources.map((source: any, index: number) => ({
           url: source.url,
           text: source.title || source.description || 'No description',
-          position: index + 1
+          position: source.position || index + 1
         }));
       } else if (response.llm === 'searchgpt') {
         // Handle SearchGPT - use links_attached field
@@ -894,6 +899,17 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
               url: link.url,
               text: link.text || link.title || link.description,
               position: link.position || index + 1,
+            });
+          }
+        });
+      } else if (response.llm === 'grok' && response.raw_response_data.citations) {
+        // Handle Grok citations
+        response.raw_response_data.citations.forEach((cit: any, index: number) => {
+          if (cit.url) {
+            urls.push({
+              url: cit.url,
+              text: cit.title || cit.description || 'No description',
+              position: index + 1,
             });
           }
         });
@@ -990,7 +1006,19 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
       .from('groups')
       .select('*')
       .order('name');
-    setGroups(data || []);
+    // Deduplicate by name: keep first, but track all IDs so lookups work
+    const groupMap = new Map<string, any>();
+    for (const g of (data || [])) {
+      const key = g.name.toLowerCase().trim();
+      if (groupMap.has(key)) {
+        const existing = groupMap.get(key);
+        if (!existing._allIds) existing._allIds = [existing.id];
+        existing._allIds.push(g.id);
+      } else {
+        groupMap.set(key, { ...g });
+      }
+    }
+    setGroups(Array.from(groupMap.values()));
   };
 
   const fetchPromptGroups = async () => {
@@ -1043,17 +1071,29 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
 
     setLoading(true);
     try {
-      // Fetch project details
-      const { data: projectData } = await supabase
-        .from('projects')
-        .select(`
-          *,
-          groups (name, color),
-          brands (*),
-          prompts (*)
-        `)
-        .eq('id', id)
-        .single();
+      // Fetch project details (with cache for navigation back/forth)
+      const cacheKey = `project:${id}:detail`;
+      let projectData = queryCache.get<any>(cacheKey);
+      if (!projectData) {
+        const { data } = await supabase
+          .from('projects')
+          .select(`
+            *,
+            groups (name, color),
+            project_groups (
+              group_id,
+              groups (id, name, color)
+            ),
+            brands (*),
+            prompts (*)
+          `)
+          .eq('id', id)
+          .single();
+        projectData = data;
+        if (projectData) {
+          queryCache.set(cacheKey, projectData, 30000); // Cache 30s
+        }
+      }
 
       if (projectData) {
         setProject(projectData);
@@ -1071,15 +1111,23 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
         setBrandsList(myBrandsList);
         setCompetitorsList(competitorsList);
         
+        // Extract group IDs from junction table, fallback to legacy group_id
+        const projectGroupIds = (projectData.project_groups || [])
+          .map((pg: any) => pg.group_id)
+          .filter(Boolean);
+        const resolvedGroupIds = projectGroupIds.length > 0
+          ? projectGroupIds
+          : (projectData.group_id ? [projectData.group_id] : []);
+
         setEditFormData({
           name: projectData.name,
           domain: projectData.domain,
           country: projectData.country,
           domainMode: projectData.domain_mode,
-          groupId: projectData.group_id || '',
+          groupIds: resolvedGroupIds,
           myBrands: myBrandsList.join(', '),
           competitors: competitorsList.join(', '),
-          prompts: projectData.prompts?.map(p => 
+          prompts: projectData.prompts?.map(p =>
             p.prompt_group === 'General' ? p.prompt_text : `${p.prompt_group};${p.prompt_text}`
           ).join('\n') || '',
         });
@@ -1325,6 +1373,8 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     setRunningAudits(prev => prev.filter(id => id !== auditId));
     setRunningAuditInfo(null);
     // Refresh project data to show updated results
+    queryCache.invalidatePattern(`project:${id}`);
+    queryCache.invalidate('projects:list');
     fetchProjectData();
   };
 
@@ -1462,6 +1512,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
       await new Promise(resolve => setTimeout(resolve, 1000));
 
       // Reload all project data to reflect the updated metrics
+      queryCache.invalidatePattern(`project:${id}`);
       await fetchProjectData();
 
       alert('Metrics recalculated successfully! All charts have been updated.');
@@ -1516,7 +1567,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     if (!id) return;
 
     try {
-      // Update project
+      // Update project (keep group_id for backward compat with first group)
       const { error: projectError } = await supabase
         .from('projects')
         .update({
@@ -1524,12 +1575,35 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
           domain: editFormData.domain,
           country: editFormData.country,
           domain_mode: editFormData.domainMode,
-          group_id: editFormData.groupId || null,
+          group_id: editFormData.groupIds.length > 0 ? editFormData.groupIds[0] : null,
           updated_at: new Date().toISOString(),
         })
         .eq('id', id);
 
       if (projectError) throw projectError;
+
+      // Update junction table: delete old + insert new
+      const { error: deleteGroupsError } = await supabase
+        .from('project_groups')
+        .delete()
+        .eq('project_id', id);
+
+      if (deleteGroupsError) {
+        console.error('Error deleting project groups:', deleteGroupsError);
+      }
+
+      if (editFormData.groupIds.length > 0) {
+        const rows = editFormData.groupIds.map(gid => ({
+          project_id: id,
+          group_id: gid,
+        }));
+        const { error: insertGroupsError } = await supabase
+          .from('project_groups')
+          .insert(rows);
+        if (insertGroupsError) {
+          console.error('Error inserting project groups:', insertGroupsError);
+        }
+      }
 
       // Delete existing brands and competitors
       const { error: deleteBrandsError } = await supabase
@@ -1616,6 +1690,8 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
         await handleRecalculateMetrics(id);
       } else {
         // Refresh project data only if we didn't recalculate (since recalculate already does it)
+        queryCache.invalidatePattern(`project:${id}`);
+        queryCache.invalidate('projects:list');
         await fetchProjectData();
       }
     } catch (error) {
@@ -3003,9 +3079,16 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                 <Brain className="w-4 h-4 text-gray-500" />
                 <div className="relative">
                   <button
+                    ref={llmButtonRef}
                     type="button"
-                    onClick={() => setShowLlmDropdown(!showLlmDropdown)}
-                    className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-xl bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 text-sm font-sans focus:ring-2 focus:ring-brand-primary/20 focus:border-brand-primary flex items-center space-x-2 min-w-[200px] justify-between"
+                    onClick={() => {
+                      if (!showLlmDropdown) {
+                        const rect = llmButtonRef.current?.getBoundingClientRect();
+                        if (rect) setLlmDropdownPos({ top: rect.bottom + 4, left: rect.left, minWidth: rect.width });
+                      }
+                      setShowLlmDropdown(!showLlmDropdown);
+                    }}
+                    className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-xl bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 text-sm font-sans focus:ring-2 focus:ring-brand-primary/20 focus:border-brand-primary flex items-center space-x-2 justify-between"
                   >
                     <div className="flex items-center space-x-2">
                       {filters.llms !== 'all' && (
@@ -3024,13 +3107,15 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                     </div>
                     <ChevronDown className="w-4 h-4" />
                   </button>
-                  {showLlmDropdown && (
+                  {showLlmDropdown && createPortal(
                     <>
                       <div
-                        className="fixed inset-0 z-[31]"
+                        className="fixed inset-0 z-[9998]"
                         onClick={() => setShowLlmDropdown(false)}
                       />
-                      <div className="absolute top-full left-0 mt-1 w-full bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded-xl shadow-lg z-[32] max-h-[400px] overflow-y-auto"
+                      <div
+                        className="fixed bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded-xl shadow-lg z-[9999] max-h-[400px] overflow-y-auto"
+                        style={llmDropdownPos || {}}
                       >
                         <button
                           type="button"
@@ -3038,7 +3123,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                             handleFilterChange('llms', 'all');
                             setShowLlmDropdown(false);
                           }}
-                          className="w-full px-3 py-2 text-left text-sm hover:bg-gray-100 dark:hover:bg-gray-600 flex items-center space-x-2"
+                          className="w-full px-3 py-2 text-left text-sm text-gray-900 dark:text-gray-100 hover:bg-gray-100 dark:hover:bg-gray-600 flex items-center space-x-2"
                         >
                           <span>All LLMs</span>
                         </button>
@@ -3048,7 +3133,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                             handleFilterChange('llms', 'searchgpt');
                             setShowLlmDropdown(false);
                           }}
-                          className="w-full px-3 py-2 text-left text-sm hover:bg-gray-100 dark:hover:bg-gray-600 flex items-center space-x-2"
+                          className="w-full px-3 py-2 text-left text-sm text-gray-900 dark:text-gray-100 hover:bg-gray-100 dark:hover:bg-gray-600 flex items-center space-x-2"
                         >
                           <img src={LLM_ICONS.searchgpt} alt="" className="w-4 h-4" />
                           <span>SearchGPT</span>
@@ -3059,7 +3144,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                             handleFilterChange('llms', 'perplexity');
                             setShowLlmDropdown(false);
                           }}
-                          className="w-full px-3 py-2 text-left text-sm hover:bg-gray-100 dark:hover:bg-gray-600 flex items-center space-x-2"
+                          className="w-full px-3 py-2 text-left text-sm text-gray-900 dark:text-gray-100 hover:bg-gray-100 dark:hover:bg-gray-600 flex items-center space-x-2"
                         >
                           <img src={LLM_ICONS.perplexity} alt="" className="w-4 h-4" />
                           <span>Perplexity</span>
@@ -3070,7 +3155,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                             handleFilterChange('llms', 'gemini');
                             setShowLlmDropdown(false);
                           }}
-                          className="w-full px-3 py-2 text-left text-sm hover:bg-gray-100 dark:hover:bg-gray-600 flex items-center space-x-2"
+                          className="w-full px-3 py-2 text-left text-sm text-gray-900 dark:text-gray-100 hover:bg-gray-100 dark:hover:bg-gray-600 flex items-center space-x-2"
                         >
                           <img src={LLM_ICONS.gemini} alt="" className="w-4 h-4" />
                           <span>Gemini</span>
@@ -3081,7 +3166,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                             handleFilterChange('llms', 'google-ai-overview');
                             setShowLlmDropdown(false);
                           }}
-                          className="w-full px-3 py-2 text-left text-sm hover:bg-gray-100 dark:hover:bg-gray-600 flex items-center space-x-2"
+                          className="w-full px-3 py-2 text-left text-sm text-gray-900 dark:text-gray-100 hover:bg-gray-100 dark:hover:bg-gray-600 flex items-center space-x-2"
                         >
                           <img src={LLM_ICONS['google-ai-overview']} alt="" className="w-4 h-4" />
                           <span>Google AI Overview</span>
@@ -3092,7 +3177,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                             handleFilterChange('llms', 'google-ai-mode');
                             setShowLlmDropdown(false);
                           }}
-                          className="w-full px-3 py-2 text-left text-sm hover:bg-gray-100 dark:hover:bg-gray-600 flex items-center space-x-2"
+                          className="w-full px-3 py-2 text-left text-sm text-gray-900 dark:text-gray-100 hover:bg-gray-100 dark:hover:bg-gray-600 flex items-center space-x-2"
                         >
                           <img src={LLM_ICONS['google-ai-mode']} alt="" className="w-4 h-4" />
                           <span>Google AI Mode</span>
@@ -3103,7 +3188,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                             handleFilterChange('llms', 'bing-copilot');
                             setShowLlmDropdown(false);
                           }}
-                          className="w-full px-3 py-2 text-left text-sm hover:bg-gray-100 dark:hover:bg-gray-600 flex items-center space-x-2"
+                          className="w-full px-3 py-2 text-left text-sm text-gray-900 dark:text-gray-100 hover:bg-gray-100 dark:hover:bg-gray-600 flex items-center space-x-2"
                         >
                           <img src={LLM_ICONS['bing-copilot']} alt="" className="w-4 h-4" />
                           <span>Bing Copilot</span>
@@ -3114,13 +3199,14 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                             handleFilterChange('llms', 'grok');
                             setShowLlmDropdown(false);
                           }}
-                          className="w-full px-3 py-2 text-left text-sm hover:bg-gray-100 dark:hover:bg-gray-600 flex items-center space-x-2"
+                          className="w-full px-3 py-2 text-left text-sm text-gray-900 dark:text-gray-100 hover:bg-gray-100 dark:hover:bg-gray-600 flex items-center space-x-2"
                         >
                           <img src={LLM_ICONS.grok} alt="" className="w-4 h-4" />
                           <span>Grok</span>
                         </button>
                       </div>
-                    </>
+                    </>,
+                    document.body
                   )}
                 </div>
               </div>
@@ -3131,7 +3217,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                   <button
                     type="button"
                     onClick={() => setShowPromptGroupDropdown(!showPromptGroupDropdown)}
-                    className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-xl bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 text-sm font-sans focus:ring-2 focus:ring-brand-primary/20 focus:border-brand-primary flex items-center space-x-2 min-w-[200px] justify-between"
+                    className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-xl bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 text-sm font-sans focus:ring-2 focus:ring-brand-primary/20 focus:border-brand-primary flex items-center space-x-2 justify-between"
                   >
                     <span>
                       {filters.promptGroups.length === 0
@@ -3320,7 +3406,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
         {!hideTabNavigation && (
           <CardHeader className="pb-0">
             <div className="border-b border-gray-200 dark:border-gray-700">
-              <nav className="flex space-x-8">
+              <nav className="flex space-x-4 sm:space-x-8 overflow-x-auto">
                 {tabs.map(tab => (
                   <button
                     key={tab.id}
@@ -3344,8 +3430,8 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
 
         <CardContent className="p-6">
           {activeTab === 'overview' && (
-            <div className="space-y-6">
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+            <div className="space-y-6 pt-4">
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-4 md:gap-6">
                 <div className="bg-gradient-to-br from-[#f72585] to-[#b5179e] rounded-2xl p-6 border border-[#f72585]/30 shadow-lg relative">
                   <div className="absolute top-4 right-4 group">
                     <Info className="w-4 h-4 text-white/70 hover:text-white cursor-help transition-colors" />
@@ -3672,7 +3758,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
 
                       {/* Legend */}
                       <div className="mt-6 pt-4 border-t border-gray-200 dark:border-gray-700">
-                        <div className="flex items-center gap-6 flex-wrap justify-center">
+                        <div className="flex items-center gap-4 md:gap-6 flex-wrap justify-center">
                           <span className="text-xs font-semibold text-gray-600 dark:text-gray-400 uppercase tracking-wider">
                             Performance Scale:
                           </span>
@@ -3703,7 +3789,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                 })()}
               </div>
 
-              <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 md:gap-6">
                 <div className="bg-white dark:bg-gray-800 rounded-2xl border border-gray-200 dark:border-gray-700 p-6">
                   <div className="flex items-center justify-between mb-4">
                     <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100">
@@ -4286,7 +4372,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
               </div>
 
               {/* Over Time Charts - 2 Column Layout */}
-              <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 md:gap-6">
                 {/* Citations Over Time Chart - Column 1 */}
                 <div className="bg-white dark:bg-gray-800 rounded-2xl border border-gray-200 dark:border-gray-700 p-6">
                   <div className="mb-6">
@@ -6094,7 +6180,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                 <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100 mb-4">
                   Select Report Type
                 </h3>
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4 md:gap-6">
                   {/* Brand Strengths & Weaknesses */}
                   <button
                     onClick={() => setSelectedReportType('brand_strengths')}
@@ -6580,9 +6666,9 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
         />
       ))}
 
-      <Modal isOpen={showEditModal} onClose={() => setShowEditModal(false)} title="Edit Project">
+      <Modal isOpen={showEditModal} onClose={() => setShowEditModal(false)} title="Edit Project" size="xl">
         <form onSubmit={handleSaveProject} className="p-6 space-y-4">
-          <div className="grid grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <Input
               label="Project Name"
               value={editFormData.name}
@@ -6592,24 +6678,53 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
             
             <div>
               <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-                Project Group
+                Project Groups
               </label>
-              <select
-                value={editFormData.groupId}
-                onChange={(e) => setEditFormData({ ...editFormData, groupId: e.target.value })}
-                className="block w-full rounded-2xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-4 py-2.5 text-gray-900 dark:text-gray-100 focus:border-brand-primary focus:ring-2 focus:ring-brand-primary/20 font-sans"
-              >
-                <option value="">No group</option>
-                {groups.map(group => (
-                  <option key={group.id} value={group.id}>
-                    {group.name}
-                  </option>
-                ))}
-              </select>
+              <div className="rounded-2xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2">
+                <div className="flex flex-wrap gap-2 max-h-28 overflow-y-auto">
+                  {groups.map(group => {
+                    const allIds = group._allIds || [group.id];
+                    const isSelected = editFormData.groupIds.some((gid: string) => allIds.includes(gid));
+                    return (
+                      <button
+                        key={group.id}
+                        type="button"
+                        onClick={() => {
+                          setEditFormData(prev => ({
+                            ...prev,
+                            groupIds: isSelected
+                              ? prev.groupIds.filter((gid: string) => !allIds.includes(gid))
+                              : [...prev.groupIds, group.id],
+                          }));
+                        }}
+                        className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium border transition-all ${
+                          isSelected
+                            ? 'ring-2 ring-offset-1 ring-opacity-50'
+                            : 'opacity-60 hover:opacity-100'
+                        }`}
+                        style={{
+                          backgroundColor: isSelected ? `${group.color}20` : 'transparent',
+                          borderColor: group.color,
+                          color: group.color,
+                        }}
+                      >
+                        <span
+                          className="w-2 h-2 rounded-full flex-shrink-0"
+                          style={{ backgroundColor: group.color }}
+                        />
+                        {group.name}
+                      </button>
+                    );
+                  })}
+                  {groups.length === 0 && (
+                    <span className="text-xs text-gray-400 py-1">No groups available</span>
+                  )}
+                </div>
+              </div>
             </div>
           </div>
 
-          <div className="grid grid-cols-3 gap-4">
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
             <Input
               label="Domain"
               value={editFormData.domain}

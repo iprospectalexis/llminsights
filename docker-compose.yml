@@ -1,0 +1,33 @@
+version: "3.8"
+
+services:
+  llmi:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # Frontend build-time variables (Supabase public keys — safe to bake in)
+        VITE_SUPABASE_URL: ${VITE_SUPABASE_URL}
+        VITE_SUPABASE_ANON_KEY: ${VITE_SUPABASE_ANON_KEY}
+        VITE_BACKEND_URL: /api
+    container_name: llmi
+    restart: unless-stopped
+    ports:
+      - "${PORT:-80}:80"
+    env_file:
+      - .env.production
+    environment:
+      - UVICORN_WORKERS=${UVICORN_WORKERS:-2}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+    volumes:
+      # Persist job results (optional)
+      - llmi_results:/app/results
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  llmi_results:

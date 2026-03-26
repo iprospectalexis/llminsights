@@ -41,11 +41,11 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({
   const [suggestingCompetitors, setSuggestingCompetitors] = useState(false);
   const [formData, setFormData] = useState({
     name: '',
-    groupId: '',
+    groupIds: [] as string[],
     newGroupName: '',
     newGroupColor: '#6366f1',
     domain: '',
-    domainMode: 'exact' as 'exact' | 'subdomains',
+    domainMode: 'subdomains' as 'exact' | 'subdomains',
     country: 'US',
     myBrands: '',
     competitors: '',
@@ -70,7 +70,19 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({
       .from('groups')
       .select('*')
       .order('name');
-    setGroups(data || []);
+    // Deduplicate by name: keep first, but track all IDs so lookups work
+    const groupMap = new Map<string, any>();
+    for (const g of (data || [])) {
+      const key = g.name.toLowerCase().trim();
+      if (groupMap.has(key)) {
+        const existing = groupMap.get(key);
+        if (!existing._allIds) existing._allIds = [existing.id];
+        existing._allIds.push(g.id);
+      } else {
+        groupMap.set(key, { ...g });
+      }
+    }
+    setGroups(Array.from(groupMap.values()));
   };
 
   const validateDomain = (domain: string): boolean => {
@@ -162,8 +174,8 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({
     if (!formData.competitors.trim()) newErrors.competitors = 'Competitors is required';
     if (!formData.prompts.trim()) newErrors.prompts = 'Prompts is required';
     
-    if (groupMode === 'existing' && !formData.groupId) {
-      newErrors.group = 'Please select a group or create a new one';
+    if (groupMode === 'existing' && formData.groupIds.length === 0) {
+      newErrors.group = 'Please select at least one group or create a new one';
     }
     if (groupMode === 'new' && !formData.newGroupName.trim()) {
       newErrors.newGroupName = 'Group name is required';
@@ -182,7 +194,7 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({
     setLoading(true);
 
     try {
-      let groupId = formData.groupId;
+      let groupIds = [...formData.groupIds];
 
       // Create new group if specified
       if (groupMode === 'new' && formData.newGroupName) {
@@ -195,18 +207,18 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({
           })
           .select()
           .single();
-        
+
         if (newGroup) {
-          groupId = newGroup.id;
+          groupIds.push(newGroup.id);
         }
       }
 
-      // Create project
+      // Create project (keep group_id for backward compat with first group)
       const { data: project, error: projectError } = await supabase
         .from('projects')
         .insert({
           name: formData.name,
-          group_id: groupId || null,
+          group_id: groupIds.length > 0 ? groupIds[0] : null,
           domain: formData.domain,
           domain_mode: formData.domainMode,
           country: formData.country,
@@ -216,6 +228,18 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({
         .single();
 
       if (projectError) throw projectError;
+
+      // Insert into junction table
+      if (groupIds.length > 0) {
+        await supabase
+          .from('project_groups')
+          .insert(
+            groupIds.map(gid => ({
+              project_id: project.id,
+              group_id: gid,
+            }))
+          );
+      }
 
       // Add brands
       if (formData.myBrands.trim()) {
@@ -265,11 +289,11 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({
       // Reset form
       setFormData({
         name: '',
-        groupId: '',
+        groupIds: [],
         newGroupName: '',
         newGroupColor: '#6366f1',
         domain: '',
-        domainMode: 'exact',
+        domainMode: 'subdomains',
         country: 'US',
         myBrands: '',
         competitors: '',
@@ -288,7 +312,7 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({
   };
 
   return (
-    <Modal isOpen={isOpen} onClose={onClose} title="Create New Project" size="lg">
+    <Modal isOpen={isOpen} onClose={onClose} title="Create New Project" size="xl">
       <form onSubmit={handleSubmit} className="p-6 space-y-6">
         <div className="grid grid-cols-2 gap-4">
           <Input
@@ -301,31 +325,61 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({
           
           <div>
             <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-              Project Group *
+              Project Groups *
             </label>
-            <select
-              value={groupMode === 'new' ? 'new' : formData.groupId}
-              onChange={(e) => {
-                if (e.target.value === 'new') {
-                  setFormData({ ...formData, groupId: '' });
-                  setGroupMode('new');
-                } else {
-                  setFormData({ ...formData, groupId: e.target.value });
-                  setGroupMode('existing');
-                }
-              }}
-              className={`block w-full rounded-2xl border px-4 py-2.5 text-gray-900 dark:text-gray-100 focus:border-brand-primary focus:ring-2 focus:ring-brand-primary/20 ${
-                errors.group ? 'border-red-300' : 'border-gray-300 dark:border-gray-600'
-              } bg-white dark:bg-gray-700`}
-            >
-              <option value="">Select a group</option>
-              {groups.map(group => (
-                <option key={group.id} value={group.id}>
-                  {group.name}
-                </option>
-              ))}
-              <option value="new">+ Create new group</option>
-            </select>
+            <div className={`rounded-2xl border px-3 py-2 ${
+              errors.group ? 'border-red-300' : 'border-gray-300 dark:border-gray-600'
+            } bg-white dark:bg-gray-700`}>
+              <div className="flex flex-wrap gap-2 max-h-28 overflow-y-auto">
+                {groups.map(group => {
+                  const isSelected = formData.groupIds.includes(group.id);
+                  return (
+                    <button
+                      key={group.id}
+                      type="button"
+                      onClick={() => {
+                        setGroupMode('existing');
+                        setFormData(prev => ({
+                          ...prev,
+                          groupIds: isSelected
+                            ? prev.groupIds.filter(id => id !== group.id)
+                            : [...prev.groupIds, group.id],
+                        }));
+                      }}
+                      className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium border transition-all ${
+                        isSelected
+                          ? 'ring-2 ring-offset-1 ring-opacity-50'
+                          : 'opacity-60 hover:opacity-100'
+                      }`}
+                      style={{
+                        backgroundColor: isSelected ? `${group.color}20` : 'transparent',
+                        borderColor: group.color,
+                        color: group.color,
+                        ...(isSelected ? { ringColor: group.color } : {}),
+                      }}
+                    >
+                      <span
+                        className="w-2 h-2 rounded-full flex-shrink-0"
+                        style={{ backgroundColor: group.color }}
+                      />
+                      {group.name}
+                      {isSelected && <X className="w-3 h-3 ml-0.5" />}
+                    </button>
+                  );
+                })}
+                <button
+                  type="button"
+                  onClick={() => setGroupMode('new')}
+                  className={`inline-flex items-center gap-1 px-3 py-1 rounded-full text-xs font-medium border border-dashed transition-all ${
+                    groupMode === 'new'
+                      ? 'border-brand-primary text-brand-primary bg-brand-primary/10'
+                      : 'border-gray-400 text-gray-500 hover:border-brand-primary hover:text-brand-primary'
+                  }`}
+                >
+                  + New group
+                </button>
+              </div>
+            </div>
             {errors.group && <p className="text-sm text-red-600 dark:text-red-400 mt-1">{errors.group}</p>}
           </div>
         </div>

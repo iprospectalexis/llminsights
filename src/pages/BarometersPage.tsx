@@ -8,23 +8,29 @@ import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, Responsi
 import { Telescope, Calendar } from 'lucide-react';
 import { useTheme } from '../contexts/ThemeContext';
 
-const LLM_COLORS = {
+const LLM_COLORS: Record<string, string> = {
   searchgpt: '#3b82f6',
   perplexity: '#8b5cf6',
   gemini: '#10b981',
+  'google-ai-overview': '#ea4335',
+  'google-ai-mode': '#fbbc04',
+  'bing-copilot': '#00a4ef',
+  grok: '#1d9bf0',
 };
 
-const LLM_NAMES = {
+const LLM_NAMES: Record<string, string> = {
   searchgpt: 'SearchGPT',
   perplexity: 'Perplexity',
   gemini: 'Gemini',
+  'google-ai-overview': 'Google AI Overview',
+  'google-ai-mode': 'Google AI Mode',
+  'bing-copilot': 'Bing Copilot',
+  grok: 'Grok',
 };
 
 interface TimeSeriesData {
   date: string;
-  searchgpt?: number;
-  perplexity?: number;
-  gemini?: number;
+  [llm: string]: string | number | undefined;
 }
 
 export function BarometersPage() {
@@ -36,22 +42,11 @@ export function BarometersPage() {
   const [webSearchLengthData, setWebSearchLengthData] = useState<TimeSeriesData[]>([]);
   const [webSearchTriggerPercentageData, setWebSearchTriggerPercentageData] = useState<TimeSeriesData[]>([]);
 
-  // State to track visible lines for each chart
-  const [visibleLinesCount, setVisibleLinesCount] = useState<{ [key: string]: boolean }>({
-    searchgpt: true,
-    perplexity: true,
-    gemini: true,
-  });
-  const [visibleLinesLength, setVisibleLinesLength] = useState<{ [key: string]: boolean }>({
-    searchgpt: true,
-    perplexity: true,
-    gemini: true,
-  });
-  const [visibleLinesTrigger, setVisibleLinesTrigger] = useState<{ [key: string]: boolean }>({
-    searchgpt: true,
-    perplexity: true,
-    gemini: true,
-  });
+  // State to track visible lines for each chart - default all LLMs to visible
+  const defaultVisible = Object.keys(LLM_COLORS).reduce((acc, k) => ({ ...acc, [k]: true }), {} as Record<string, boolean>);
+  const [visibleLinesCount, setVisibleLinesCount] = useState<{ [key: string]: boolean }>(defaultVisible);
+  const [visibleLinesLength, setVisibleLinesLength] = useState<{ [key: string]: boolean }>(defaultVisible);
+  const [visibleLinesTrigger, setVisibleLinesTrigger] = useState<{ [key: string]: boolean }>(defaultVisible);
 
   // More discreet grid color in dark mode
   const gridColor = isDarkMode ? '#374151' : '#e5e7eb';
@@ -144,16 +139,22 @@ export function BarometersPage() {
     data.forEach((row) => {
       const date = row.time_period;
       const llm = row.llm;
-      const value = parseFloat(row.value);
+      const value = row.value != null ? parseFloat(row.value) : null;
 
       if (!dateMap[date]) {
         dateMap[date] = { date };
       }
 
-      dateMap[date][llm as keyof TimeSeriesData] = value;
+      // Only set value if it's a valid number (skip null/NaN)
+      if (value !== null && !isNaN(value)) {
+        dateMap[date][llm] = value;
+      }
     });
 
-    return Object.values(dateMap).sort((a, b) => a.date.localeCompare(b.date));
+    // Only keep dates that have at least one valid data point
+    return Object.values(dateMap)
+      .filter(d => Object.keys(d).some(k => k !== 'date' && d[k] !== undefined))
+      .sort((a, b) => (a.date as string).localeCompare(b.date as string));
   };
 
   const formatXAxis = (date: string) => {

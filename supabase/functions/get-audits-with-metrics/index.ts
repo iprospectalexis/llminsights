@@ -91,6 +91,7 @@ Deno.serve(async (req: Request) => {
         progress,
         started_at,
         finished_at,
+        processing_started_at,
         created_at,
         run_by,
         projects (

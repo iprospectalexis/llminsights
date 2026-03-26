@@ -26,7 +26,8 @@ import {
   PanelLeftClose,
   PanelLeftOpen,
   LayoutDashboard,
-  Eye
+  Eye,
+  X
 } from 'lucide-react';
 import { useProject } from '../../contexts/ProjectContext';
 
@@ -50,12 +51,17 @@ interface SidebarProps {
   isOpen: boolean;
   onToggleCollapse?: () => void;
   collapsed?: boolean;
+  isMobile?: boolean;
+  onMobileClose?: () => void;
 }
 
-export const Sidebar: React.FC<SidebarProps> = ({ user, userProfile, isOpen, onToggleCollapse, collapsed }) => {
+export const Sidebar: React.FC<SidebarProps> = ({ user, userProfile, isOpen, onToggleCollapse, collapsed, isMobile, onMobileClose }) => {
   const location = useLocation();
   const { selectedProject } = useProject();
-  const [isCollapsed, setIsCollapsed] = useState(collapsed || false);
+  const [isCollapsed, setIsCollapsed] = useState(isMobile ? false : (collapsed || false));
+
+  // On mobile, sidebar is always expanded
+  const effectiveCollapsed = isMobile ? false : isCollapsed;
 
   useEffect(() => {
     if (collapsed !== undefined) {
@@ -91,7 +97,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ user, userProfile, isOpen, onT
   }, [location.pathname]);
 
   const toggleExpanded = (itemName: string) => {
-    if (isCollapsed) {
+    if (effectiveCollapsed) {
       setIsCollapsed(false);
       setTimeout(() => {
         setExpandedItems(prev =>
@@ -117,18 +123,26 @@ export const Sidebar: React.FC<SidebarProps> = ({ user, userProfile, isOpen, onT
       animate={{
         x: 0,
         opacity: 1,
-        width: isCollapsed ? '80px' : '280px'
+        width: effectiveCollapsed ? '80px' : '280px'
       }}
       transition={{ duration: 0.3, ease: 'easeInOut' }}
       className="bg-white dark:bg-gray-900 border-r border-gray-200 dark:border-gray-800 h-full flex flex-col overflow-hidden"
     >
-      {/* macOS-style Window Dots */}
+      {/* macOS-style Window Dots + Mobile close */}
       <div className="px-5 py-4 flex items-center justify-between">
         <div className="flex items-center space-x-2">
           <div className="w-3 h-3 rounded-full bg-red-500"></div>
           <div className="w-3 h-3 rounded-full bg-yellow-500"></div>
           <div className="w-3 h-3 rounded-full bg-green-500"></div>
         </div>
+        {isMobile && onMobileClose && (
+          <button
+            onClick={onMobileClose}
+            className="p-1.5 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 text-gray-500"
+          >
+            <X className="w-5 h-5" />
+          </button>
+        )}
       </div>
 
       {/* Logo and App Name */}
@@ -146,7 +160,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ user, userProfile, isOpen, onT
               />
             </div>
             <AnimatePresence>
-              {!isCollapsed && (
+              {!effectiveCollapsed && (
                 <motion.span
                   initial={{ opacity: 0, width: 0 }}
                   animate={{ opacity: 1, width: 'auto' }}
@@ -166,7 +180,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ user, userProfile, isOpen, onT
       <div className="flex-1 overflow-y-auto px-3">
         {/* MAIN MENU Section */}
         <div className="mb-6">
-          {!isCollapsed && (
+          {!effectiveCollapsed && (
             <div className="px-3 mb-2">
               <h3 className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider">
                 Main Menu
@@ -191,13 +205,13 @@ export const Sidebar: React.FC<SidebarProps> = ({ user, userProfile, isOpen, onT
                             ? 'bg-[rgb(243,232,255)] text-[rgb(126,34,206)] dark:bg-purple-900/30 dark:text-purple-300'
                             : 'text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800'
                           }
-                          ${isCollapsed ? 'justify-center' : ''}
+                          ${effectiveCollapsed ? 'justify-center' : ''}
                         `}
-                        title={isCollapsed ? item.name : ''}
+                        title={effectiveCollapsed ? item.name : ''}
                       >
-                        <item.icon className={`w-5 h-5 ${isCollapsed ? '' : 'mr-3'} flex-shrink-0`} />
+                        <item.icon className={`w-5 h-5 ${effectiveCollapsed ? '' : 'mr-3'} flex-shrink-0`} />
                         <AnimatePresence>
-                          {!isCollapsed && (
+                          {!effectiveCollapsed && (
                             <motion.span
                               initial={{ opacity: 0, width: 0 }}
                               animate={{ opacity: 1, width: 'auto' }}
@@ -209,7 +223,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ user, userProfile, isOpen, onT
                             </motion.span>
                           )}
                         </AnimatePresence>
-                        {!isCollapsed && (
+                        {!effectiveCollapsed && (
                           <span className="ml-auto">
                             {isExpanded ? (
                               <ChevronDown className="w-4 h-4" />
@@ -220,7 +234,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ user, userProfile, isOpen, onT
                         )}
                       </button>
                       <AnimatePresence>
-                        {isExpanded && !isCollapsed && item.children && (
+                        {isExpanded && !effectiveCollapsed && item.children && (
                           <motion.div
                             initial={{ opacity: 0, height: 0 }}
                             animate={{ opacity: 1, height: 'auto' }}
@@ -259,13 +273,13 @@ export const Sidebar: React.FC<SidebarProps> = ({ user, userProfile, isOpen, onT
                           ? 'bg-[rgb(243,232,255)] text-[rgb(126,34,206)] dark:bg-purple-900/30 dark:text-purple-300'
                           : 'text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800'
                         }
-                        ${isCollapsed ? 'justify-center' : ''}
+                        ${effectiveCollapsed ? 'justify-center' : ''}
                       `}
-                      title={isCollapsed ? item.name : ''}
+                      title={effectiveCollapsed ? item.name : ''}
                     >
-                      <item.icon className={`w-5 h-5 ${isCollapsed ? '' : 'mr-3'} flex-shrink-0`} />
+                      <item.icon className={`w-5 h-5 ${effectiveCollapsed ? '' : 'mr-3'} flex-shrink-0`} />
                       <AnimatePresence>
-                        {!isCollapsed && (
+                        {!effectiveCollapsed && (
                           <motion.span
                             initial={{ opacity: 0, width: 0 }}
                             animate={{ opacity: 1, width: 'auto' }}
@@ -287,7 +301,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ user, userProfile, isOpen, onT
 
         {selectedProject && (
           <div className="mb-6">
-            {!isCollapsed && (
+            {!effectiveCollapsed && (
               <div className="px-3 mb-2">
                 <h3 className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider truncate">
                   {selectedProject.name}
@@ -303,19 +317,19 @@ export const Sidebar: React.FC<SidebarProps> = ({ user, userProfile, isOpen, onT
                     ? 'bg-[rgb(243,232,255)] text-[rgb(126,34,206)] dark:bg-purple-900/30 dark:text-purple-300'
                     : 'text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800'
                   }
-                  ${isCollapsed ? 'justify-center px-3' : 'pl-9 pr-3'}
+                  ${effectiveCollapsed ? 'justify-center px-3' : 'pl-9 pr-3'}
                 `}
-                title={isCollapsed ? 'Overview' : ''}
+                title={effectiveCollapsed ? 'Overview' : ''}
               >
-                {!isCollapsed && (
+                {!effectiveCollapsed && (
                   <div className="absolute left-3 top-0 bottom-0 flex items-center">
                     <div className="w-px h-full bg-gray-300 dark:bg-gray-700"></div>
                     <div className="absolute left-0 top-1/2 -translate-y-1/2 w-3 h-px bg-gray-300 dark:bg-gray-700"></div>
                   </div>
                 )}
-                <LayoutDashboard className={`w-4 h-4 ${isCollapsed ? '' : 'mr-3'} flex-shrink-0 ${!isCollapsed && 'relative z-10'}`} />
+                <LayoutDashboard className={`w-4 h-4 ${effectiveCollapsed ? '' : 'mr-3'} flex-shrink-0 ${!effectiveCollapsed && 'relative z-10'}`} />
                 <AnimatePresence>
-                  {!isCollapsed && (
+                  {!effectiveCollapsed && (
                     <motion.span
                       initial={{ opacity: 0, width: 0 }}
                       animate={{ opacity: 1, width: 'auto' }}
@@ -336,19 +350,19 @@ export const Sidebar: React.FC<SidebarProps> = ({ user, userProfile, isOpen, onT
                     ? 'bg-[rgb(243,232,255)] text-[rgb(126,34,206)] dark:bg-purple-900/30 dark:text-purple-300'
                     : 'text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800'
                   }
-                  ${isCollapsed ? 'justify-center px-3' : 'pl-9 pr-3'}
+                  ${effectiveCollapsed ? 'justify-center px-3' : 'pl-9 pr-3'}
                 `}
-                title={isCollapsed ? 'Prompts' : ''}
+                title={effectiveCollapsed ? 'Prompts' : ''}
               >
-                {!isCollapsed && (
+                {!effectiveCollapsed && (
                   <div className="absolute left-3 top-0 bottom-0 flex items-center">
                     <div className="w-px h-full bg-gray-300 dark:bg-gray-700"></div>
                     <div className="absolute left-0 top-1/2 -translate-y-1/2 w-3 h-px bg-gray-300 dark:bg-gray-700"></div>
                   </div>
                 )}
-                <MessageCircle className={`w-4 h-4 ${isCollapsed ? '' : 'mr-3'} flex-shrink-0 ${!isCollapsed && 'relative z-10'}`} />
+                <MessageCircle className={`w-4 h-4 ${effectiveCollapsed ? '' : 'mr-3'} flex-shrink-0 ${!effectiveCollapsed && 'relative z-10'}`} />
                 <AnimatePresence>
-                  {!isCollapsed && (
+                  {!effectiveCollapsed && (
                     <motion.span
                       initial={{ opacity: 0, width: 0 }}
                       animate={{ opacity: 1, width: 'auto' }}
@@ -369,19 +383,19 @@ export const Sidebar: React.FC<SidebarProps> = ({ user, userProfile, isOpen, onT
                     ? 'bg-[rgb(243,232,255)] text-[rgb(126,34,206)] dark:bg-purple-900/30 dark:text-purple-300'
                     : 'text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800'
                   }
-                  ${isCollapsed ? 'justify-center px-3' : 'pl-9 pr-3'}
+                  ${effectiveCollapsed ? 'justify-center px-3' : 'pl-9 pr-3'}
                 `}
-                title={isCollapsed ? 'Pages' : ''}
+                title={effectiveCollapsed ? 'Pages' : ''}
               >
-                {!isCollapsed && (
+                {!effectiveCollapsed && (
                   <div className="absolute left-3 top-0 bottom-0 flex items-center">
                     <div className="w-px h-full bg-gray-300 dark:bg-gray-700"></div>
                     <div className="absolute left-0 top-1/2 -translate-y-1/2 w-3 h-px bg-gray-300 dark:bg-gray-700"></div>
                   </div>
                 )}
-                <FileText className={`w-4 h-4 ${isCollapsed ? '' : 'mr-3'} flex-shrink-0 ${!isCollapsed && 'relative z-10'}`} />
+                <FileText className={`w-4 h-4 ${effectiveCollapsed ? '' : 'mr-3'} flex-shrink-0 ${!effectiveCollapsed && 'relative z-10'}`} />
                 <AnimatePresence>
-                  {!isCollapsed && (
+                  {!effectiveCollapsed && (
                     <motion.span
                       initial={{ opacity: 0, width: 0 }}
                       animate={{ opacity: 1, width: 'auto' }}
@@ -402,19 +416,19 @@ export const Sidebar: React.FC<SidebarProps> = ({ user, userProfile, isOpen, onT
                     ? 'bg-[rgb(243,232,255)] text-[rgb(126,34,206)] dark:bg-purple-900/30 dark:text-purple-300'
                     : 'text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800'
                   }
-                  ${isCollapsed ? 'justify-center px-3' : 'pl-9 pr-3'}
+                  ${effectiveCollapsed ? 'justify-center px-3' : 'pl-9 pr-3'}
                 `}
-                title={isCollapsed ? 'Domains' : ''}
+                title={effectiveCollapsed ? 'Domains' : ''}
               >
-                {!isCollapsed && (
+                {!effectiveCollapsed && (
                   <div className="absolute left-3 top-0 bottom-0 flex items-center">
                     <div className="w-px h-full bg-gray-300 dark:bg-gray-700"></div>
                     <div className="absolute left-0 top-1/2 -translate-y-1/2 w-3 h-px bg-gray-300 dark:bg-gray-700"></div>
                   </div>
                 )}
-                <Globe className={`w-4 h-4 ${isCollapsed ? '' : 'mr-3'} flex-shrink-0 ${!isCollapsed && 'relative z-10'}`} />
+                <Globe className={`w-4 h-4 ${effectiveCollapsed ? '' : 'mr-3'} flex-shrink-0 ${!effectiveCollapsed && 'relative z-10'}`} />
                 <AnimatePresence>
-                  {!isCollapsed && (
+                  {!effectiveCollapsed && (
                     <motion.span
                       initial={{ opacity: 0, width: 0 }}
                       animate={{ opacity: 1, width: 'auto' }}
@@ -435,19 +449,19 @@ export const Sidebar: React.FC<SidebarProps> = ({ user, userProfile, isOpen, onT
                     ? 'bg-[rgb(243,232,255)] text-[rgb(126,34,206)] dark:bg-purple-900/30 dark:text-purple-300'
                     : 'text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800'
                   }
-                  ${isCollapsed ? 'justify-center px-3' : 'pl-9 pr-3'}
+                  ${effectiveCollapsed ? 'justify-center px-3' : 'pl-9 pr-3'}
                 `}
-                title={isCollapsed ? 'Mentions' : ''}
+                title={effectiveCollapsed ? 'Mentions' : ''}
               >
-                {!isCollapsed && (
+                {!effectiveCollapsed && (
                   <div className="absolute left-3 top-0 bottom-0 flex items-center">
                     <div className="w-px h-full bg-gray-300 dark:bg-gray-700"></div>
                     <div className="absolute left-0 top-1/2 -translate-y-1/2 w-3 h-px bg-gray-300 dark:bg-gray-700"></div>
                   </div>
                 )}
-                <BadgeCheck className={`w-4 h-4 ${isCollapsed ? '' : 'mr-3'} flex-shrink-0 ${!isCollapsed && 'relative z-10'}`} />
+                <BadgeCheck className={`w-4 h-4 ${effectiveCollapsed ? '' : 'mr-3'} flex-shrink-0 ${!effectiveCollapsed && 'relative z-10'}`} />
                 <AnimatePresence>
-                  {!isCollapsed && (
+                  {!effectiveCollapsed && (
                     <motion.span
                       initial={{ opacity: 0, width: 0 }}
                       animate={{ opacity: 1, width: 'auto' }}
@@ -468,19 +482,19 @@ export const Sidebar: React.FC<SidebarProps> = ({ user, userProfile, isOpen, onT
                     ? 'bg-[rgb(243,232,255)] text-[rgb(126,34,206)] dark:bg-purple-900/30 dark:text-purple-300'
                     : 'text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800'
                   }
-                  ${isCollapsed ? 'justify-center px-3' : 'pl-9 pr-3'}
+                  ${effectiveCollapsed ? 'justify-center px-3' : 'pl-9 pr-3'}
                 `}
-                title={isCollapsed ? 'Insights' : ''}
+                title={effectiveCollapsed ? 'Insights' : ''}
               >
-                {!isCollapsed && (
+                {!effectiveCollapsed && (
                   <div className="absolute left-3 top-0 bottom-0 flex items-center">
                     <div className="w-px h-full bg-gray-300 dark:bg-gray-700"></div>
                     <div className="absolute left-0 top-1/2 -translate-y-1/2 w-3 h-px bg-gray-300 dark:bg-gray-700"></div>
                   </div>
                 )}
-                <Lightbulb className={`w-4 h-4 ${isCollapsed ? '' : 'mr-3'} flex-shrink-0 ${!isCollapsed && 'relative z-10'}`} />
+                <Lightbulb className={`w-4 h-4 ${effectiveCollapsed ? '' : 'mr-3'} flex-shrink-0 ${!effectiveCollapsed && 'relative z-10'}`} />
                 <AnimatePresence>
-                  {!isCollapsed && (
+                  {!effectiveCollapsed && (
                     <motion.span
                       initial={{ opacity: 0, width: 0 }}
                       animate={{ opacity: 1, width: 'auto' }}
@@ -501,19 +515,19 @@ export const Sidebar: React.FC<SidebarProps> = ({ user, userProfile, isOpen, onT
                     ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-100'
                     : 'text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800'
                   }
-                  ${isCollapsed ? 'justify-center px-3' : 'pl-9 pr-3'}
+                  ${effectiveCollapsed ? 'justify-center px-3' : 'pl-9 pr-3'}
                 `}
-                title={isCollapsed ? 'Settings' : ''}
+                title={effectiveCollapsed ? 'Settings' : ''}
               >
-                {!isCollapsed && (
+                {!effectiveCollapsed && (
                   <div className="absolute left-3 top-0 bottom-0 flex items-center">
                     <div className="w-px h-full bg-gray-300 dark:bg-gray-700"></div>
                     <div className="absolute left-0 top-1/2 -translate-y-1/2 w-3 h-px bg-gray-300 dark:bg-gray-700"></div>
                   </div>
                 )}
-                <Settings className={`w-4 h-4 ${isCollapsed ? '' : 'mr-3'} flex-shrink-0 ${!isCollapsed && 'relative z-10'}`} />
+                <Settings className={`w-4 h-4 ${effectiveCollapsed ? '' : 'mr-3'} flex-shrink-0 ${!effectiveCollapsed && 'relative z-10'}`} />
                 <AnimatePresence>
-                  {!isCollapsed && (
+                  {!effectiveCollapsed && (
                     <motion.span
                       initial={{ opacity: 0, width: 0 }}
                       animate={{ opacity: 1, width: 'auto' }}
@@ -532,7 +546,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ user, userProfile, isOpen, onT
 
         {/* Tools Section */}
         <div className="mb-6">
-          {!isCollapsed && (
+          {!effectiveCollapsed && (
             <div className="px-3 mb-2">
               <h3 className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider">
                 Tools
@@ -548,13 +562,13 @@ export const Sidebar: React.FC<SidebarProps> = ({ user, userProfile, isOpen, onT
                   ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-100'
                   : 'text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800'
                 }
-                ${isCollapsed ? 'justify-center' : ''}
+                ${effectiveCollapsed ? 'justify-center' : ''}
               `}
-              title={isCollapsed ? 'Prompt Finder' : ''}
+              title={effectiveCollapsed ? 'Prompt Finder' : ''}
             >
-              <Search className={`w-5 h-5 ${isCollapsed ? '' : 'mr-3'} flex-shrink-0`} />
+              <Search className={`w-5 h-5 ${effectiveCollapsed ? '' : 'mr-3'} flex-shrink-0`} />
               <AnimatePresence>
-                {!isCollapsed && (
+                {!effectiveCollapsed && (
                   <motion.span
                     initial={{ opacity: 0, width: 0 }}
                     animate={{ opacity: 1, width: 'auto' }}
@@ -581,13 +595,13 @@ export const Sidebar: React.FC<SidebarProps> = ({ user, userProfile, isOpen, onT
                         ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-100'
                         : 'text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800'
                       }
-                      ${isCollapsed ? 'justify-center' : ''}
+                      ${effectiveCollapsed ? 'justify-center' : ''}
                     `}
-                    title={isCollapsed ? 'Barometers' : ''}
+                    title={effectiveCollapsed ? 'Barometers' : ''}
                   >
-                    <Telescope className={`w-5 h-5 ${isCollapsed ? '' : 'mr-3'} flex-shrink-0`} />
+                    <Telescope className={`w-5 h-5 ${effectiveCollapsed ? '' : 'mr-3'} flex-shrink-0`} />
                     <AnimatePresence>
-                      {!isCollapsed && (
+                      {!effectiveCollapsed && (
                         <>
                           <motion.span
                             initial={{ opacity: 0, width: 0 }}
@@ -610,7 +624,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ user, userProfile, isOpen, onT
                     </AnimatePresence>
                   </button>
                   <AnimatePresence>
-                    {isBarometersExpanded && !isCollapsed && (
+                    {isBarometersExpanded && !effectiveCollapsed && (
                       <motion.div
                         initial={{ opacity: 0, height: 0 }}
                         animate={{ opacity: 1, height: 'auto' }}
@@ -641,7 +655,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ user, userProfile, isOpen, onT
 
         {/* Settings Section */}
         <div className="mb-6">
-          {!isCollapsed && (
+          {!effectiveCollapsed && (
             <div className="px-3 mb-2">
               <h3 className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider">
                 Settings
@@ -657,13 +671,13 @@ export const Sidebar: React.FC<SidebarProps> = ({ user, userProfile, isOpen, onT
                   ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-100'
                   : 'text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800'
                 }
-                ${isCollapsed ? 'justify-center' : ''}
+                ${effectiveCollapsed ? 'justify-center' : ''}
               `}
-              title={isCollapsed ? 'Account' : ''}
+              title={effectiveCollapsed ? 'Account' : ''}
             >
-              <Settings className={`w-5 h-5 ${isCollapsed ? '' : 'mr-3'} flex-shrink-0`} />
+              <Settings className={`w-5 h-5 ${effectiveCollapsed ? '' : 'mr-3'} flex-shrink-0`} />
               <AnimatePresence>
-                {!isCollapsed && (
+                {!effectiveCollapsed && (
                   <motion.span
                     initial={{ opacity: 0, width: 0 }}
                     animate={{ opacity: 1, width: 'auto' }}
@@ -684,13 +698,13 @@ export const Sidebar: React.FC<SidebarProps> = ({ user, userProfile, isOpen, onT
                   ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-100'
                   : 'text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800'
                 }
-                ${isCollapsed ? 'justify-center' : ''}
+                ${effectiveCollapsed ? 'justify-center' : ''}
               `}
-              title={isCollapsed ? 'Team' : ''}
+              title={effectiveCollapsed ? 'Team' : ''}
             >
-              <Users className={`w-5 h-5 ${isCollapsed ? '' : 'mr-3'} flex-shrink-0`} />
+              <Users className={`w-5 h-5 ${effectiveCollapsed ? '' : 'mr-3'} flex-shrink-0`} />
               <AnimatePresence>
-                {!isCollapsed && (
+                {!effectiveCollapsed && (
                   <motion.span
                     initial={{ opacity: 0, width: 0 }}
                     animate={{ opacity: 1, width: 'auto' }}
@@ -712,13 +726,13 @@ export const Sidebar: React.FC<SidebarProps> = ({ user, userProfile, isOpen, onT
                     ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-100'
                     : 'text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800'
                   }
-                  ${isCollapsed ? 'justify-center' : ''}
+                  ${effectiveCollapsed ? 'justify-center' : ''}
                 `}
-                title={isCollapsed ? 'Settings' : ''}
+                title={effectiveCollapsed ? 'Settings' : ''}
               >
-                <Settings className={`w-5 h-5 ${isCollapsed ? '' : 'mr-3'} flex-shrink-0`} />
+                <Settings className={`w-5 h-5 ${effectiveCollapsed ? '' : 'mr-3'} flex-shrink-0`} />
                 <AnimatePresence>
-                  {!isCollapsed && (
+                  {!effectiveCollapsed && (
                     <motion.span
                       initial={{ opacity: 0, width: 0 }}
                       animate={{ opacity: 1, width: 'auto' }}
@@ -732,44 +746,46 @@ export const Sidebar: React.FC<SidebarProps> = ({ user, userProfile, isOpen, onT
                 </AnimatePresence>
               </NavLink>
             )}
-            <button
-              onClick={() => {
-                const newState = !isCollapsed;
-                setIsCollapsed(newState);
-                if (onToggleCollapse) {
-                  onToggleCollapse();
-                }
-              }}
-              className={`
-                w-full flex items-center px-3 py-2.5 text-sm font-medium rounded-xl transition-all duration-200
-                text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800
-                ${isCollapsed ? 'justify-center' : ''}
-              `}
-              title={isCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
-            >
-              {isCollapsed ? (
-                <PanelLeftOpen className="w-5 h-5 flex-shrink-0" />
-              ) : (
-                <>
-                  <PanelLeftClose className="w-5 h-5 mr-3 flex-shrink-0" />
-                  <motion.span
-                    initial={{ opacity: 0, width: 0 }}
-                    animate={{ opacity: 1, width: 'auto' }}
-                    exit={{ opacity: 0, width: 0 }}
-                    transition={{ duration: 0.2 }}
-                    className="overflow-hidden whitespace-nowrap"
-                  >
-                    Collapse
-                  </motion.span>
-                </>
-              )}
-            </button>
+            {!isMobile && (
+              <button
+                onClick={() => {
+                  const newState = !isCollapsed;
+                  setIsCollapsed(newState);
+                  if (onToggleCollapse) {
+                    onToggleCollapse();
+                  }
+                }}
+                className={`
+                  w-full flex items-center px-3 py-2.5 text-sm font-medium rounded-xl transition-all duration-200
+                  text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800
+                  ${effectiveCollapsed ? 'justify-center' : ''}
+                `}
+                title={effectiveCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+              >
+                {effectiveCollapsed ? (
+                  <PanelLeftOpen className="w-5 h-5 flex-shrink-0" />
+                ) : (
+                  <>
+                    <PanelLeftClose className="w-5 h-5 mr-3 flex-shrink-0" />
+                    <motion.span
+                      initial={{ opacity: 0, width: 0 }}
+                      animate={{ opacity: 1, width: 'auto' }}
+                      exit={{ opacity: 0, width: 0 }}
+                      transition={{ duration: 0.2 }}
+                      className="overflow-hidden whitespace-nowrap"
+                    >
+                      Collapse
+                    </motion.span>
+                  </>
+                )}
+              </button>
+            )}
           </nav>
         </div>
       </div>
 
       {/* Version Number */}
-      {!isCollapsed && (
+      {!effectiveCollapsed && (
         <div className="px-5 pb-4">
           <p className="text-xs text-gray-400 dark:text-gray-600 text-center">
             v1.5.2

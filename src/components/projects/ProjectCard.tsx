@@ -6,12 +6,19 @@ import { Globe, Calendar, Users, Play, Trash2 } from 'lucide-react';
 import { format } from 'date-fns';
 import { getCountryByCode } from '../../utils/countries';
 
+interface ProjectGroup {
+  id: string;
+  name: string;
+  color: string;
+}
+
 interface Project {
   id: string;
   name: string;
   domain: string;
   country: string;
   created_at: string;
+  _groups?: ProjectGroup[];
   _metrics?: {
     prompts: number;
     mentionRate: number;
@@ -33,6 +40,7 @@ export const ProjectCard: React.FC<ProjectCardProps> = ({
   onDelete,
 }) => {
   const countryInfo = getCountryByCode(project.country);
+  const groups = project._groups || [];
 
   return (
     <motion.div
@@ -105,6 +113,29 @@ export const ProjectCard: React.FC<ProjectCardProps> = ({
                   </div>
                 )}
               </div>
+
+              {/* Group badges */}
+              {groups.length > 0 && (
+                <div className="flex flex-wrap gap-1.5 mt-2.5">
+                  {groups.map(g => (
+                    <span
+                      key={g.id}
+                      className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium border"
+                      style={{
+                        backgroundColor: `${g.color}15`,
+                        borderColor: `${g.color}40`,
+                        color: g.color,
+                      }}
+                    >
+                      <span
+                        className="w-1.5 h-1.5 rounded-full flex-shrink-0"
+                        style={{ backgroundColor: g.color }}
+                      />
+                      {g.name}
+                    </span>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
         </CardHeader>

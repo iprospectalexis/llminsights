@@ -168,7 +168,7 @@ export const SettingsPage: React.FC = () => {
       </div>
 
       {/* Data Providers Section */}
-      <div className="bg-white dark:bg-gray-800 rounded-xl shadow-sm border border-gray-200 dark:border-gray-700 p-8 mb-6">
+      <div className="bg-white dark:bg-gray-800 rounded-xl shadow-sm border border-gray-200 dark:border-gray-700 p-4 md:p-8 mb-6">
         <div className="flex items-center space-x-3 mb-6">
           <Database className="w-6 h-6 text-brand-primary" />
           <h2 className="text-2xl font-bold text-gray-900 dark:text-white">
@@ -296,7 +296,7 @@ export const SettingsPage: React.FC = () => {
       </div>
 
       {/* Test Data Provider Section */}
-      <div className="bg-white dark:bg-gray-800 rounded-xl shadow-sm border border-gray-200 dark:border-gray-700 p-8 mb-6">
+      <div className="bg-white dark:bg-gray-800 rounded-xl shadow-sm border border-gray-200 dark:border-gray-700 p-4 md:p-8 mb-6">
         <div className="flex items-center space-x-3 mb-6">
           <TestTube className="w-6 h-6 text-brand-primary" />
           <h2 className="text-2xl font-bold text-gray-900 dark:text-white">

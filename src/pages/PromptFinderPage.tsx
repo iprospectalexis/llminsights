@@ -804,7 +804,7 @@ export const PromptFinderPage: React.FC = () => {
             <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-100">Configuration</h2>
           </CardHeader>
           <CardContent className="space-y-6">
-            <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
+            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4 md:gap-6">
               <Input
                 label="Brand / Company / Website *"
                 value={domain}
@@ -893,7 +893,7 @@ export const PromptFinderPage: React.FC = () => {
           <h2 className="text-xl font-semibold text-gray-900 dark:text-gray-100 text-center">Choose a framework *</h2>
           
           {/* Results-based Frameworks */}
-          <div className="bg-gradient-to-r from-indigo-50 to-teal-50 dark:from-indigo-900/20 dark:to-teal-900/20 rounded-2xl p-8 border border-indigo-100 dark:border-indigo-800">
+          <div className="bg-gradient-to-r from-indigo-50 to-teal-50 dark:from-indigo-900/20 dark:to-teal-900/20 rounded-2xl p-4 md:p-8 border border-indigo-100 dark:border-indigo-800">
             <div className="text-center mb-8">
               <div className="inline-flex items-center justify-center w-16 h-16 bg-gradient-to-r from-indigo-500 to-teal-500 rounded-full mb-4">
                 <BarChart3 className="w-8 h-8 text-white" />
@@ -903,7 +903,7 @@ export const PromptFinderPage: React.FC = () => {
                 Generate queries from existing data and observed results
               </p>
             </div>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6 max-w-4xl mx-auto">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 md:gap-6 max-w-4xl mx-auto">
               {resultsBasedFrameworks.map((framework) => (
                 <FrameworkCard
                   key={framework.id}
@@ -916,7 +916,7 @@ export const PromptFinderPage: React.FC = () => {
           </div>
 
           {/* Audience-based Frameworks */}
-          <div className="bg-gradient-to-r from-blue-50 to-purple-50 dark:from-blue-900/20 dark:to-purple-900/20 rounded-2xl p-8 border border-blue-100 dark:border-blue-800">
+          <div className="bg-gradient-to-r from-blue-50 to-purple-50 dark:from-blue-900/20 dark:to-purple-900/20 rounded-2xl p-4 md:p-8 border border-blue-100 dark:border-blue-800">
             <div className="text-center mb-8">
               <div className="inline-flex items-center justify-center w-16 h-16 bg-gradient-to-r from-blue-500 to-purple-500 rounded-full mb-4">
                 <Users className="w-8 h-8 text-white" />
@@ -926,7 +926,7 @@ export const PromptFinderPage: React.FC = () => {
                 Create queries based on user profiles and behaviors
               </p>
             </div>
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 md:gap-6">
               {audienceBasedFrameworks.map((framework) => (
                 <FrameworkCard
                   key={framework.id}
@@ -939,7 +939,7 @@ export const PromptFinderPage: React.FC = () => {
           </div>
 
           {/* Specific Frameworks */}
-          <div className="bg-gradient-to-r from-pink-50 to-amber-50 dark:from-pink-900/20 dark:to-amber-900/20 rounded-2xl p-8 border border-pink-100 dark:border-pink-800">
+          <div className="bg-gradient-to-r from-pink-50 to-amber-50 dark:from-pink-900/20 dark:to-amber-900/20 rounded-2xl p-4 md:p-8 border border-pink-100 dark:border-pink-800">
             <div className="text-center mb-8">
               <div className="inline-flex items-center justify-center w-16 h-16 bg-gradient-to-r from-pink-500 to-amber-500 rounded-full mb-4">
                 <Lightbulb className="w-8 h-8 text-white" />
@@ -949,7 +949,7 @@ export const PromptFinderPage: React.FC = () => {
                 Use specialized frameworks for specific use cases
               </p>
             </div>
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4 md:gap-6">
               {specificFrameworks.map((framework) => (
                 <FrameworkCard
                   key={framework.id}
@@ -1042,7 +1042,7 @@ export const PromptFinderPage: React.FC = () => {
           {selectedFramework === 'personas' && personas.length > 0 && !showCustomPersonaInput && (
             <div className="mt-8">
               <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100 mb-4">Select a persona</h3>
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4 md:gap-6">
                 {personas.map((persona, index) => (
                   <button
                     key={index}
@@ -1197,7 +1197,7 @@ export const PromptFinderPage: React.FC = () => {
           {selectedFramework === 'icp' && icpProfiles.length > 0 && !showCustomIcpInput && (
             <div className="mt-8">
               <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100 mb-4">Select an ideal customer profile</h3>
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4 md:gap-6">
                 {icpProfiles.map((icp, index) => (
                   <button
                     key={index}

@@ -11,6 +11,7 @@ import { CreateProjectModal } from '../components/projects/CreateProjectModal';
 import { RunAuditModal } from '../components/audit/RunAuditModal';
 import { AuditProgressToast } from '../components/audit/AuditProgressToast';
 import { supabase } from '../lib/supabase';
+import { queryCache } from '../lib/queryCache';
 import { Plus, Search, ListFilter as Filter, X, Calendar, Users, Globe, AlertTriangle, CheckCircle, XCircle, LayoutGrid, List, Play, Trash2 } from 'lucide-react';
 import { format } from 'date-fns';
 import { getCountryByCode } from '../utils/countries';
@@ -66,13 +67,16 @@ export const ProjectsPage: React.FC = () => {
       filtered = filtered.filter(project =>
         project.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
         project.domain.toLowerCase().includes(searchTerm.toLowerCase()) ||
-        project.group?.name.toLowerCase().includes(searchTerm.toLowerCase())
+        (project._groups || []).some((g: any) => g.name.toLowerCase().includes(searchTerm.toLowerCase()))
       );
     }
 
     // Apply group filter
     if (selectedGroup) {
-      filtered = filtered.filter(project => project.group_id === selectedGroup);
+      filtered = filtered.filter(project =>
+        (project._groups || []).some((g: any) => g.id === selectedGroup) ||
+        project.group_id === selectedGroup
+      );
     }
 
     // Apply country filter
@@ -125,6 +129,15 @@ export const ProjectsPage: React.FC = () => {
 
       console.log('ProjectsPage: Fetching projects for user:', session.user.email);
 
+      // Check cache first
+      const cached = queryCache.get<any[]>('projects:list');
+      if (cached) {
+        console.log('ProjectsPage: Using cached projects');
+        setProjects(cached);
+        setLoading(false);
+        return;
+      }
+
       // Fetch all projects with precomputed metrics
       // RLS policies will automatically filter based on user's role and project membership
       const { data: projectsData, error: projectsError } = await supabase
@@ -135,6 +148,14 @@ export const ProjectsPage: React.FC = () => {
             id,
             name,
             color
+          ),
+          project_groups (
+            group_id,
+            groups (
+              id,
+              name,
+              color
+            )
           ),
           project_metrics (
             mention_rate,
@@ -180,13 +201,24 @@ export const ProjectsPage: React.FC = () => {
           final: finalMetrics
         });
 
+        // Extract groups from junction table (project_groups), fallback to legacy groups FK
+        const projectGroupsList = (project.project_groups || [])
+          .map((pg: any) => pg.groups)
+          .filter(Boolean);
+        const legacyGroup = project.groups;
+        const resolvedGroups = projectGroupsList.length > 0
+          ? projectGroupsList
+          : (legacyGroup ? [legacyGroup] : []);
+
         return {
           ...project,
+          _groups: resolvedGroups,
           _metrics: finalMetrics
         };
       });
 
       console.log('✅ ProjectsPage: Projects with metrics:', projectsWithMetrics);
+      queryCache.set('projects:list', projectsWithMetrics, 60000); // Cache 60s
       setProjects(projectsWithMetrics);
     } catch (error) {
       console.error('Error fetching projects:', error);
@@ -230,6 +262,7 @@ export const ProjectsPage: React.FC = () => {
     console.log('Audit completed with ID:', auditId);
     setRunningAudits(prev => prev.filter(id => id !== auditId));
     // Refresh projects to show updated data
+    queryCache.invalidate('projects:list');
     fetchProjects();
   };
 
@@ -257,6 +290,7 @@ export const ProjectsPage: React.FC = () => {
       if (deleteError) throw deleteError;
 
       // Refresh projects list
+      queryCache.invalidate('projects:list');
       await fetchProjects();
 
       setResultMessage({
@@ -295,7 +329,7 @@ export const ProjectsPage: React.FC = () => {
       <motion.div
         initial={{ opacity: 0, y: 20 }}
         animate={{ opacity: 1, y: 0 }}
-        className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-6"
+        className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between sm:gap-6"
       >
         <div>
           <h1 className="text-4xl font-bold bg-gradient-to-r from-gray-900 via-gray-800 to-gray-900 dark:from-gray-100 dark:via-white dark:to-gray-100 bg-clip-text text-transparent">
@@ -421,7 +455,7 @@ export const ProjectsPage: React.FC = () => {
         <motion.div
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
-          className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6"
+          className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 md:gap-6"
         >
           {filteredProjects.map((project, index) => (
             <motion.div
@@ -457,7 +491,7 @@ export const ProjectsPage: React.FC = () => {
                 className="group"
               >
                 <div className="bg-gradient-to-br from-white via-white to-gray-50/30 dark:from-gray-800 dark:via-gray-800 dark:to-gray-900/30 backdrop-blur-sm border border-gray-200/50 dark:border-gray-700/50 rounded-2xl p-6 hover:shadow-2xl hover:shadow-gray-200/40 dark:hover:shadow-gray-900/40 transition-all duration-300">
-                  <div className="flex items-center justify-between gap-6">
+                  <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between sm:gap-6">
                     <div className="flex items-center gap-4 flex-1 min-w-0">
                       <div className="relative flex-shrink-0">
                         <div className="absolute inset-0 bg-gradient-to-br from-brand-primary/20 to-brand-secondary/20 rounded-xl blur-md opacity-0 group-hover:opacity-100 transition-opacity duration-300" />
@@ -506,13 +540,30 @@ export const ProjectsPage: React.FC = () => {
                               />
                             </div>
                           )}
+                          {(project._groups || []).map((g: any) => (
+                            <span
+                              key={g.id}
+                              className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium border"
+                              style={{
+                                backgroundColor: `${g.color}15`,
+                                borderColor: `${g.color}40`,
+                                color: g.color,
+                              }}
+                            >
+                              <span
+                                className="w-1.5 h-1.5 rounded-full flex-shrink-0"
+                                style={{ backgroundColor: g.color }}
+                              />
+                              {g.name}
+                            </span>
+                          ))}
                         </div>
                       </div>
                     </div>
 
                     <div className="flex items-center gap-4">
                       <div className="flex gap-3">
-                        <div className="relative overflow-hidden bg-gradient-to-br from-emerald-50 to-emerald-100/50 dark:from-emerald-900/20 dark:to-emerald-800/10 rounded-xl px-4 py-3 border border-emerald-200/50 dark:border-emerald-800/30 min-w-[100px]">
+                        <div className="relative overflow-hidden bg-gradient-to-br from-emerald-50 to-emerald-100/50 dark:from-emerald-900/20 dark:to-emerald-800/10 rounded-xl px-4 py-3 border border-emerald-200/50 dark:border-emerald-800/30">
                           <div className="absolute top-0 right-0 w-16 h-16 bg-emerald-400/10 rounded-full -mr-8 -mt-8" />
                           <div className="relative text-center">
                             <div className="text-2xl font-bold bg-gradient-to-br from-emerald-600 to-emerald-700 dark:from-emerald-400 dark:to-emerald-500 bg-clip-text text-transparent">
@@ -523,7 +574,7 @@ export const ProjectsPage: React.FC = () => {
                             </div>
                           </div>
                         </div>
-                        <div className="relative overflow-hidden bg-gradient-to-br from-blue-50 to-blue-100/50 dark:from-blue-900/20 dark:to-blue-800/10 rounded-xl px-4 py-3 border border-blue-200/50 dark:border-blue-800/30 min-w-[100px]">
+                        <div className="relative overflow-hidden bg-gradient-to-br from-blue-50 to-blue-100/50 dark:from-blue-900/20 dark:to-blue-800/10 rounded-xl px-4 py-3 border border-blue-200/50 dark:border-blue-800/30">
                           <div className="absolute top-0 right-0 w-16 h-16 bg-blue-400/10 rounded-full -mr-8 -mt-8" />
                           <div className="relative text-center">
                             <div className="text-2xl font-bold bg-gradient-to-br from-blue-600 to-blue-700 dark:from-blue-400 dark:to-blue-500 bg-clip-text text-transparent">
@@ -577,7 +628,7 @@ export const ProjectsPage: React.FC = () => {
       <CreateProjectModal
         isOpen={showCreateModal}
         onClose={() => setShowCreateModal(false)}
-        onSuccess={fetchProjects}
+        onSuccess={() => { queryCache.invalidate('projects:list'); fetchProjects(); }}
       />
 
       <RunAuditModal

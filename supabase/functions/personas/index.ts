@@ -36,14 +36,13 @@ async function callOpenAI(prompt: string, retryCount = 0): Promise<any> {
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-        model: 'gpt-4',
+        model: 'gpt-5-mini',
         messages: [
           {
             role: 'user',
             content: prompt
           }
         ],
-        temperature: 0.7
       })
     })
 

@@ -50,45 +50,50 @@ Deno.serve(async (req) => {
 
     // Call OpenAI using standard chat completions API
     const response = await openai.chat.completions.create({
-      model: "gpt-4o",
+      model: "gpt-5-mini",
       messages: [
         {
+          role: "system",
+          content: `You are a brand intelligence analyst. Your task is to extract all brand/company names mentioned in LLM-generated text, along with their context.
+
+Rules:
+- Extract ONLY real brand names, company names, or named services/products (not generic categories like "online insurers" or "local shops")
+- Normalize brand names to their most common form (e.g., "NIKE" → "Nike", "McDonald's Corp" → "McDonald's")
+- If the same brand appears multiple times, merge into one entry with combined strengths/weaknesses
+- Strengths = positive attributes, recommendations, advantages mentioned in the text
+- Weaknesses = negative attributes, limitations, criticisms mentioned in the text
+- If a brand is ranked or positioned (e.g., "#1", "top 3", "best"), capture the rank
+- Mention type: "recommended" if explicitly suggested, "compared" if part of a comparison, "mentioned" if just referenced
+- Respond in the SAME LANGUAGE as the analyzed text
+- Return valid JSON only`
+        },
+        {
           role: "user",
-          content: `I want to extract the brands mentioned in a text, taking into account the following prompt: [${prompt}]. For each mentioned brand, extract the following information in JSON format:
+          content: `Extract all brands/companies mentioned in this LLM response.
 
-name: The name of the brand (e.g., an insurance company or a service).
-strengths: A list of strengths or characteristics of the brand, as mentioned in the text, that are relevant to the prompt. For example, if the prompt concerns insurance, include information related to coverage, options, and plan flexibility.
+Context prompt that generated this response: "${prompt}"
 
-Expected output format:
+LLM response text:
+"""
+${answerText}
+"""
+
+Return JSON:
 {
   "brands": [
     {
-      "name": "Brand name",
-      "strengths": [
-        "Strength 1",
-        "Strength 2",
-        "Strength 3"
-      ]
-    },
-    {
-      "name": "Another brand",
-      "strengths": [
-        "Strength 1",
-        "Strength 2"
-      ]
+      "name": "Brand Name",
+      "strengths": ["strength 1", "strength 2"],
+      "weaknesses": ["weakness 1"],
+      "mention_type": "recommended" | "compared" | "mentioned",
+      "rank": null or number (if ranked in text)
     }
   ]
-}
-
-Make sure to extract all the mentioned brands and their respective strengths. If some brands do not have clearly defined strengths, indicate an empty list for strengths.
-
-Prompt: ${prompt}
-Text: ${answerText}`
+}`
         }
       ],
       response_format: { type: "json_object" },
-      temperature: 0.1,
-      max_tokens: 2048,
+      max_completion_tokens: 2048,
     })
 
     console.log('OpenAI response received')

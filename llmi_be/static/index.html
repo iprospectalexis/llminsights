@@ -1,0 +1,1013 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Sofia+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <title>LLM Insights API Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Sofia Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: #0f172a;
+            color: #e2e8f0;
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+
+        h1 {
+            font-size: 2rem;
+            background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 8px;
+        }
+
+        .subtitle {
+            color: #64748b;
+            font-size: 0.9rem;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+
+        @media (max-width: 900px) {
+            .grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .card {
+            background: #1e293b;
+            border-radius: 12px;
+            padding: 20px;
+            border: 1px solid #334155;
+        }
+
+        .card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+
+        .card-title {
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: #f1f5f9;
+        }
+
+        .badge {
+            padding: 4px 10px;
+            border-radius: 20px;
+            font-size: 0.75rem;
+            font-weight: 500;
+        }
+
+        .badge-blue { background: #1d4ed8; color: #dbeafe; }
+        .badge-green { background: #15803d; color: #dcfce7; }
+        .badge-yellow { background: #a16207; color: #fef3c7; }
+        .badge-red { background: #b91c1c; color: #fee2e2; }
+        .badge-gray { background: #475569; color: #e2e8f0; }
+        .badge-purple { background: #7c3aed; color: #ede9fe; }
+
+        textarea {
+            width: 100%;
+            height: 200px;
+            background: #0f172a;
+            border: 1px solid #334155;
+            border-radius: 8px;
+            padding: 12px;
+            color: #e2e8f0;
+            font-family: 'Monaco', 'Menlo', monospace;
+            font-size: 0.85rem;
+            resize: vertical;
+            margin-bottom: 15px;
+        }
+
+        textarea:focus {
+            outline: none;
+            border-color: #3b82f6;
+        }
+
+        input[type="text"],
+        input[type="password"] {
+            width: 100%;
+            background: #0f172a;
+            border: 1px solid #334155;
+            border-radius: 8px;
+            padding: 10px 12px;
+            color: #e2e8f0;
+            font-size: 0.9rem;
+            margin-bottom: 15px;
+        }
+
+        input[type="text"]:focus,
+        input[type="password"]:focus {
+            outline: none;
+            border-color: #3b82f6;
+        }
+
+        select {
+            width: 100%;
+            background: #0f172a;
+            border: 1px solid #334155;
+            border-radius: 8px;
+            padding: 10px 12px;
+            color: #e2e8f0;
+            font-size: 0.9rem;
+            margin-bottom: 15px;
+            cursor: pointer;
+        }
+
+        select:focus {
+            outline: none;
+            border-color: #3b82f6;
+        }
+
+        select option {
+            background: #1e293b;
+            color: #e2e8f0;
+        }
+
+        .form-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 15px;
+        }
+
+        @media (max-width: 600px) {
+            .form-row {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        label {
+            display: block;
+            font-size: 0.85rem;
+            color: #94a3b8;
+            margin-bottom: 6px;
+        }
+
+        .btn {
+            padding: 10px 20px;
+            border-radius: 8px;
+            font-size: 0.9rem;
+            font-weight: 500;
+            cursor: pointer;
+            border: none;
+            transition: all 0.2s;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+            color: white;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(59, 130, 246, 0.4);
+        }
+
+        .btn-primary:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+
+        .btn-secondary {
+            background: #334155;
+            color: #e2e8f0;
+        }
+
+        .btn-secondary:hover {
+            background: #475569;
+        }
+
+        .btn-sm {
+            padding: 6px 12px;
+            font-size: 0.8rem;
+        }
+
+        .btn-group {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+
+        .jobs-list {
+            max-height: 500px;
+            overflow-y: auto;
+        }
+
+        .job-item {
+            background: #0f172a;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 10px;
+            border: 1px solid #334155;
+            cursor: pointer;
+            transition: border-color 0.2s;
+        }
+
+        .job-item:hover {
+            border-color: #3b82f6;
+        }
+
+        .job-item.active {
+            border-color: #3b82f6;
+            background: #1a2744;
+        }
+
+        .job-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+
+        .job-id {
+            font-family: monospace;
+            font-size: 0.8rem;
+            color: #64748b;
+        }
+
+        .job-meta {
+            display: flex;
+            gap: 15px;
+            font-size: 0.8rem;
+            color: #94a3b8;
+        }
+
+        .progress-bar {
+            height: 6px;
+            background: #334155;
+            border-radius: 3px;
+            margin-top: 10px;
+            overflow: hidden;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #3b82f6, #8b5cf6);
+            border-radius: 3px;
+            transition: width 0.3s ease;
+        }
+
+        .detail-section {
+            margin-top: 20px;
+        }
+
+        .detail-title {
+            font-size: 0.85rem;
+            color: #64748b;
+            margin-bottom: 8px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .results-list {
+            background: #0f172a;
+            border-radius: 8px;
+            padding: 12px;
+            font-family: monospace;
+            font-size: 0.8rem;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+
+        .results-list a {
+            color: #60a5fa;
+            text-decoration: none;
+            display: block;
+            padding: 4px 0;
+            word-break: break-all;
+        }
+
+        .results-list a:hover {
+            text-decoration: underline;
+        }
+
+        .error-list {
+            color: #f87171;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 40px 20px;
+            color: #64748b;
+        }
+
+        .empty-state svg {
+            width: 48px;
+            height: 48px;
+            margin-bottom: 15px;
+            opacity: 0.5;
+        }
+
+        .spinner {
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            border: 2px solid #334155;
+            border-top-color: #3b82f6;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin-right: 8px;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .toast {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            background: #1e293b;
+            border: 1px solid #334155;
+            border-radius: 8px;
+            padding: 12px 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+            transform: translateY(100px);
+            opacity: 0;
+            transition: all 0.3s;
+        }
+
+        .toast.show {
+            transform: translateY(0);
+            opacity: 1;
+        }
+
+        .toast-success { border-color: #15803d; }
+        .toast-error { border-color: #b91c1c; }
+
+        .health-indicator {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 0.8rem;
+            color: #64748b;
+        }
+
+        .health-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #22c55e;
+        }
+
+        .health-dot.unhealthy {
+            background: #ef4444;
+        }
+
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+
+        .stat {
+            background: #0f172a;
+            border-radius: 8px;
+            padding: 12px;
+            text-align: center;
+        }
+
+        .stat-value {
+            font-size: 1.5rem;
+            font-weight: 600;
+            color: #f1f5f9;
+        }
+
+        .stat-label {
+            font-size: 0.75rem;
+            color: #64748b;
+            margin-top: 4px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🔍 LLM Insights API Dashboard</h1>
+            <p class="subtitle">Batch processing interface</p>
+        </header>
+
+        <div class="grid">
+            <!-- Left Column: Create Job -->
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">📝 Create New Job</span>
+                    <div class="health-indicator">
+                        <span class="health-dot" id="healthDot"></span>
+                        <span id="healthStatus">Checking...</span>
+                    </div>
+                </div>
+
+                <label for="prompts">Prompts (one per line)</label>
+                <textarea id="prompts" placeholder="Quel est le meilleur croissant de Paris ?
+Où manger le meilleur falafel dans le Marais ?
+Les meilleurs restaurants japonais rue Sainte-Anne ?"></textarea>
+
+                <label for="apiKey">API Key (required if configured on server)</label>
+                <input type="password" id="apiKey" placeholder="Enter your API key">
+
+                <label for="webhook">Webhook URL (optional)</label>
+                <input type="text" id="webhook" placeholder="https://webhook.site/your-unique-url">
+
+                <div class="form-row">
+                    <div>
+                        <label for="provider">API Provider</label>
+                        <select id="provider" onchange="updateSourceOptions()">
+                            <option value="serp">SERP API (100/batch)</option>
+                            <option value="brightdata">BrightData (500/batch)</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label for="source">AI Source</label>
+                        <select id="source">
+                            <option value="chatgpt">ChatGPT</option>
+                        </select>
+                    </div>
+                </div>
+
+                <label for="geoTargeting">Geo Targeting</label>
+                <input type="text" id="geoTargeting" value="Paris,Paris,Ile-de-France,France">
+
+                <div class="btn-group">
+                    <button class="btn btn-primary" id="submitBtn" onclick="createJob()">
+                        🚀 Submit Job
+                    </button>
+                    <button class="btn btn-secondary" onclick="loadJobs()">
+                        🔄 Refresh Jobs
+                    </button>
+                </div>
+            </div>
+
+            <!-- Right Column: Jobs List -->
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">📋 Jobs</span>
+                    <span class="badge badge-blue" id="jobCount">0 jobs</span>
+                </div>
+
+                <div class="stats">
+                    <div class="stat">
+                        <div class="stat-value" id="statPending">0</div>
+                        <div class="stat-label">Pending</div>
+                    </div>
+                    <div class="stat">
+                        <div class="stat-value" id="statProcessing">0</div>
+                        <div class="stat-label">Processing</div>
+                    </div>
+                    <div class="stat">
+                        <div class="stat-value" id="statCompleted">0</div>
+                        <div class="stat-label">Completed</div>
+                    </div>
+                </div>
+
+                <div class="jobs-list" id="jobsList">
+                    <div class="empty-state">
+                        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
+                        </svg>
+                        <p>No jobs yet</p>
+                        <p style="font-size: 0.8rem; margin-top: 5px;">Create your first job above</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Job Details -->
+        <div class="card" id="jobDetails" style="margin-top: 20px; display: none;">
+            <div class="card-header">
+                <span class="card-title">📊 Job Details</span>
+                <div class="btn-group">
+                    <button class="btn btn-secondary btn-sm" onclick="refreshSelectedJob()">🔄 Refresh</button>
+                    <button class="btn btn-secondary btn-sm" id="cancelBtn" onclick="cancelJob()">❌ Cancel</button>
+                    <button class="btn btn-secondary btn-sm" id="retryBtn" onclick="retryJob()" style="display: none;">🔁 Retry</button>
+                </div>
+            </div>
+
+            <div style="display: flex; gap: 15px; margin-bottom: 15px; font-size: 0.9rem; color: #94a3b8;">
+                <span>Provider: <strong id="detailProvider" style="color: #f8fafc;">SERP</strong></span>
+                <span>AI Source: <strong id="detailSource" style="color: #f8fafc;">ChatGPT</strong></span>
+            </div>
+
+            <div class="stats" style="grid-template-columns: repeat(5, 1fr);">
+                <div class="stat">
+                    <div class="stat-value" id="detailTotal">0</div>
+                    <div class="stat-label">Total Prompts</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-value" id="detailProcessed">0</div>
+                    <div class="stat-label">Processed</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-value" id="detailResults" style="color: #22c55e;">--</div>
+                    <div class="stat-label">Results</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-value" id="detailFailed">0</div>
+                    <div class="stat-label">Failed</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-value" id="detailDuration">--</div>
+                    <div class="stat-label">Duration</div>
+                </div>
+            </div>
+
+            <div class="progress-bar">
+                <div class="progress-fill" id="detailProgress" style="width: 0%"></div>
+            </div>
+
+            <div class="detail-section" id="mergedResultsSection" style="display: none;">
+                <div class="detail-title">📦 Results</div>
+                <div style="display: flex; align-items: center; gap: 15px; flex-wrap: wrap;">
+                    <span id="mergedResultsCount" style="color: #94a3b8;"></span>
+                    <button class="btn btn-secondary btn-sm" id="downloadRawBtn" onclick="downloadResults()">
+                        📥 Raw JSON
+                    </button>
+                    <button class="btn btn-primary btn-sm" id="downloadConvertedBtn" onclick="downloadConvertedResults()" style="display: none;">
+                        ⬇️ Converted JSON
+                    </button>
+                </div>
+            </div>
+
+            <div class="detail-section" id="resultsSection" style="display: none;">
+                <div class="detail-title">📁 Source Files</div>
+                <div class="results-list" id="resultsList"></div>
+            </div>
+
+            <div class="detail-section" id="errorsSection" style="display: none;">
+                <div class="detail-title">⚠️ Failed Queries</div>
+                <div class="results-list error-list" id="errorsList"></div>
+            </div>
+
+            <div class="detail-section" id="errorMessageSection" style="display: none;">
+                <div class="detail-title">❌ Error</div>
+                <div class="results-list error-list" id="errorMessage"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast -->
+    <div class="toast" id="toast">
+        <span id="toastMessage"></span>
+    </div>
+
+    <script>
+        const API_URL = '/api/v1';
+        let selectedJobId = null;
+        let autoRefreshInterval = null;
+
+        // Get headers with API key
+        function getHeaders(includeContentType = false) {
+            const headers = {};
+            const apiKey = document.getElementById('apiKey')?.value?.trim();
+            if (apiKey) {
+                headers['X-API-Key'] = apiKey;
+            }
+            if (includeContentType) {
+                headers['Content-Type'] = 'application/json';
+            }
+            return headers;
+        }
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', () => {
+            checkHealth();
+            loadJobs();
+            updateSourceOptions();  // Set source options based on default provider
+            setInterval(checkHealth, 30000);
+            setInterval(loadJobs, 10000);
+        });
+
+        // Health check
+        async function checkHealth() {
+            try {
+                const response = await fetch('/health');
+                const data = await response.json();
+                
+                const dot = document.getElementById('healthDot');
+                const status = document.getElementById('healthStatus');
+                
+                if (data.status === 'healthy') {
+                    dot.classList.remove('unhealthy');
+                    status.textContent = `Healthy • ${data.active_jobs} active`;
+                } else {
+                    dot.classList.add('unhealthy');
+                    status.textContent = 'Unhealthy';
+                }
+            } catch (e) {
+                document.getElementById('healthDot').classList.add('unhealthy');
+                document.getElementById('healthStatus').textContent = 'Offline';
+            }
+        }
+
+        // Update source options based on provider
+        function updateSourceOptions() {
+            const provider = document.getElementById('provider').value;
+            const sourceSelect = document.getElementById('source');
+
+            if (provider === 'brightdata') {
+                sourceSelect.innerHTML = `
+                    <option value="chatgpt">ChatGPT</option>
+                    <option value="perplexity">Perplexity</option>
+                    <option value="gemini">Gemini</option>
+                    <option value="copilot">Bing Copilot</option>
+                    <option value="grok">Grok</option>
+                    <option value="google_ai_mode">Google AI Mode</option>
+                    <option value="google_ai_overview">Google AI Overview</option>
+                `;
+            } else {
+                sourceSelect.innerHTML = `
+                    <option value="chatgpt">ChatGPT</option>
+                `;
+            }
+        }
+
+        // Create job
+        async function createJob() {
+            const promptsText = document.getElementById('prompts').value.trim();
+            const webhook = document.getElementById('webhook').value.trim();
+            const geoTargeting = document.getElementById('geoTargeting').value.trim();
+            const provider = document.getElementById('provider').value;
+            const source = document.getElementById('source').value;
+
+            if (!promptsText) {
+                showToast('Please enter at least one prompt', 'error');
+                return;
+            }
+
+            const prompts = promptsText.split('\n').map(p => p.trim()).filter(p => p);
+
+            if (prompts.length === 0) {
+                showToast('Please enter at least one prompt', 'error');
+                return;
+            }
+
+            const btn = document.getElementById('submitBtn');
+            btn.disabled = true;
+            btn.innerHTML = '<span class="spinner"></span>Submitting...';
+
+            try {
+                const body = {
+                    prompts,
+                    geo_targeting: geoTargeting,
+                    provider: provider,
+                    source: source
+                };
+                if (webhook) body.webhook_url = webhook;
+
+                const response = await fetch(`${API_URL}/jobs`, {
+                    method: 'POST',
+                    headers: getHeaders(true),
+                    body: JSON.stringify(body)
+                });
+
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.detail || 'Failed to create job');
+                }
+
+                const job = await response.json();
+                const providerName = job.provider === 'brightdata' ? 'BrightData' : 'SERP';
+                showToast(`Job created via ${providerName}: ${job.id.slice(0, 8)}...`, 'success');
+                document.getElementById('prompts').value = '';
+                
+                await loadJobs();
+                selectJob(job.id);
+
+            } catch (e) {
+                showToast(e.message, 'error');
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = '🚀 Submit Job';
+            }
+        }
+
+        // Load jobs
+        async function loadJobs() {
+            try {
+                const response = await fetch(`${API_URL}/jobs?per_page=50`, { headers: getHeaders() });
+                const data = await response.json();
+
+                // Check for API error response
+                if (!response.ok || !data.jobs) {
+                    console.error('Failed to load jobs:', data);
+                    showToast(data.detail || 'Failed to load jobs', 'error');
+                    return;
+                }
+
+                document.getElementById('jobCount').textContent = `${data.total} jobs`;
+
+                // Update stats
+                const stats = { pending: 0, processing: 0, completed: 0, failed: 0 };
+                data.jobs.forEach(j => stats[j.status] = (stats[j.status] || 0) + 1);
+                
+                document.getElementById('statPending').textContent = stats.pending;
+                document.getElementById('statProcessing').textContent = stats.processing;
+                document.getElementById('statCompleted').textContent = stats.completed + stats.failed;
+
+                // Render jobs
+                const list = document.getElementById('jobsList');
+                
+                if (data.jobs.length === 0) {
+                    list.innerHTML = `
+                        <div class="empty-state">
+                            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
+                            </svg>
+                            <p>No jobs yet</p>
+                        </div>
+                    `;
+                    return;
+                }
+
+                list.innerHTML = data.jobs.map(job => {
+                    const durationText = job.duration_seconds !== null ? ` • ⏳ ${formatDuration(job.duration_seconds)}` : '';
+                    const providerBadge = job.provider === 'brightdata' ? '<span class="badge badge-purple" style="font-size: 0.65rem; padding: 2px 6px;">BD</span>' : '';
+                    const sourceLabel = (job.source || 'chatgpt').charAt(0).toUpperCase() + (job.source || 'chatgpt').slice(1);
+                    const sourceBadge = `<span class="badge" style="font-size: 0.65rem; padding: 2px 6px; background: #6366f1; color: white;">${sourceLabel}</span>`;
+                    return `
+                    <div class="job-item ${job.id === selectedJobId ? 'active' : ''}" onclick="selectJob('${job.id}')">
+                        <div class="job-header">
+                            <span class="badge ${getBadgeClass(job.status)}">${job.status}</span>
+                            ${providerBadge}
+                            ${sourceBadge}
+                            <span class="job-id">${job.id.slice(0, 8)}...</span>
+                        </div>
+                        <div class="job-meta">
+                            <span>📝 ${job.total_prompts} prompts</span>
+                            <span>⏱️ ${formatDate(job.created_at)}${durationText}</span>
+                        </div>
+                        <div class="progress-bar">
+                            <div class="progress-fill" style="width: ${job.progress}%"></div>
+                        </div>
+                    </div>
+                `}).join('');
+
+                // Auto-refresh selected job if processing
+                if (selectedJobId) {
+                    const selected = data.jobs.find(j => j.id === selectedJobId);
+                    if (selected && selected.status === 'processing') {
+                        showJobDetails(selected);
+                    }
+                }
+
+            } catch (e) {
+                console.error('Failed to load jobs:', e);
+            }
+        }
+
+        // Select job
+        async function selectJob(jobId) {
+            selectedJobId = jobId;
+            
+            document.querySelectorAll('.job-item').forEach(el => {
+                el.classList.remove('active');
+                if (el.onclick.toString().includes(jobId)) {
+                    el.classList.add('active');
+                }
+            });
+
+            await refreshSelectedJob();
+        }
+
+        // Refresh selected job
+        async function refreshSelectedJob() {
+            if (!selectedJobId) return;
+
+            try {
+                const response = await fetch(`${API_URL}/jobs/${selectedJobId}`, { headers: getHeaders() });
+                const job = await response.json();
+                showJobDetails(job);
+            } catch (e) {
+                showToast('Failed to load job details', 'error');
+            }
+        }
+
+        // Show job details
+        function showJobDetails(job) {
+            const details = document.getElementById('jobDetails');
+            details.style.display = 'block';
+
+            document.getElementById('detailTotal').textContent = job.total_prompts;
+            document.getElementById('detailProcessed').textContent = job.processed_prompts;
+            document.getElementById('detailResults').textContent = job.processed_prompts - job.failed_prompts;
+            document.getElementById('detailFailed').textContent = job.failed_prompts;
+            document.getElementById('detailDuration').textContent = job.duration_seconds !== null ? formatDuration(job.duration_seconds) : '--';
+            document.getElementById('detailProgress').style.width = `${job.progress}%`;
+
+            // Provider and Source
+            document.getElementById('detailProvider').textContent = job.provider === 'brightdata' ? 'BrightData' : 'SERP';
+            const sourceLabel = (job.source || 'chatgpt').charAt(0).toUpperCase() + (job.source || 'chatgpt').slice(1);
+            document.getElementById('detailSource').textContent = sourceLabel;
+
+            // Show/hide buttons
+            const cancelBtn = document.getElementById('cancelBtn');
+            const retryBtn = document.getElementById('retryBtn');
+            
+            cancelBtn.style.display = ['pending', 'processing'].includes(job.status) ? 'inline-block' : 'none';
+            retryBtn.style.display = job.status === 'failed' && job.failed_queries?.length > 0 ? 'inline-block' : 'none';
+
+            // Merged Results
+            const mergedResultsSection = document.getElementById('mergedResultsSection');
+            const mergedResultsCount = document.getElementById('mergedResultsCount');
+            const downloadConvertedBtn = document.getElementById('downloadConvertedBtn');
+
+            if (job.merged_results_file && job.merged_results_count > 0) {
+                mergedResultsSection.style.display = 'block';
+                mergedResultsCount.textContent = `${job.merged_results_count} items`;
+                downloadConvertedBtn.style.display = job.converted_results_file ? 'inline-block' : 'none';
+            } else {
+                mergedResultsSection.style.display = 'none';
+            }
+
+            // Source Files (zip links)
+            const resultsSection = document.getElementById('resultsSection');
+            const resultsList = document.getElementById('resultsList');
+
+            if (job.results && job.results.length > 0) {
+                resultsSection.style.display = 'block';
+                resultsList.innerHTML = job.results.map(r =>
+                    `<a href="${r}" target="_blank">📥 ${r.split('/').pop()}</a>`
+                ).join('');
+            } else {
+                resultsSection.style.display = 'none';
+            }
+
+            // Errors
+            const errorsSection = document.getElementById('errorsSection');
+            const errorsList = document.getElementById('errorsList');
+            
+            if (job.failed_queries && job.failed_queries.length > 0) {
+                errorsSection.style.display = 'block';
+                errorsList.innerHTML = job.failed_queries.map(q => `<div>• ${q}</div>`).join('');
+            } else {
+                errorsSection.style.display = 'none';
+            }
+
+            // Error message
+            const errorMessageSection = document.getElementById('errorMessageSection');
+            const errorMessage = document.getElementById('errorMessage');
+            
+            if (job.error_message) {
+                errorMessageSection.style.display = 'block';
+                errorMessage.textContent = job.error_message;
+            } else {
+                errorMessageSection.style.display = 'none';
+            }
+        }
+
+        // Download merged results (raw)
+        async function downloadResults() {
+            if (!selectedJobId) return;
+            await downloadFile(`${API_URL}/jobs/${selectedJobId}/download`, `results_${selectedJobId.slice(0, 8)}.json`);
+        }
+
+        // Download converted results
+        async function downloadConvertedResults() {
+            if (!selectedJobId) return;
+            await downloadFile(`${API_URL}/jobs/${selectedJobId}/download/converted`, `results_${selectedJobId.slice(0, 8)}_converted.json`);
+        }
+
+        // Download file with API key header
+        async function downloadFile(url, filename) {
+            try {
+                const response = await fetch(url, { headers: getHeaders() });
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.detail || 'Download failed');
+                }
+                const blob = await response.blob();
+                const downloadUrl = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = downloadUrl;
+                a.download = filename;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                window.URL.revokeObjectURL(downloadUrl);
+            } catch (e) {
+                showToast(e.message, 'error');
+            }
+        }
+
+        // Cancel job
+        async function cancelJob() {
+            if (!selectedJobId) return;
+
+            if (!confirm('Are you sure you want to cancel this job?')) return;
+
+            try {
+                const response = await fetch(`${API_URL}/jobs/${selectedJobId}`, {
+                    method: 'DELETE',
+                    headers: getHeaders()
+                });
+                
+                if (response.ok) {
+                    showToast('Job cancelled', 'success');
+                    await loadJobs();
+                    await refreshSelectedJob();
+                } else {
+                    const error = await response.json();
+                    throw new Error(error.detail);
+                }
+            } catch (e) {
+                showToast(e.message, 'error');
+            }
+        }
+
+        // Retry job
+        async function retryJob() {
+            if (!selectedJobId) return;
+
+            try {
+                const response = await fetch(`${API_URL}/jobs/${selectedJobId}/retry`, {
+                    method: 'POST',
+                    headers: getHeaders()
+                });
+                
+                if (response.ok) {
+                    const newJob = await response.json();
+                    showToast(`Retry job created: ${newJob.id.slice(0, 8)}...`, 'success');
+                    await loadJobs();
+                    selectJob(newJob.id);
+                } else {
+                    const error = await response.json();
+                    throw new Error(error.detail);
+                }
+            } catch (e) {
+                showToast(e.message, 'error');
+            }
+        }
+
+        // Utilities
+        function getBadgeClass(status) {
+            const classes = {
+                pending: 'badge-gray',
+                processing: 'badge-yellow',
+                completed: 'badge-green',
+                failed: 'badge-red',
+                cancelled: 'badge-gray'
+            };
+            return classes[status] || 'badge-gray';
+        }
+
+        function formatDate(dateStr) {
+            const date = new Date(dateStr);
+            return date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+        }
+
+        function formatDuration(seconds) {
+            if (seconds === null || seconds === undefined) return null;
+            if (seconds < 60) return `${seconds}s`;
+            const mins = Math.floor(seconds / 60);
+            const secs = seconds % 60;
+            if (mins < 60) return `${mins}m ${secs}s`;
+            const hours = Math.floor(mins / 60);
+            const remainingMins = mins % 60;
+            return `${hours}h ${remainingMins}m ${secs}s`;
+        }
+
+        function showToast(message, type = 'success') {
+            const toast = document.getElementById('toast');
+            const toastMessage = document.getElementById('toastMessage');
+            
+            toast.className = `toast toast-${type}`;
+            toastMessage.textContent = message;
+            toast.classList.add('show');
+            
+            setTimeout(() => toast.classList.remove('show'), 3000);
+        }
+    </script>
+</body>
+</html>

@@ -38,8 +38,6 @@ export const GroupsPage: React.FC = () => {
         return;
       }
 
-      console.log('GroupsPage: Fetching groups for user:', session.user.email);
-
       // Fetch all groups - RLS policies will automatically filter based on user's role
       // - Admins/Managers see all groups (via is_manager() function)
       // - Group creators see their own groups
@@ -47,9 +45,12 @@ export const GroupsPage: React.FC = () => {
         .from('groups')
         .select(`
           *,
-          projects (
-            id,
-            name
+          project_groups (
+            project_id,
+            projects (
+              id,
+              name
+            )
           )
         `)
         .order('created_at', { ascending: false });
@@ -59,8 +60,32 @@ export const GroupsPage: React.FC = () => {
         throw error;
       }
 
-      console.log('GroupsPage: Fetched groups:', data?.length || 0);
-      setGroups(data || []);
+      // Flatten project_groups join into a simple projects array, then deduplicate groups by name
+      const groupMap = new Map<string, any>();
+      for (const g of (data || [])) {
+        // Extract projects from junction table
+        const projects = (g.project_groups || [])
+          .map((pg: any) => pg.projects)
+          .filter(Boolean);
+
+        const key = g.name.toLowerCase().trim();
+        if (groupMap.has(key)) {
+          // Merge projects into existing entry
+          const existing = groupMap.get(key);
+          const existingIds = new Set((existing.projects || []).map((p: any) => p.id));
+          for (const p of projects) {
+            if (!existingIds.has(p.id)) {
+              existing.projects.push(p);
+            }
+          }
+          if (!existing._allGroupIds) existing._allGroupIds = [existing.id];
+          existing._allGroupIds.push(g.id);
+        } else {
+          groupMap.set(key, { ...g, projects: [...projects] });
+        }
+      }
+      const unique = Array.from(groupMap.values());
+      setGroups(unique);
     } catch (error) {
       console.error('Error fetching groups:', error);
       setGroups([]);
@@ -103,7 +128,7 @@ export const GroupsPage: React.FC = () => {
   }
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-4 md:space-y-6">
       <motion.div
         initial={{ opacity: 0, y: 20 }}
         animate={{ opacity: 1, y: 0 }}
@@ -151,7 +176,7 @@ export const GroupsPage: React.FC = () => {
         <motion.div
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
-          className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6"
+          className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 md:gap-6"
         >
           {groups.map((group, index) => (
             <motion.div

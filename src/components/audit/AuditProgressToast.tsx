@@ -50,7 +50,6 @@ export const AuditProgressToast: React.FC<AuditProgressToastProps> = ({
   const [llmResponses, setLlmResponses] = useState<any[]>([]);
   const [citations, setCitations] = useState<any[]>([]);
   const [isVisible, setIsVisible] = useState(true);
-  const [pollingInterval, setPollingInterval] = useState<NodeJS.Timeout | null>(null);
   const [showModal, setShowModal] = useState(false);
 
   // Helper function to check if audit is actually completed
@@ -137,10 +136,7 @@ export const AuditProgressToast: React.FC<AuditProgressToastProps> = ({
     // Fetch initial data
     fetchAuditData();
 
-    // Start polling for results
-    startPolling();
-
-    // Subscribe to real-time updates
+    // Realtime for audit status only (filter by PK 'id' works reliably)
     const auditChannel = supabase
       .channel(`audit-progress-${auditId}`)
       .on(
@@ -154,60 +150,31 @@ export const AuditProgressToast: React.FC<AuditProgressToastProps> = ({
         (payload) => {
           console.log('AuditProgressToast: Audit update received:', payload.new);
           setAudit(payload.new);
-          if (payload.new.status === 'completed') {
-            stopPolling();
+          if (payload.new.status === 'completed' || payload.new.status === 'failed') {
+            // Final fetch to get latest data, then auto-close
+            fetchAuditSteps();
+            fetchLlmResponses();
+            fetchCitations();
             setTimeout(() => {
               onCompleted();
               setIsVisible(false);
-            }, 5000); // Auto-close after 5 seconds
+            }, 5000);
           }
-        }
-      )
-      .on(
-        'postgres_changes',
-        {
-          event: '*',
-          schema: 'public',
-          table: 'audit_steps',
-          filter: `audit_id=eq.${auditId}`,
-        },
-        () => {
-          console.log('AuditProgressToast: Audit steps update received');
-          fetchAuditSteps();
-        }
-      )
-      .on(
-        'postgres_changes',
-        {
-          event: 'UPDATE',
-          schema: 'public',
-          table: 'llm_responses',
-          filter: `audit_id=eq.${auditId}`,
-        },
-        (payload) => {
-          console.log('AuditProgressToast: LLM responses update received');
-          console.log('AuditProgressToast: Updated response:', payload.new);
-          fetchLlmResponses();
-        }
-      )
-      .on(
-        'postgres_changes',
-        {
-          event: '*',
-          schema: 'public',
-          table: 'citations',
-          filter: `audit_id=eq.${auditId}`,
-        },
-        () => {
-          console.log('AuditProgressToast: Citations update received');
-          fetchCitations();
         }
       )
       .subscribe();
 
+    // Refresh UI data every 30s (read-only queries)
+    // Polling is handled by the backend scheduler — no edge function invocation needed
+    const dataInterval = setInterval(() => {
+      fetchAuditSteps();
+      fetchLlmResponses();
+      fetchCitations();
+    }, 30000);
+
     return () => {
-      stopPolling();
       supabase.removeChannel(auditChannel);
+      clearInterval(dataInterval);
     };
   }, [auditId]);
 
@@ -251,59 +218,11 @@ export const AuditProgressToast: React.FC<AuditProgressToastProps> = ({
     }
   }, [llmResponses, audit?.status, auditId]);
 
-  const startPolling = () => {
-    // Poll every 10 seconds to reduce database load and prevent timeouts
-    const interval = setInterval(async () => {
-      if (!auditId) return;
-      
-      try {
-        console.log('AuditProgressToast: Polling for results...');
-        
-        // Try to call the edge function, but fall back to direct polling if it fails
-        try {
-          const { data, error } = await supabase.functions.invoke('poll-audit-results', {
-            body: { auditId }
-          });
-          
-          if (error) {
-            console.log('AuditProgressToast: Edge function error, using fallback:', error);
-            await fallbackPolling();
-          } else {
-            console.log('AuditProgressToast: Edge function polling successful:', data);
-          }
-        } catch (networkError) {
-          console.log('AuditProgressToast: Edge function not available, using fallback polling');
-          await fallbackPolling();
-        }
-      } catch (error) {
-        console.error('AuditProgressToast: Fallback polling error:', error);
-      }
-    }, 10000);
-    
-    setPollingInterval(interval);
-  };
-
-  const fallbackPolling = async () => {
-    // Directly fetch audit data and LLM responses as fallback
-    try {
-      await fetchAuditData();
-    } catch (error) {
-      console.error('AuditProgressToast: Fallback polling failed:', error);
-    }
-  };
-
-  const stopPolling = () => {
-    if (pollingInterval) {
-      clearInterval(pollingInterval);
-      setPollingInterval(null);
-    }
-  };
-
   const fetchAuditData = async () => {
     console.log('AuditProgressToast: Fetching audit data for:', auditId);
     const { data, error } = await supabase
       .from('audits')
-      .select('*')
+      .select('id, status, progress, llms, sentiment, created_at')
       .eq('id', auditId)
       .single();
     
@@ -327,7 +246,7 @@ export const AuditProgressToast: React.FC<AuditProgressToastProps> = ({
     console.log('AuditProgressToast: Fetching steps for:', auditId);
     const { data, error } = await supabase
       .from('audit_steps')
-      .select('*')
+      .select('id, audit_id, step, status, message, created_at')
       .eq('audit_id', auditId)
       .order('created_at');
     
@@ -346,10 +265,7 @@ export const AuditProgressToast: React.FC<AuditProgressToastProps> = ({
     console.log('AuditProgressToast: Fetching LLM responses for:', auditId);
     const { data } = await supabase
       .from('llm_responses')
-      .select(`
-        *,
-        prompts (prompt_text, prompt_group)
-      `)
+      .select('id, llm, answer_text, raw_response_data, sentiment_score, sentiment_label, prompts(prompt_text, prompt_group)')
       .eq('audit_id', auditId)
       .order('created_at');
     
@@ -363,7 +279,7 @@ export const AuditProgressToast: React.FC<AuditProgressToastProps> = ({
     console.log('AuditProgressToast: Fetching citations for:', auditId);
     const { data } = await supabase
       .from('citations')
-      .select('*')
+      .select('id, audit_id, domain, position')
       .eq('audit_id', auditId)
       .order('position');
     

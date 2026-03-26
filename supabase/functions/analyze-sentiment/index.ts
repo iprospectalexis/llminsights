@@ -91,10 +91,9 @@ Réponds SEULEMENT avec l'objet JSON, rien d'autre.
         "Content-Type": "application/json"
       },
       body: JSON.stringify({
-        model: "gpt-4o",
+        model: "gpt-5-mini",
         messages: [{ role: "user", content: prompt }],
-        temperature: 0.1, // Lower temperature for more consistent output
-        max_tokens: 50 // Limit tokens to encourage concise JSON response
+        max_completion_tokens: 50 // Limit tokens to encourage concise JSON response
       })
     })
 

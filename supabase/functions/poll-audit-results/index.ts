@@ -99,14 +99,16 @@ async function pollForResults(auditId: string, supabaseClient: any, apiKey: stri
     .eq('id', auditId)
     .eq('status', 'running')
 
-  // Get a limited batch of pending LLM responses for this audit (max 20 at a time)
+  // Get a batch of pending LLM responses for this audit (max 100 at a time for throughput)
+  // A response is "pending" if it has no answer_text AND no raw_response_data
+  // (google-ai-overview may have null answer_text but valid raw_response_data when no AI Overview exists)
   let query = supabaseClient
     .from('llm_responses')
     .select('*')
     .eq('audit_id', auditId)
     .is('answer_text', null)
-    .is('raw_response_data->error', null) // Exclude already failed responses
-    .limit(20)
+    .is('raw_response_data', null) // Exclude already processed responses (even those without answer_text)
+    .limit(100)
 
   // Apply LLM filter if specified
   if (llmFilter) {
@@ -123,9 +125,11 @@ async function pollForResults(auditId: string, supabaseClient: any, apiKey: stri
 
   console.log(`Processing batch of ${pendingResponses.length} pending responses for audit ${auditId}`)
 
-  // Group responses by data provider and job_id (for OneSearch)
-  const brightdataResponses = pendingResponses.filter(r => r.data_provider === 'BrightData' && r.snapshot_id)
-  const onesearchResponses = pendingResponses.filter(r => r.data_provider === 'OneSearch SERP API' && r.job_id)
+  // Group responses by processing method:
+  // - Legacy BrightData: individual snapshot_id (old audits)
+  // - Backend API (job-based): job_id — includes both BrightData and OneSearch providers
+  const brightdataResponses = pendingResponses.filter(r => r.snapshot_id && !r.job_id)
+  const onesearchResponses = pendingResponses.filter(r => r.job_id)
 
   const results: any[] = []
 
@@ -139,7 +143,12 @@ async function pollForResults(auditId: string, supabaseClient: any, apiKey: stri
           const result = await fetchBrightDataResult(response.llm, response.snapshot_id, apiKey)
 
           if (result) {
-            const { answer_html, response_raw, source_html, ...cleanedResult } = result
+            const { answer_html, response_raw, source_html, page_html, ...cleanedResult } = result
+
+            // Google AI Overview uses aio_text instead of answer_text
+            const isGoogleAio = response.llm === 'google-ai-overview' || response.llm === 'google-ai-mode'
+            const answerText = isGoogleAio ? (result.aio_text || null) : result.answer_text
+            const answerMarkdown = isGoogleAio ? (result.aio_text || null) : result.answer_text_markdown
 
             return {
               success: true,
@@ -148,12 +157,12 @@ async function pollForResults(auditId: string, supabaseClient: any, apiKey: stri
               update: {
                 id: response.id,
                 response_url: result.url,
-                answer_text: result.answer_text,
-                answer_text_markdown: result.answer_text_markdown,
+                answer_text: answerText,
+                answer_text_markdown: answerMarkdown,
                 response_timestamp: result.timestamp,
                 raw_response_data: cleanedResult,
                 web_search_query: result.web_search_query || null,
-                citations: result.citations || null,
+                citations: isGoogleAio ? (result.aio_citations || result.organic || null) : (result.citations || null),
                 links_attached: result.links_attached || null,
                 search_sources: result.search_sources || null,
                 is_map: result.is_map || false,
@@ -285,10 +294,47 @@ async function pollForResults(auditId: string, supabaseClient: any, apiKey: stri
     }
   }
 
-  // Parse and store citations for successful results
+  // Parse and store citations for successful results (batched)
   const successfulResults = results.filter(r => r.success && r.result)
-  for (const { result, response } of successfulResults) {
-    await parseCitations(result, response, supabaseClient)
+  if (successfulResults.length > 0) {
+    // Collect all citations across all responses
+    const allCitations: any[] = []
+    const deleteKeys: { audit_id: string; prompt_id: string; llm: string }[] = []
+
+    for (const { result, response } of successfulResults) {
+      deleteKeys.push({
+        audit_id: response.audit_id,
+        prompt_id: response.prompt_id,
+        llm: response.llm,
+      })
+      // Use parseCitationsCollect to gather citations without DB operations
+      const citations = collectCitations(result, response)
+      allCitations.push(...citations)
+    }
+
+    // Batch delete existing citations for all processed responses
+    for (const key of deleteKeys) {
+      await supabaseClient
+        .from('citations')
+        .delete()
+        .eq('audit_id', key.audit_id)
+        .eq('prompt_id', key.prompt_id)
+        .eq('llm', key.llm)
+    }
+
+    // Batch insert all citations in one operation
+    if (allCitations.length > 0) {
+      console.log(`Batch inserting ${allCitations.length} citations for ${successfulResults.length} responses`)
+      const { error } = await supabaseClient
+        .from('citations')
+        .insert(allCitations)
+
+      if (error) {
+        console.error('Error batch inserting citations:', error)
+      } else {
+        console.log(`Successfully batch inserted ${allCitations.length} citations`)
+      }
+    }
   }
   
   // Log results summary
@@ -405,8 +451,8 @@ async function runCompetitorsExtraction(auditId: string, supabaseClient: any) {
 
     console.log(`Processing ${responsesToProcess.length} LLM responses for competitors extraction`)
 
-    // Process responses in batches to avoid overwhelming the API
-    const batchSize = 3
+    // Process responses in batches (increased from 3 for better throughput)
+    const batchSize = 10
     let processedCount = 0
 
     for (let i = 0; i < responsesToProcess.length; i += batchSize) {
@@ -468,9 +514,9 @@ async function runCompetitorsExtraction(auditId: string, supabaseClient: any) {
       processedCount += batch.length
       console.log(`Processed ${processedCount}/${responsesToProcess.length} responses for competitors extraction`)
 
-      // Add small delay between batches to avoid rate limiting
+      // Short delay between batches to avoid rate limiting
       if (i + batchSize < responsesToProcess.length) {
-        await new Promise(resolve => setTimeout(resolve, 1000))
+        await new Promise(resolve => setTimeout(resolve, 200))
       }
     }
 
@@ -619,8 +665,8 @@ async function runSentimentAnalysis(auditId: string, supabaseClient: any) {
 
     console.log(`Running sentiment analysis on ${llmResponses.length} LLM responses for ${brands.length} brands`)
 
-    // Process LLM responses in batches to avoid overwhelming the API
-    const batchSize = 5
+    // Process LLM responses in batches (increased from 5 for better throughput)
+    const batchSize = 15
     let processedCount = 0
     const sentimentUpdates: any[] = []
 
@@ -832,19 +878,13 @@ async function fetchBrightDataResult(llm: string, snapshotId: string, apiKey: st
   // URL-encode the snapshot ID to handle special characters
   const encodedSnapshotId = encodeURIComponent(snapshotId)
 
-  switch (llm) {
-    case 'searchgpt':
-      url = `https://api.brightdata.com/datasets/v3/snapshot/${encodedSnapshotId}?format=json`
-      break
-    case 'perplexity':
-      url = `https://api.brightdata.com/datasets/v3/snapshot/${encodedSnapshotId}?format=json`
-      break
-    case 'gemini':
-      url = `https://api.brightdata.com/datasets/v3/snapshot/${encodedSnapshotId}?format=json`
-      break
-    default:
-      throw new Error(`Unsupported LLM: ${llm}`)
+  // All BrightData snapshots use the same download endpoint regardless of LLM/dataset
+  const supportedLLMs = ['searchgpt', 'perplexity', 'gemini', 'google-ai-overview', 'google-ai-mode', 'copilot', 'grok']
+  if (!supportedLLMs.includes(llm)) {
+    throw new Error(`Unsupported LLM: ${llm}`)
   }
+
+  url = `https://api.brightdata.com/datasets/v3/snapshot/${encodedSnapshotId}?format=json`
 
   // Create AbortController with 45-second timeout (leaving buffer for Edge Function timeout)
   const controller = new AbortController()
@@ -939,6 +979,36 @@ async function parseCitations(result: any, llmResponse: any, supabaseClient: any
         checked_at: new Date().toISOString(),
       })
     })
+  } else if ((llmResponse.llm === 'google-ai-overview' || llmResponse.llm === 'google-ai-mode') && result.aio_citations) {
+    // Google AI Overview: citations from aio_citations
+    console.log(`${llmResponse.llm}: Found ${result.aio_citations.length} aio_citations`)
+    result.aio_citations.forEach((citation: any, index: number) => {
+      citations.push({
+        audit_id: llmResponse.audit_id,
+        prompt_id: llmResponse.prompt_id,
+        llm: llmResponse.llm,
+        page_url: citation.url || citation.link || '',
+        domain: extractDomain(citation.url || citation.link || ''),
+        citation_text: citation.title || citation.text || citation.snippet || 'No description available',
+        position: index + 1,
+        checked_at: new Date().toISOString(),
+      })
+    })
+  } else if ((llmResponse.llm === 'google-ai-overview' || llmResponse.llm === 'google-ai-mode') && result.organic) {
+    // Google AI Overview fallback: use organic results as citations
+    console.log(`${llmResponse.llm}: Using ${result.organic.length} organic results as citations`)
+    result.organic.forEach((item: any, index: number) => {
+      citations.push({
+        audit_id: llmResponse.audit_id,
+        prompt_id: llmResponse.prompt_id,
+        llm: llmResponse.llm,
+        page_url: item.url || item.link || '',
+        domain: extractDomain(item.url || item.link || ''),
+        citation_text: item.title || item.description || 'No description available',
+        position: index + 1,
+        checked_at: new Date().toISOString(),
+      })
+    })
   } else {
     console.log(`No citations found for ${llmResponse.llm}. Available fields:`, Object.keys(result))
 
@@ -1000,6 +1070,95 @@ async function parseCitations(result: any, llmResponse: any, supabaseClient: any
   } else {
     console.log(`No citations parsed for ${llmResponse.llm}`)
   }
+}
+
+function collectCitations(result: any, llmResponse: any): any[] {
+  const citations: any[] = []
+
+  // SearchGPT and ChatGPT: Use links_attached
+  if ((llmResponse.llm === 'searchgpt' || llmResponse.llm === 'chatgpt') && result.links_attached) {
+    result.links_attached.forEach((link: any, index: number) => {
+      citations.push({
+        audit_id: llmResponse.audit_id,
+        prompt_id: llmResponse.prompt_id,
+        llm: llmResponse.llm,
+        page_url: link.url,
+        domain: extractDomain(link.url),
+        citation_text: link.text || link.title || 'No description available',
+        position: link.position || index + 1,
+        cited: link.cited !== undefined ? link.cited : null,
+        checked_at: new Date().toISOString(),
+      })
+    })
+  } else if (llmResponse.llm === 'perplexity' && result.sources) {
+    result.sources.forEach((source: any, index: number) => {
+      citations.push({
+        audit_id: llmResponse.audit_id,
+        prompt_id: llmResponse.prompt_id,
+        llm: llmResponse.llm,
+        page_url: source.url,
+        domain: extractDomain(source.url),
+        citation_text: source.title || source.description || source.snippet || 'No description available',
+        position: index + 1,
+        checked_at: new Date().toISOString(),
+      })
+    })
+  } else if ((llmResponse.llm === 'google-ai-overview' || llmResponse.llm === 'google-ai-mode') && result.aio_citations) {
+    result.aio_citations.forEach((citation: any, index: number) => {
+      citations.push({
+        audit_id: llmResponse.audit_id,
+        prompt_id: llmResponse.prompt_id,
+        llm: llmResponse.llm,
+        page_url: citation.url || citation.link || '',
+        domain: extractDomain(citation.url || citation.link || ''),
+        citation_text: citation.title || citation.text || citation.snippet || 'No description available',
+        position: index + 1,
+        checked_at: new Date().toISOString(),
+      })
+    })
+  } else if ((llmResponse.llm === 'google-ai-overview' || llmResponse.llm === 'google-ai-mode') && result.organic) {
+    result.organic.forEach((item: any, index: number) => {
+      citations.push({
+        audit_id: llmResponse.audit_id,
+        prompt_id: llmResponse.prompt_id,
+        llm: llmResponse.llm,
+        page_url: item.url || item.link || '',
+        domain: extractDomain(item.url || item.link || ''),
+        citation_text: item.title || item.description || 'No description available',
+        position: index + 1,
+        checked_at: new Date().toISOString(),
+      })
+    })
+  } else if (llmResponse.llm === 'gemini' && result.links_attached) {
+    result.links_attached.forEach((link: any, index: number) => {
+      citations.push({
+        audit_id: llmResponse.audit_id,
+        prompt_id: llmResponse.prompt_id,
+        llm: llmResponse.llm,
+        page_url: link.url,
+        domain: extractDomain(link.url),
+        citation_text: link.text || 'No description available',
+        position: link.position || index + 1,
+        checked_at: new Date().toISOString(),
+      })
+    })
+  } else if ((llmResponse.llm === 'searchgpt' || llmResponse.llm === 'chatgpt') && result.citations) {
+    result.citations.forEach((citation: any, index: number) => {
+      citations.push({
+        audit_id: llmResponse.audit_id,
+        prompt_id: llmResponse.prompt_id,
+        llm: llmResponse.llm,
+        page_url: citation.url,
+        domain: extractDomain(citation.url),
+        citation_text: citation.text || citation.title,
+        position: index + 1,
+        cited: citation.cited !== undefined ? citation.cited : null,
+        checked_at: new Date().toISOString(),
+      })
+    })
+  }
+
+  return citations
 }
 
 function extractDomain(url: string): string {

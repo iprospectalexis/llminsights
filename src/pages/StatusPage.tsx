@@ -26,6 +26,7 @@ interface Audit {
   progress: number;
   started_at: string | null;
   finished_at: string | null;
+  processing_started_at: string | null;
   created_at: string;
   projects: {
     name: string;
@@ -130,28 +131,11 @@ export function StatusPage() {
 
   const checkOneSearchHealth = async () => {
     try {
-      const { data: { session } } = await supabase.auth.getSession();
-      if (!session) return;
-
-      const apiUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/check-onesearch-health`;
-      const response = await fetch(apiUrl, {
-        headers: {
-          'Authorization': `Bearer ${session.access_token}`,
-        },
+      const data = await import('../lib/backendApi').then(m => m.checkHealth());
+      setOneSearchHealth({
+        status: data.status === 'healthy' ? 'healthy' : 'unhealthy',
+        error: undefined,
       });
-
-      if (response.ok) {
-        const data = await response.json();
-        setOneSearchHealth({
-          status: data.status,
-          error: data.error,
-        });
-      } else {
-        setOneSearchHealth({
-          status: 'unhealthy',
-          error: 'Failed to check health',
-        });
-      }
     } catch (error) {
       console.error('Error checking OneSearch health:', error);
       setOneSearchHealth({
@@ -309,6 +293,8 @@ export function StatusPage() {
           return 'Getting Results';
         case 'processing_results':
           return 'Processing Results';
+        case 'completing':
+          return 'Processing Results';
         case 'sentiment_analysis':
           return 'Sentiment Analysis';
         default:
@@ -378,6 +364,19 @@ export function StatusPage() {
     return `${hours}h ${minutes}m`;
   };
 
+  const formatProcessingDuration = (audit: Audit) => {
+    if (!audit.processing_started_at || !audit.finished_at) return '-';
+    const start = new Date(audit.processing_started_at);
+    const end = new Date(audit.finished_at);
+    const seconds = differenceInSeconds(end, start);
+    if (seconds < 0) return '-';
+    if (seconds < 60) return `${seconds}s`;
+    if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    return `${hours}h ${minutes}m`;
+  };
+
   const filteredAudits = statusFilter === 'all'
     ? audits
     : audits.filter(a => a.status === statusFilter);
@@ -391,7 +390,7 @@ export function StatusPage() {
   }
 
   return (
-    <div className="space-y-8">
+    <div className="space-y-4 md:space-y-8">
       <div className="w-full">
         <div className="mb-8">
           <h1 className="text-3xl font-bold text-gray-900 dark:text-gray-100">
@@ -440,7 +439,7 @@ export function StatusPage() {
         </div>
 
         {/* Filters */}
-        <div className="mb-4 flex items-center gap-4">
+        <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:gap-4">
           <div className="flex items-center gap-2">
             <Filter className="w-4 h-4 text-gray-600 dark:text-gray-400" />
             <span className="text-sm font-medium text-gray-700 dark:text-gray-300">Filter:</span>
@@ -484,6 +483,9 @@ export function StatusPage() {
                   <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
                     Duration
                   </th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                    Processing
+                  </th>
                   <th className="px-6 py-3 text-center text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
                     Total Prompts
                   </th>
@@ -500,10 +502,15 @@ export function StatusPage() {
               </thead>
               <tbody className="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
                 {filteredAudits.map((audit) => {
-                  const totalPrompts = audit.webhook_data?.total_prompts ?? audit.total_prompts ?? 0;
-                  const processedPrompts = audit.webhook_data?.processed_prompts ?? 0;
-                  const successCount = audit.responses_received || 0;
-                  const failedCount = audit.webhook_data?.failed_prompts ?? ((audit.responses_sent || 0) - successCount);
+                  const totalPrompts = audit.total_prompts ?? 0;
+                  const responsesSent = audit.responses_sent || 0;
+                  const responsesReceived = audit.responses_received || 0;
+                  // Processed = responses with answer_text (from metrics view)
+                  const processedPrompts = responsesReceived;
+                  // Failed = only count when audit is done (completed/failed), not while running
+                  const failedCount = audit.status === 'running'
+                    ? 0
+                    : Math.max(0, responsesSent - responsesReceived);
 
                   return (
                     <tr
@@ -563,6 +570,9 @@ export function StatusPage() {
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 dark:text-gray-100">
                         {formatDuration(audit)}
+                      </td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
+                        {formatProcessingDuration(audit)}
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap text-center">
                         <span className="inline-flex items-center px-3 py-1 rounded-full text-sm font-medium bg-blue-100 dark:bg-blue-900/30 text-blue-800 dark:text-blue-200">

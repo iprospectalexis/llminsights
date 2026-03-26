@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Modal } from '../ui/Modal';
 import { Button } from '../ui/Button';
+import { runAudit } from '../../lib/backendApi';
 import { supabase } from '../../lib/supabase';
 import { Brain, Search, Sparkles } from 'lucide-react';
 
@@ -109,27 +110,22 @@ export const RunAuditModal: React.FC<RunAuditModalProps> = ({
       console.log('RunAuditModal: Selected LLMs:', selectedLlms);
       console.log('RunAuditModal: Enable sentiment:', enableSentiment);
       
-      // Call the run-audit edge function
-      const { data, error } = await supabase.functions.invoke('run-audit', {
-        body: {
-          projectId,
-          llms: selectedLlms,
-          enableSentiment,
-          forceWebSearch,
-        },
+      // Call the backend API (replaces Supabase edge function)
+      const data = await runAudit({
+        projectId,
+        llms: selectedLlms,
+        enableSentiment,
+        forceWebSearch,
       });
 
-      console.log('RunAuditModal: Edge function response:', { data, error });
-
-      if (error) throw error;
+      console.log('RunAuditModal: Backend API response:', data);
 
       if (data?.success) {
         console.log('Audit started successfully:', data);
         onAuditStarted(data.auditId);
-        onClose(); // Close the modal immediately
+        onClose();
       } else {
-        console.error('Audit start failed:', data);
-        throw new Error(data?.error || 'Failed to start audit');
+        throw new Error('Failed to start audit');
       }
     } catch (error) {
       console.error('Error starting audit:', error);

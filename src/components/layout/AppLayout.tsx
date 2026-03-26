@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Outlet, useNavigate } from 'react-router-dom';
+import { Outlet, useNavigate, useLocation } from 'react-router-dom';
 import { Navbar } from './Navbar';
 import { Sidebar } from './Sidebar';
 import { Footer } from './Footer';
@@ -13,11 +13,19 @@ export const AppLayout: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
+  const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
   const navigate = useNavigate();
+  const location = useLocation();
+
+  // Close mobile menu on route change
+  useEffect(() => {
+    setIsMobileMenuOpen(false);
+  }, [location.pathname]);
 
   const toggleSidebarCollapse = () => {
     setIsSidebarCollapsed(!isSidebarCollapsed);
   };
+
   useEffect(() => {
     checkAuth();
   }, []);
@@ -42,7 +50,6 @@ export const AppLayout: React.FC = () => {
 
       if (error || !profile) {
         console.error('Error fetching profile:', error);
-        // Fallback to JWT metadata if database query fails
         const jwtRole = (session.user as any).app_metadata?.role || 'client';
         setUserProfile({
           id: session.user.id,
@@ -81,22 +88,48 @@ export const AppLayout: React.FC = () => {
   return (
     <div className="min-h-screen bg-gray-50 dark:bg-gray-900">
       <div className="flex h-screen">
-        <Sidebar
-          user={user}
-          userProfile={userProfile}
-          isOpen={isSidebarOpen}
-          collapsed={isSidebarCollapsed}
-          onToggleCollapse={toggleSidebarCollapse}
-        />
-        <div className="flex-1 flex flex-col">
+        {/* Desktop sidebar — hidden on mobile */}
+        <div className="hidden md:block">
+          <Sidebar
+            user={user}
+            userProfile={userProfile}
+            isOpen={isSidebarOpen}
+            collapsed={isSidebarCollapsed}
+            onToggleCollapse={toggleSidebarCollapse}
+          />
+        </div>
+
+        {/* Mobile sidebar overlay */}
+        {isMobileMenuOpen && (
+          <>
+            <div
+              className="fixed inset-0 bg-black/50 z-40 md:hidden"
+              onClick={() => setIsMobileMenuOpen(false)}
+            />
+            <div className="fixed inset-y-0 left-0 z-50 md:hidden">
+              <Sidebar
+                user={user}
+                userProfile={userProfile}
+                isOpen={true}
+                collapsed={false}
+                onToggleCollapse={toggleSidebarCollapse}
+                isMobile={true}
+                onMobileClose={() => setIsMobileMenuOpen(false)}
+              />
+            </div>
+          </>
+        )}
+
+        <div className="flex-1 flex flex-col min-w-0">
           <Navbar
             user={user}
             userProfile={userProfile}
             onToggleCollapse={toggleSidebarCollapse}
             isCollapsed={isSidebarCollapsed}
+            onMobileMenuToggle={() => setIsMobileMenuOpen(!isMobileMenuOpen)}
           />
           <main className="flex-1 overflow-auto">
-            <div className="p-6">
+            <div className="p-3 md:p-6">
               <Outlet />
             </div>
             <Footer />

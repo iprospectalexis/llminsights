@@ -62,18 +62,51 @@ Deno.serve(async (req: Request) => {
     console.log('Request params:', { projectId, llmFilter, domainSearch, sortBy, sortOrder, page, pageSize });
 
     // Get accessible project IDs for the user
-    const { data: accessibleProjects, error: projectsError } = await supabase
+    // Check project_members (explicit membership)
+    const { data: memberProjects, error: memberError } = await supabase
       .from("project_members")
       .select("project_id")
       .eq("user_id", user.id);
 
-    if (projectsError) {
-      console.error('Error fetching accessible projects:', projectsError);
-      throw new Error("Failed to fetch accessible projects");
+    if (memberError) {
+      console.error('Error fetching member projects:', memberError);
     }
 
-    const accessibleProjectIds = accessibleProjects?.map(p => p.project_id) || [];
-    console.log('User accessible projects:', accessibleProjectIds.length);
+    // Check projects created by user
+    const { data: ownedProjects, error: ownedError } = await supabase
+      .from("projects")
+      .select("id")
+      .eq("created_by", user.id);
+
+    if (ownedError) {
+      console.error('Error fetching owned projects:', ownedError);
+    }
+
+    // Check if user is admin or manager (they can see all projects)
+    const { data: userProfile } = await supabase
+      .from("users")
+      .select("role")
+      .eq("id", user.id)
+      .single();
+
+    let accessibleProjectIds: string[] = [];
+    const isAdminOrManager = userProfile?.role === 'admin' || userProfile?.role === 'manager';
+
+    if (isAdminOrManager) {
+      // Admin/manager sees all projects - fetch all project IDs
+      const { data: allProjects } = await supabase
+        .from("projects")
+        .select("id");
+      accessibleProjectIds = (allProjects || []).map(p => p.id);
+    } else {
+      // Combine member + owned project IDs (deduplicated)
+      const idSet = new Set<string>();
+      (memberProjects || []).forEach(p => idSet.add(p.project_id));
+      (ownedProjects || []).forEach(p => idSet.add(p.id));
+      accessibleProjectIds = Array.from(idSet);
+    }
+
+    console.log('User accessible projects:', accessibleProjectIds.length, 'isAdminOrManager:', isAdminOrManager);
 
     if (accessibleProjectIds.length === 0) {
       // User has no accessible projects, return empty result

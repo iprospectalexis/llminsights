@@ -15,10 +15,6 @@ interface AuditRequest {
   isScheduled?: boolean
 }
 
-interface BrightdataResponse {
-  snapshot_id: string
-}
-
 interface OneSearchJobResponse {
   id: string
   status: string
@@ -155,104 +151,65 @@ Deno.serve(async (req) => {
       .eq('audit_id', audit.id)
       .eq('step', 'fetch')
 
-    // Route to appropriate data provider based on settings
+    // Route ALL LLMs through the backend API for batch processing
+    // The backend handles chunking, concurrency, and rate limiting internally
     const totalQueries = auditLlms.length * project.prompts.length
     const llmResponsesToInsert: any[] = []
 
-    // Group LLMs by data provider
-    const brightdataLLMs: string[] = []
-    const onesearchLLMs: string[] = []
+    const onesearchApiKey = Deno.env.get('ONESEARCH_API_KEY') || ''
+    const onesearchApiUrl = Deno.env.get('ONESEARCH_API_URL') || 'http://168.231.84.54:8000'
 
-    for (const llm of auditLlms) {
-      const provider = llmProviderMap.get(llm)
-      if (provider === 'OneSearch SERP API') {
-        onesearchLLMs.push(llm)
-      } else {
-        brightdataLLMs.push(llm)
-      }
-    }
+    console.log('[run-audit] Routing ALL LLMs through backend API')
+    console.log('[run-audit] Backend API URL:', onesearchApiUrl)
+    console.log('[run-audit] LLMs to process:', auditLlms)
 
-    // Process BrightData LLMs
-    if (brightdataLLMs.length > 0) {
-      const brightdataApiKey = Deno.env.get('BRIGHTDATA_API_KEY')
-      if (!brightdataApiKey) {
-        throw new Error('BrightData API key not configured')
-      }
+    // Trigger all LLMs in parallel through the backend API
+    const triggerPromises = auditLlms.map(async (llm) => {
+      try {
+        const prompts = project.prompts.map(p => p.prompt_text)
+        const providerConfig = llmProviderConfigMap.get(llm)
 
-      for (const llm of brightdataLLMs) {
+        // Determine the backend provider based on settings
+        // BrightData LLMs use provider='brightdata', OneSearch SERP API uses providerConfig
+        const dataProvider = llmProviderMap.get(llm) || 'BrightData'
+
+        const jobId = await triggerOneSearchJob(
+          llm, prompts, project.country, project.country_name,
+          auditForceWebSearch, onesearchApiUrl, onesearchApiKey, providerConfig
+        )
+
+        // Create one response entry per prompt with the shared job_id
         for (const prompt of project.prompts) {
-          try {
-            const snapshotId = await triggerBrightDataQuery(llm, prompt.prompt_text, project.country, brightdataApiKey)
+          llmResponsesToInsert.push({
+            audit_id: audit.id,
+            prompt_id: prompt.id,
+            llm,
+            job_id: jobId,
+            country: project.country,
+            data_provider: dataProvider,
+          })
+        }
 
-            llmResponsesToInsert.push({
-              audit_id: audit.id,
-              prompt_id: prompt.id,
-              llm,
-              snapshot_id: snapshotId,
-              country: project.country,
-              data_provider: 'BrightData',
-            })
+        console.log(`[run-audit] ${llm}: job ${jobId} created with ${prompts.length} prompts`)
+      } catch (error) {
+        console.error(`[run-audit] Failed to trigger ${llm} job:`, error)
 
-          } catch (error) {
-            console.error(`Failed to trigger ${llm} query for prompt ${prompt.id}:`, error)
-
-            llmResponsesToInsert.push({
-              audit_id: audit.id,
-              prompt_id: prompt.id,
-              llm,
-              country: project.country,
-              data_provider: 'BrightData',
-              raw_response_data: { error: error.message },
-            })
-          }
+        // Mark all prompts as failed for this LLM
+        const dataProvider = llmProviderMap.get(llm) || 'BrightData'
+        for (const prompt of project.prompts) {
+          llmResponsesToInsert.push({
+            audit_id: audit.id,
+            prompt_id: prompt.id,
+            llm,
+            country: project.country,
+            data_provider: dataProvider,
+            raw_response_data: { error: error.message },
+          })
         }
       }
-    }
+    })
 
-    // Process OneSearch LLMs (batch processing)
-    if (onesearchLLMs.length > 0) {
-      const onesearchApiKey = Deno.env.get('ONESEARCH_API_KEY') || ''
-      const onesearchApiUrl = Deno.env.get('ONESEARCH_API_URL') || 'http://168.231.84.54:8000'
-
-      console.log('[run-audit] Processing OneSearch LLMs:', onesearchLLMs)
-      console.log('[run-audit] OneSearch API URL:', onesearchApiUrl)
-      console.log('[run-audit] API Key configured:', onesearchApiKey ? 'Yes' : 'No')
-
-      for (const llm of onesearchLLMs) {
-        try {
-          const prompts = project.prompts.map(p => p.prompt_text)
-          const providerConfig = llmProviderConfigMap.get(llm)
-          const jobId = await triggerOneSearchJob(llm, prompts, project.country, project.country_name, auditForceWebSearch, onesearchApiUrl, onesearchApiKey, providerConfig)
-
-          // Create one response entry per prompt with the shared job_id
-          for (const prompt of project.prompts) {
-            llmResponsesToInsert.push({
-              audit_id: audit.id,
-              prompt_id: prompt.id,
-              llm,
-              job_id: jobId,
-              country: project.country,
-              data_provider: 'OneSearch SERP API',
-            })
-          }
-
-        } catch (error) {
-          console.error(`Failed to trigger ${llm} OneSearch job:`, error)
-
-          // Mark all prompts as failed for this LLM
-          for (const prompt of project.prompts) {
-            llmResponsesToInsert.push({
-              audit_id: audit.id,
-              prompt_id: prompt.id,
-              llm,
-              country: project.country,
-              data_provider: 'OneSearch SERP API',
-              raw_response_data: { error: error.message },
-            })
-          }
-        }
-      }
-    }
+    await Promise.all(triggerPromises)
 
     // Batch insert all LLM responses in one operation
     if (llmResponsesToInsert.length > 0) {
@@ -274,7 +231,7 @@ Deno.serve(async (req) => {
     }
 
     // Update progress once after all queries are triggered
-    const successfulQueries = llmResponsesToInsert.filter(r => r.snapshot_id || r.job_id).length
+    const successfulQueries = llmResponsesToInsert.filter(r => r.job_id).length
     const progress = Math.round((successfulQueries / totalQueries) * 25)
 
     await supabaseClient
@@ -324,90 +281,6 @@ Deno.serve(async (req) => {
     )
   }
 })
-
-async function triggerBrightDataQuery(llm: string, prompt: string, country: string, apiKey: string): Promise<string> {
-  let url: string
-  let payload: any
-
-  switch (llm) {
-    case 'searchgpt':
-      url = 'https://api.brightdata.com/datasets/v3/trigger?dataset_id=gd_m7aof0k82r803d5bjm&include_errors=true'
-      payload = [{
-        url: 'https://chatgpt.com/',
-        prompt,
-        country: country,
-        web_search: true,
-        additional_prompt: ''
-      }]
-      break
-
-    case 'perplexity':
-      url = 'https://api.brightdata.com/datasets/v3/trigger?dataset_id=gd_m7dhdot1vw9a7gc1n&include_errors=true'
-      payload = [{
-        url: 'https://www.perplexity.ai',
-        prompt,
-        country: country,
-        index: Date.now() // Use timestamp as index
-      }]
-      break
-
-    case 'gemini':
-      url = 'https://api.brightdata.com/datasets/v3/trigger?dataset_id=gd_mbz66arm2mf9cu856y&include_errors=true'
-      payload = [{
-        url: 'https://gemini.google.com/',
-        prompt,
-        country: country,
-        index: 1
-      }]
-      break
-
-    case 'google-ai-overview':
-    case 'google-ai-mode':
-      // Google AI Overview and Mode use Google Search SERP
-      // Dataset ID for Google SERP (web search)
-      url = 'https://api.brightdata.com/datasets/v3/trigger?dataset_id=gd_l7q7dkf244hwxijb&include_errors=true'
-      payload = [{
-        url: 'https://www.google.com/',
-        keyword: prompt,
-        country: country
-      }]
-      break
-
-    default:
-      throw new Error(`Unsupported LLM: ${llm}`)
-  }
-
-  // Create AbortController with 1-minute timeout
-  const controller = new AbortController()
-  const timeoutId = setTimeout(() => controller.abort(), 60000)
-
-  try {
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(payload),
-      signal: controller.signal,
-    })
-
-    clearTimeout(timeoutId)
-
-    if (!response.ok) {
-      throw new Error(`Brightdata API error: ${response.status} ${response.statusText}`)
-    }
-
-    const data: BrightdataResponse = await response.json()
-    return data.snapshot_id
-  } catch (error) {
-    clearTimeout(timeoutId)
-    if (error.name === 'AbortError') {
-      throw new Error(`Brightdata API timeout for ${llm} - request took longer than 1 minute`)
-    }
-    throw error
-  }
-}
 
 async function triggerOneSearchJob(
   llm: string,
