@@ -612,7 +612,7 @@ Les meilleurs restaurants japonais rue Sainte-Anne ?"></textarea>
         // Health check
         async function checkHealth() {
             try {
-                const response = await fetch('/health');
+                const response = await fetch('/api/health');
                 const data = await response.json();
                 
                 const dot = document.getElementById('healthDot');
