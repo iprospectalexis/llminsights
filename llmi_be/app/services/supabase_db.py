@@ -391,6 +391,8 @@ class SupabaseDB:
                     """),
                     {"aid": audit_id, "now": datetime.now(timezone.utc)},
                 )
+                # Increase statement timeout for MV refresh (default is too low for large tables)
+                await s.execute(text("SET LOCAL statement_timeout = '120s'"))
                 await s.execute(
                     text("SELECT refresh_audit_metrics(:aid)"),
                     {"aid": audit_id},
