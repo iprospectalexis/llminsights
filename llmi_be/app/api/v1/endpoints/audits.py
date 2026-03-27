@@ -420,9 +420,9 @@ async def _poll_for_results(audit_id: str):
                                     "response_timestamp": datetime.now(timezone.utc),
                                     "raw_response_data": matched,
                                     "web_search_query": matched.get("web_search_query"),
-                                    "citations": matched.get("citations"),
-                                    "all_sources": matched.get("all_sources"),
-                                    "links_attached": matched.get("links_attached"),
+                                    "citations": json.dumps(matched["citations"]) if matched.get("citations") else None,
+                                    "all_sources": json.dumps(matched["all_sources"]) if matched.get("all_sources") else None,
+                                    "links_attached": json.dumps(matched["links_attached"]) if matched.get("links_attached") else None,
                                 },
                             })
                         else:

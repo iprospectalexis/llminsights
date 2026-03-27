@@ -495,7 +495,7 @@ class BrightDataClient:
         prompts: list[str],
         geo_targeting: str = "",
         source: str = "chatgpt",
-        max_retries: int = 3,
+        max_retries: int = 1,
         progress_callback: Callable[[int, int, list], None] = None,
         output_file: str = None,
     ) -> tuple[list[dict], list[str]]:
