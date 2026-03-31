@@ -6,10 +6,14 @@ import { supabase } from '../../lib/supabase';
 import { CheckCircle, Clock, AlertCircle, Loader2, X, Eye } from 'lucide-react';
 import { AuditProgressModal } from './AuditProgressModal';
 
-const LLM_ICONS = {
+const LLM_ICONS: Record<string, string> = {
   searchgpt: 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/SearchGPT.PNG',
   perplexity: 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/Perplexity.png',
   gemini: 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/Gemini.png',
+  'google-ai-overview': 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/Google.png',
+  'google-ai-mode': 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/Google.png',
+  'bing-copilot': 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/bing_copilot.png',
+  grok: 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/Grok-icon.png',
 };
 
 interface AuditProgressToastProps {
@@ -18,16 +22,21 @@ interface AuditProgressToastProps {
   onClose: () => void;
 }
 
-interface AuditStep {
-  step: 'fetch' | 'parse' | 'sentiment' | 'persist';
-  status: 'pending' | 'running' | 'done' | 'error';
-  message?: string;
-}
+const pipelineLabels: Record<string, string> = {
+  created: 'Preparing audit...',
+  fetching: 'Sending requests to LLMs...',
+  polling: 'Receiving LLM answers...',
+  extracting_competitors: 'Extracting competitors...',
+  analyzing_sentiment: 'Analyzing sentiment...',
+  finalizing: 'Computing metrics...',
+  completed: 'Audit completed',
+  failed: 'Audit failed',
+};
 
-const stepLabels = {
-  fetch: 'Fetching LLM data',
-  parse: 'Parsing citations',
-  competitors: 'Retrieving competitors',
+const stepLabels: Record<string, string> = {
+  fetch: 'Sending requests',
+  parse: 'Receiving answers',
+  competitors: 'Extracting competitors',
   sentiment: 'Analyzing sentiment',
   persist: 'Saving results',
 };
@@ -45,291 +54,103 @@ export const AuditProgressToast: React.FC<AuditProgressToastProps> = ({
   onClose,
 }) => {
   const [audit, setAudit] = useState<any>(null);
-  const [steps, setSteps] = useState<AuditStep[]>([]);
+  const [steps, setSteps] = useState<any[]>([]);
   const [isExpanded, setIsExpanded] = useState(false);
-  const [llmResponses, setLlmResponses] = useState<any[]>([]);
-  const [citations, setCitations] = useState<any[]>([]);
   const [isVisible, setIsVisible] = useState(true);
   const [showModal, setShowModal] = useState(false);
 
-  // Helper function to check if audit is actually completed
-  const isAuditCompleted = () => {
-    // First check database status
-    if (audit?.status === 'completed' || audit?.status === 'failed') return true;
+  const isCompleted = audit?.status === 'completed' || audit?.status === 'failed';
 
-    // Check if all steps are completed
-    const allStepsCompleted = Object.keys(stepLabels).every(stepKey => {
-      // Skip sentiment step if not enabled
-      if (stepKey === 'sentiment' && !audit?.sentiment) return true;
-      const status = getStepStatus(stepKey);
-      return status === 'done';
-    });
+  const getProgressLabel = () => {
+    if (!audit) return 'Initializing...';
+    const state = audit.pipeline_state || audit.current_step;
+    if (!state) return 'Preparing audit...';
 
-    // Also check if all LLM responses have been processed (including errors)
-    const allResponsesProcessed = llmResponses.length > 0 && llmResponses.filter(r => {
-      const hasData = r.raw_response_data && Object.keys(r.raw_response_data).length > 0;
-      return hasData; // Either successful or failed, but processed
-    }).length === llmResponses.length;
-
-    console.log('AuditProgressToast: Completion check:', {
-      allStepsCompleted,
-      allResponsesProcessed,
-      completedCount: llmResponses.filter(r => r.raw_response_data && Object.keys(r.raw_response_data).length > 0).length,
-      total: llmResponses.length,
-      status: audit?.status
-    });
-
-    // Audit is completed only when all steps are done AND all responses are processed
-    return allStepsCompleted && allResponsesProcessed;
-  };
-
-  const getOverallProgress = () => {
-    // If audit is completed or failed, always show 100%
-    if (audit?.status === 'completed' || audit?.status === 'failed') return 100;
-
-    if (llmResponses.length > 0) {
-      const completedCount = llmResponses.filter(r => {
-        const hasData = r.raw_response_data && Object.keys(r.raw_response_data).length > 0;
-        return hasData;
-      }).length;
-
-      const progress = Math.round((completedCount / llmResponses.length) * 100);
-      console.log('AuditProgressToast: Progress calculation:', { completedCount, total: llmResponses.length, progress, auditStatus: audit?.status });
-
-      // If all responses are completed but audit status isn't updated yet, show 100%
-      if (completedCount === llmResponses.length && llmResponses.length > 0) return 100;
-
-      return progress;
+    // Add counters to label
+    if (state === 'polling' && audit.responses_expected > 0) {
+      return `Receiving answers (${audit.responses_received || 0}/${audit.responses_expected})`;
     }
-
-    // Use audit progress from database, but ensure minimum progress for running audits
-    const dbProgress = audit?.progress || 0;
-    return audit?.status === 'running' ? Math.max(dbProgress, 5) : dbProgress;
+    if (state === 'extracting_competitors' && audit.competitors_total > 0) {
+      return `Extracting competitors (${audit.competitors_processed || 0}/${audit.competitors_total})`;
+    }
+    if (state === 'analyzing_sentiment' && audit.sentiment_total > 0) {
+      return `Analyzing sentiment (${audit.sentiment_processed || 0}/${audit.sentiment_total})`;
+    }
+    return pipelineLabels[state] || state;
   };
 
-  const getSentimentProgress = () => {
-    if (!audit?.sentiment || llmResponses.length === 0) return null;
-    
-    const totalResponses = llmResponses.filter(r => r.answer_text).length;
-    const analyzedResponses = llmResponses.filter(r => r.sentiment_score !== null || r.sentiment_label !== null).length;
-    
-    return {
-      total: totalResponses,
-      analyzed: analyzedResponses,
-      percentage: totalResponses > 0 ? Math.round((analyzedResponses / totalResponses) * 100) : 0
-    };
+  const getProgress = () => {
+    if (isCompleted) return 100;
+    return audit?.progress || 0;
   };
+
   useEffect(() => {
     if (!auditId) return;
-
-    console.log('AuditProgressToast: Starting for audit ID:', auditId);
     setIsVisible(true);
-    
-    // Show toast immediately with initial state
-    setAudit({
-      id: auditId,
-      status: 'running',
-      progress: 0,
-      llms: []
-    });
+    setAudit({ id: auditId, status: 'running', progress: 0 });
 
-    // Fetch initial data
     fetchAuditData();
 
-    // Realtime for audit status only (filter by PK 'id' works reliably)
-    const auditChannel = supabase
-      .channel(`audit-progress-${auditId}`)
-      .on(
-        'postgres_changes',
-        {
-          event: 'UPDATE',
-          schema: 'public',
-          table: 'audits',
-          filter: `id=eq.${auditId}`,
-        },
-        (payload) => {
-          console.log('AuditProgressToast: Audit update received:', payload.new);
-          setAudit(payload.new);
-          if (payload.new.status === 'completed' || payload.new.status === 'failed') {
-            // Final fetch to get latest data, then auto-close
-            fetchAuditSteps();
-            fetchLlmResponses();
-            fetchCitations();
-            setTimeout(() => {
-              onCompleted();
-              setIsVisible(false);
-            }, 5000);
-          }
+    // Realtime subscription for audit updates
+    const channel = supabase
+      .channel(`audit-toast-${auditId}`)
+      .on('postgres_changes', {
+        event: 'UPDATE', schema: 'public', table: 'audits',
+        filter: `id=eq.${auditId}`,
+      }, (payload) => {
+        setAudit(payload.new);
+        if (payload.new.status === 'completed' || payload.new.status === 'failed') {
+          fetchSteps();
+          setTimeout(() => { onCompleted(); setIsVisible(false); }, 5000);
         }
-      )
+      })
       .subscribe();
 
-    // Refresh UI data every 30s (read-only queries)
-    // Polling is handled by the backend scheduler — no edge function invocation needed
-    const dataInterval = setInterval(() => {
-      fetchAuditSteps();
-      fetchLlmResponses();
-      fetchCitations();
-    }, 30000);
+    // Periodic refresh for steps + counters
+    const interval = setInterval(() => {
+      fetchAuditData();
+      fetchSteps();
+    }, 15000);
 
     return () => {
-      supabase.removeChannel(auditChannel);
-      clearInterval(dataInterval);
+      supabase.removeChannel(channel);
+      clearInterval(interval);
     };
   }, [auditId]);
 
-  // Check for completion and auto-close
-  useEffect(() => {
-    const completed = isAuditCompleted();
-
-    if (completed && audit?.status !== 'completed' && audit?.status !== 'failed') {
-      // Update audit status in database if it's not already marked as completed
-      console.log('AuditProgressToast: All responses processed, updating audit status to completed');
-      const updateAuditStatus = async () => {
-        try {
-          await supabase
-            .from('audits')
-            .update({
-              status: 'completed',
-              progress: 100,
-              finished_at: new Date().toISOString()
-            })
-            .eq('id', auditId);
-
-          // Update local state immediately
-          setAudit(prev => ({ ...prev, status: 'completed', progress: 100 }));
-        } catch (error) {
-          console.error('Error updating audit status:', error);
-        }
-      };
-      updateAuditStatus();
-    }
-
-    // Auto-close after completion
-    if (completed) {
-      console.log('AuditProgressToast: Audit completed, scheduling auto-close');
-      const timer = setTimeout(() => {
-        console.log('AuditProgressToast: Auto-closing after completion');
-        onCompleted();
-        setIsVisible(false);
-      }, 5000);
-
-      return () => clearTimeout(timer);
-    }
-  }, [llmResponses, audit?.status, auditId]);
-
   const fetchAuditData = async () => {
-    console.log('AuditProgressToast: Fetching audit data for:', auditId);
-    const { data, error } = await supabase
+    const { data } = await supabase
       .from('audits')
-      .select('id, status, progress, llms, sentiment, created_at')
+      .select('id, status, progress, llms, sentiment, pipeline_state, responses_expected, responses_received, competitors_processed, competitors_total, sentiment_processed, sentiment_total')
       .eq('id', auditId)
       .single();
-    
-    if (error) {
-      console.error('AuditProgressToast: Error fetching audit:', error);
-      // If audit doesn't exist yet, keep the initial state
-      return;
-    }
-    
-    console.log('AuditProgressToast: Audit data received:', data);
-    if (data) {
-      setAudit(data);
-    }
-
-    fetchAuditSteps();
-    fetchLlmResponses();
-    fetchCitations();
+    if (data) setAudit(data);
   };
 
-  const fetchAuditSteps = async () => {
-    console.log('AuditProgressToast: Fetching steps for:', auditId);
-    const { data, error } = await supabase
+  const fetchSteps = async () => {
+    const { data } = await supabase
       .from('audit_steps')
-      .select('id, audit_id, step, status, message, created_at')
+      .select('step, status, message, processed_count, total_count')
       .eq('audit_id', auditId)
       .order('created_at');
-    
-    if (error) {
-      console.error('AuditProgressToast: Error fetching steps:', error);
-      return;
-    }
-    
-    console.log('AuditProgressToast: Steps received:', data);
-    if (data) {
-      setSteps(data);
-    }
+    if (data) setSteps(data);
   };
 
-  const fetchLlmResponses = async () => {
-    console.log('AuditProgressToast: Fetching LLM responses for:', auditId);
-    const { data } = await supabase
-      .from('llm_responses')
-      .select('id, llm, answer_text, raw_response_data, sentiment_score, sentiment_label, prompts(prompt_text, prompt_group)')
-      .eq('audit_id', auditId)
-      .order('created_at');
-    
-    console.log('AuditProgressToast: LLM responses received:', data);
-    if (data) {
-      setLlmResponses(data);
-    }
-  };
-
-  const fetchCitations = async () => {
-    console.log('AuditProgressToast: Fetching citations for:', auditId);
-    const { data } = await supabase
-      .from('citations')
-      .select('id, audit_id, domain, position')
-      .eq('audit_id', auditId)
-      .order('position');
-    
-    console.log('AuditProgressToast: Citations received:', data?.length || 0);
-    if (data) {
-      setCitations(data);
-    }
-  };
   const getStepStatus = (stepName: string) => {
-    const step = steps.find(s => s.step === stepName);
+    const step = steps.find((s: any) => s.step === stepName);
     return step?.status || 'pending';
   };
 
-  const getCurrentStep = () => {
-    if (!steps.length) return 'Initializing audit...';
-    
-    const runningStep = steps.find(s => s.status === 'running');
-    if (runningStep) return stepLabels[runningStep.step];
-    
-    const lastDoneStep = steps.filter(s => s.status === 'done').pop();
-    if (lastDoneStep) return `${stepLabels[lastDoneStep.step]} completed`;
-    
-    return 'Preparing audit...';
-  };
-
-  const getLlmProgress = () => {
-    if (!llmResponses.length) return { completed: 0, total: 0 };
-    
-    const totalExpected = llmResponses.length;
-    const completed = llmResponses.filter(r => {
-      // Count as completed if it has answer_text OR if raw_response_data exists (success or error)
-      return r.answer_text || (r.raw_response_data && Object.keys(r.raw_response_data).length > 0);
-    }).length;
-    
-    console.log('AuditProgressToast: LLM Progress:', { completed, total: totalExpected, responses: llmResponses });
-    console.log('AuditProgressToast: Response details:', llmResponses.map(r => ({
-      id: r.id,
-      llm: r.llm,
-      hasAnswerText: !!r.answer_text,
-      hasRawData: !!(r.raw_response_data && Object.keys(r.raw_response_data).length > 0),
-      rawDataKeys: r.raw_response_data ? Object.keys(r.raw_response_data) : []
-    })));
-    
-    return { completed, total: totalExpected };
+  const getStepDetail = (stepName: string) => {
+    const step = steps.find((s: any) => s.step === stepName);
+    if (!step) return null;
+    if (step.processed_count && step.total_count) {
+      return `${step.processed_count}/${step.total_count}`;
+    }
+    return step.message || null;
   };
 
   if (!audit || !isVisible) return null;
-
-  const llmProgress = getLlmProgress();
-  const sentimentProgress = getSentimentProgress();
 
   return (
     <AnimatePresence>
@@ -342,33 +163,20 @@ export const AuditProgressToast: React.FC<AuditProgressToastProps> = ({
         <div className="p-4">
           <div className="flex items-center justify-between mb-3">
             <div className="flex items-center space-x-2">
-              {isAuditCompleted() ? (
+              {isCompleted ? (
                 <CheckCircle className="w-5 h-5 text-green-500" />
               ) : (
                 <Loader2 className="w-5 h-5 text-brand-primary animate-spin" />
               )}
               <h3 className="font-semibold text-gray-900 dark:text-gray-100">
-                {isAuditCompleted() ? 'Audit Completed' : 'Running Audit'}
+                {isCompleted ? (audit?.status === 'failed' ? 'Audit Failed' : 'Audit Completed') : 'Running Audit'}
               </h3>
             </div>
             <div className="flex items-center space-x-1">
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => setShowModal(true)}
-                className="p-1"
-              >
+              <Button variant="ghost" size="sm" onClick={() => setShowModal(true)} className="p-1">
                 <Eye className="w-4 h-4" />
               </Button>
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => {
-                  setIsVisible(false);
-                  onClose();
-                }}
-                className="p-1"
-              >
+              <Button variant="ghost" size="sm" onClick={() => { setIsVisible(false); onClose(); }} className="p-1">
                 <X className="w-4 h-4" />
               </Button>
             </div>
@@ -377,32 +185,28 @@ export const AuditProgressToast: React.FC<AuditProgressToastProps> = ({
           <div className="space-y-2">
             <div className="flex justify-between text-sm">
               <span className="text-gray-600 dark:text-gray-400">
-                {isAuditCompleted() ? 'Audit completed successfully' : getCurrentStep()}
+                {getProgressLabel()}
               </span>
               <span className="font-medium text-brand-primary">
-                {getOverallProgress()}%
+                {getProgress()}%
               </span>
             </div>
-            <Progress value={getOverallProgress()} />
-            
-            {/* Show LLM progress if available */}
-            {llmProgress.total > 0 && (
+            <Progress value={getProgress()} />
+
+            {/* Granular counters */}
+            {audit.pipeline_state === 'polling' && audit.responses_expected > 0 && (
               <div className="text-xs text-gray-500 dark:text-gray-400">
-                LLM Responses: {llmProgress.completed}/{llmProgress.total}
+                Responses: {audit.responses_received || 0}/{audit.responses_expected}
               </div>
             )}
-            
-            {/* Show sentiment progress if enabled and available */}
-            {sentimentProgress && (
+            {audit.pipeline_state === 'extracting_competitors' && audit.competitors_total > 0 && (
               <div className="text-xs text-gray-500 dark:text-gray-400">
-                Sentiment Analysis: {sentimentProgress.analyzed}/{sentimentProgress.total} responses ({sentimentProgress.percentage}%)
+                Competitors: {audit.competitors_processed || 0}/{audit.competitors_total}
               </div>
             )}
-            
-            {/* Show initial message when no steps yet */}
-            {steps.length === 0 && (
+            {audit.pipeline_state === 'analyzing_sentiment' && audit.sentiment_total > 0 && (
               <div className="text-xs text-gray-500 dark:text-gray-400">
-                Setting up audit pipeline...
+                Sentiment: {audit.sentiment_processed || 0}/{audit.sentiment_total}
               </div>
             )}
           </div>
@@ -414,88 +218,51 @@ export const AuditProgressToast: React.FC<AuditProgressToastProps> = ({
               exit={{ height: 0, opacity: 0 }}
               className="mt-4 space-y-3 border-t border-gray-200 dark:border-gray-700 pt-3"
             >
-              {/* LLM Progress */}
-              {llmProgress.total > 0 && (
-                <div className="space-y-2">
-                <div className="text-sm font-medium text-gray-700 dark:text-gray-300">
-                  LLM Responses: {llmProgress.completed}/{llmProgress.total}
-                </div>
-                {audit.llms?.map((llm: string) => {
-                  const llmCount = llmResponses.filter(r => r.llm === llm && r.answer_text).length;
-                  const totalForLlm = llmResponses.filter(r => r.llm === llm).length;
-                  return (
-                    <div key={llm} className="flex justify-between text-xs">
-                      <div className="flex items-center space-x-1">
-                        <img 
-                          src={LLM_ICONS[llm as keyof typeof LLM_ICONS]} 
-                          alt={`${llm} icon`}
-                          className="w-3 h-3 object-contain"
-                        />
-                        <span className="capitalize text-gray-600 dark:text-gray-400">
-                          {llm}
-                        </span>
-                      </div>
-                      <span className="text-gray-900 dark:text-gray-100">
-                        {llmCount}/{totalForLlm}
-                      </span>
-                    </div>
-                  );
-                })}
-                </div>
-              )}
-
-              {/* Sentiment Analysis Progress */}
-              {sentimentProgress && (
-                <div className="space-y-2">
-                  <div className="text-sm font-medium text-gray-700 dark:text-gray-300">
-                    Sentiment Analysis: {sentimentProgress.analyzed}/{sentimentProgress.total}
-                  </div>
-                  <div className="bg-gray-100 dark:bg-gray-700 rounded-lg p-2">
-                    <Progress value={sentimentProgress.percentage} />
-                    <div className="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                      {sentimentProgress.percentage}% of citations analyzed
-                    </div>
-                  </div>
-                </div>
-              )}
               {/* Steps Progress */}
               <div className="space-y-2">
-                <div className="text-sm font-medium text-gray-700 dark:text-gray-300">
-                  Process Steps
-                </div>
                 {Object.entries(stepLabels).map(([stepKey, label]) => {
-                  const status = getStepStatus(stepKey);
-                  const Icon = stepIcons[status];
+                  const status = getStepStatus(stepKey) as keyof typeof stepIcons;
+                  const Icon = stepIcons[status] || Clock;
+                  const detail = getStepDetail(stepKey);
                   return (
-                    <div key={stepKey} className="flex items-center space-x-2 text-xs">
-                      <Icon 
-                        className={`
-                          w-3 h-3
-                          ${status === 'done' ? 'text-green-500' : ''}
-                          ${status === 'running' ? 'text-blue-500 animate-spin' : ''}
-                          ${status === 'error' ? 'text-red-500' : ''}
-                          ${status === 'pending' ? 'text-gray-400' : ''}
-                        `}
-                      />
-                      <span className="text-gray-600 dark:text-gray-400">{label}</span>
+                    <div key={stepKey} className="flex items-center justify-between text-xs">
+                      <div className="flex items-center space-x-2">
+                        <Icon className={`w-3 h-3 ${
+                          status === 'done' ? 'text-green-500' :
+                          status === 'running' ? 'text-blue-500 animate-spin' :
+                          status === 'error' ? 'text-red-500' : 'text-gray-400'
+                        }`} />
+                        <span className="text-gray-600 dark:text-gray-400">{label}</span>
+                      </div>
+                      {detail && (
+                        <span className="text-gray-500 dark:text-gray-500 text-[10px]">{detail}</span>
+                      )}
                     </div>
                   );
                 })}
               </div>
 
-              {isAuditCompleted() && (
-                <div className="text-center pt-2">
-                  <div className="text-xs text-green-600 dark:text-green-400">
-                    ✓ Audit completed successfully
-                  </div>
+              {/* Per-LLM icons */}
+              {audit.llms?.length > 0 && (
+                <div className="flex gap-2 pt-1">
+                  {audit.llms.map((llm: string) => (
+                    <img key={llm} src={LLM_ICONS[llm]} alt={llm}
+                      className="w-5 h-5 object-contain rounded" title={llm} />
+                  ))}
                 </div>
               )}
             </motion.div>
           )}
+
+          <button
+            onClick={() => setIsExpanded(!isExpanded)}
+            className="w-full mt-2 text-xs text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 transition-colors"
+          >
+            {isExpanded ? 'Less details' : 'More details'}
+          </button>
         </div>
       </motion.div>
 
-      {/* Import and use the modal */}
       {showModal && (
         <AuditProgressModal
           isOpen={showModal}

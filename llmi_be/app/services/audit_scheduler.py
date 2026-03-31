@@ -1,34 +1,39 @@
 """
-Background audit scheduler — replaces pg_cron poll_running_audits jobs.
+Audit scheduler — single-owner model using audit_pipeline state machine.
 
-Runs every 10s, polls at most 5 running audits concurrently.
-Starts automatically on app startup via lifespan.
+Runs every 15s. For each active audit:
+  1. Try to claim it (CAS lock)
+  2. Process the current pipeline step
+  3. Release the lock
+
+Only ONE executor processes each audit at a time.
 """
 
 import asyncio
 import logging
 
-from app.services.supabase_db import db
+from app.services import audit_pipeline
+from app.services.audit_pipeline import WORKER_ID
 
 logger = logging.getLogger(__name__)
 
-# Max concurrent audit polls
-_poll_semaphore = asyncio.Semaphore(5)
+# Max concurrent audit processing
+_semaphore = asyncio.Semaphore(5)
 _running = False
 
 
 async def start_scheduler():
-    """Start the background polling loop."""
+    """Start the background scheduling loop."""
     global _running
     _running = True
-    logger.info("Audit scheduler started (10s interval, max 5 concurrent)")
+    logger.info(f"Audit scheduler started (worker={WORKER_ID}, 15s interval, max 5 concurrent)")
 
     while _running:
         try:
-            await _poll_tick()
+            await _scheduler_tick()
         except Exception as e:
             logger.error(f"Scheduler tick error: {e}")
-        await asyncio.sleep(10)
+        await asyncio.sleep(15)
 
 
 def stop_scheduler():
@@ -38,22 +43,41 @@ def stop_scheduler():
     logger.info("Audit scheduler stopped")
 
 
-async def _poll_tick():
-    """One scheduler tick — find running audits and poll them."""
-    running_audits = await db.get_running_audits()
-    if not running_audits:
+async def _scheduler_tick():
+    """One tick — find active audits and process them."""
+    # Release stale locks first (workers that died)
+    try:
+        from app.database import AsyncSessionLocal
+        from sqlalchemy import text
+        async with AsyncSessionLocal() as s:
+            result = await s.execute(text("SELECT release_stale_audit_locks()"))
+            released = result.scalar()
+            if released and released > 0:
+                logger.info(f"Scheduler: released {released} stale lock(s)")
+            await s.commit()
+    except Exception as e:
+        logger.warning(f"Scheduler: stale lock cleanup error: {e}")
+
+    # Get active audits
+    active_audits = await audit_pipeline.get_active_audits()
+    if not active_audits:
         return
 
-    logger.info(f"Scheduler: {len(running_audits)} running audit(s)")
+    logger.info(f"Scheduler: {len(active_audits)} active audit(s)")
 
-    async def _poll_one(audit_id: str):
-        async with _poll_semaphore:
+    async def _process_one(audit: dict):
+        async with _semaphore:
+            audit_id = str(audit["id"])
+            claimed = await audit_pipeline.try_claim(audit_id, WORKER_ID)
+            if not claimed:
+                return  # Another worker/tick owns it
+
             try:
-                # Import here to avoid circular imports
-                from app.api.v1.endpoints.audits import _poll_for_results
-                await _poll_for_results(audit_id)
+                await audit_pipeline.process_step(audit, WORKER_ID)
             except Exception as e:
-                logger.error(f"Scheduler poll error for {audit_id}: {e}")
+                logger.error(f"Scheduler pipeline error for {audit_id}: {e}")
+            finally:
+                await audit_pipeline.release(audit_id, WORKER_ID)
 
-    tasks = [_poll_one(str(a["id"])) for a in running_audits]
+    tasks = [_process_one(a) for a in active_audits]
     await asyncio.gather(*tasks, return_exceptions=True)

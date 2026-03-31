@@ -34,16 +34,16 @@ def _serialize_value(v: Any, col: str = "") -> Any:
     """Convert Python values to asyncpg-compatible types."""
     if isinstance(v, dict):
         return json.dumps(v)  # dicts → JSON string for jsonb columns
-    if isinstance(v, list) and col in _JSONB_COLUMNS:
-        return json.dumps(v)  # lists in jsonb columns → JSON string
-    if isinstance(v, list) and col in _TEXT_ARRAY_COLUMNS:
-        return v  # text[] columns: pass native Python list (asyncpg handles it)
+    if isinstance(v, list):
+        if col in _TEXT_ARRAY_COLUMNS:
+            return v  # text[] columns: pass native Python list (asyncpg handles it)
+        return json.dumps(v)  # ALL other lists → JSON string (safe default)
     return v
 
 
 def _needs_jsonb_cast(v: Any, col: str) -> bool:
     """Check if a value needs CAST to jsonb."""
-    return isinstance(v, dict) or (isinstance(v, list) and col in _JSONB_COLUMNS)
+    return isinstance(v, dict) or (isinstance(v, list) and col not in _TEXT_ARRAY_COLUMNS)
 
 
 def _build_insert(table: str, data: dict, returning: bool = True) -> tuple[str, dict]:

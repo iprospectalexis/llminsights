@@ -23,6 +23,11 @@ interface Audit {
   llms: string[];
   status: string;
   current_step?: string | null;
+  pipeline_state?: string | null;
+  competitors_processed?: number;
+  competitors_total?: number;
+  sentiment_processed?: number;
+  sentiment_total?: number;
   progress: number;
   started_at: string | null;
   finished_at: string | null;
@@ -287,16 +292,27 @@ export function StatusPage() {
   };
 
   const getStatusDisplay = (audit: Audit): string => {
-    if (audit.status === 'running' && audit.current_step) {
-      switch (audit.current_step) {
+    if (audit.status === 'running') {
+      const state = audit.pipeline_state || audit.current_step;
+      switch (state) {
+        case 'fetching':
+          return 'Sending Requests';
+        case 'polling':
         case 'getting_results':
-          return 'Getting Results';
+          return 'Receiving Answers';
+        case 'extracting_competitors':
         case 'processing_results':
-          return 'Processing Results';
-        case 'completing':
-          return 'Processing Results';
+          return audit.competitors_total
+            ? `Competitors (${audit.competitors_processed || 0}/${audit.competitors_total})`
+            : 'Extracting Competitors';
+        case 'analyzing_sentiment':
         case 'sentiment_analysis':
-          return 'Sentiment Analysis';
+          return audit.sentiment_total
+            ? `Sentiment (${audit.sentiment_processed || 0}/${audit.sentiment_total})`
+            : 'Analyzing Sentiment';
+        case 'finalizing':
+        case 'completing':
+          return 'Finalizing';
         default:
           return 'Running';
       }

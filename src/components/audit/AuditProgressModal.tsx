@@ -3,28 +3,42 @@ import { Modal } from '../ui/Modal';
 import { Progress } from '../ui/Progress';
 import { Button } from '../ui/Button';
 import { supabase } from '../../lib/supabase';
-import { CheckCircle, Clock, AlertCircle, Loader2, Play } from 'lucide-react';
-import { motion } from 'framer-motion';
+import { CheckCircle, Clock, AlertCircle, Loader2 } from 'lucide-react';
 
-const stepLabels = {
+const pipelineLabels: Record<string, string> = {
+  created: 'Preparing audit...',
+  fetching: 'Sending requests to LLMs...',
+  polling: 'Receiving LLM answers...',
+  extracting_competitors: 'Extracting competitors...',
+  analyzing_sentiment: 'Analyzing sentiment...',
+  finalizing: 'Computing metrics...',
+  completed: 'Audit completed',
+  failed: 'Audit failed',
+};
+
+const stepLabels: Record<string, string> = {
   fetch: 'Sending requests to LLMs',
   parse: 'Receiving answers',
   competitors: 'Retrieving competitors',
   sentiment: 'Analyzing Brand Sentiment',
-  persist: 'Saving Results'
+  persist: 'Saving Results',
 };
 
 const stepIcons = {
   pending: Clock,
   running: Loader2,
   done: CheckCircle,
-  error: AlertCircle
+  error: AlertCircle,
 };
 
-const LLM_ICONS = {
+const LLM_ICONS: Record<string, string> = {
   searchgpt: 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/SearchGPT.PNG',
   perplexity: 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/Perplexity.png',
   gemini: 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/Gemini.png',
+  'google-ai-overview': 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/Google.png',
+  'google-ai-mode': 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/Google.png',
+  'bing-copilot': 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/bing_copilot.png',
+  grok: 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/Grok-icon.png',
 };
 
 interface AuditProgressModalProps {
@@ -33,16 +47,12 @@ interface AuditProgressModalProps {
   auditId: string;
 }
 
-interface LLMResponse {
-  id: string;
-  llm: string;
-  snapshot_id: string;
-  answer_text: string | null;
-  raw_response_data: any;
-  prompts: {
-    prompt_text: string;
-    prompt_group: string;
-  } | null;
+interface AuditStep {
+  step: string;
+  status: string;
+  message: string | null;
+  processed_count: number | null;
+  total_count: number | null;
 }
 
 export const AuditProgressModal: React.FC<AuditProgressModalProps> = ({
@@ -51,157 +61,84 @@ export const AuditProgressModal: React.FC<AuditProgressModalProps> = ({
   auditId,
 }) => {
   const [audit, setAudit] = useState<any>(null);
-  const [steps, setSteps] = useState<any[]>([]);
-  const [llmResponses, setLlmResponses] = useState<LLMResponse[]>([]);
-  const [citations, setCitations] = useState<any[]>([]);
+  const [steps, setSteps] = useState<AuditStep[]>([]);
   const [loading, setLoading] = useState(true);
-  const [isInitialLoad, setIsInitialLoad] = useState(true);
+
+  const isCompleted = audit?.status === 'completed' || audit?.status === 'failed';
 
   useEffect(() => {
     if (!isOpen || !auditId) return;
 
-    console.log('AuditProgressModal: Starting for audit ID:', auditId);
+    setLoading(true);
+    fetchAll().then(() => setLoading(false));
 
-    // Fetch initial data
-    setIsInitialLoad(true);
-    fetchAuditData();
-
-    // Realtime for audit status only (filter by PK 'id' works reliably)
-    const auditChannel = supabase
+    // Realtime subscription for audit updates
+    const channel = supabase
       .channel(`audit-modal-${auditId}`)
-      .on(
-        'postgres_changes',
-        {
-          event: 'UPDATE',
-          schema: 'public',
-          table: 'audits',
-          filter: `id=eq.${auditId}`,
-        },
-        (payload) => {
-          console.log('AuditProgressModal: Audit updated:', payload.new);
-          setAudit(payload.new);
-          if (payload.new.status === 'completed' || payload.new.status === 'failed') {
-            // Final fetch to get latest data
-            fetchAuditSteps();
-            fetchLlmResponses();
-            fetchCitations();
-          }
+      .on('postgres_changes', {
+        event: 'UPDATE', schema: 'public', table: 'audits',
+        filter: `id=eq.${auditId}`,
+      }, (payload) => {
+        setAudit(payload.new);
+        if (payload.new.status === 'completed' || payload.new.status === 'failed') {
+          fetchSteps();
         }
-      )
+      })
       .subscribe();
 
-    // Refresh UI data every 30s (read-only queries)
-    // Polling is handled by the backend scheduler — no edge function invocation needed
-    const dataInterval = setInterval(() => {
-      fetchAuditSteps();
-      fetchLlmResponses();
-      fetchCitations();
-    }, 30000);
+    // Periodic refresh for steps + counters
+    const interval = setInterval(() => {
+      fetchAll();
+    }, 15000);
 
     return () => {
-      supabase.removeChannel(auditChannel);
-      clearInterval(dataInterval);
+      supabase.removeChannel(channel);
+      clearInterval(interval);
     };
   }, [isOpen, auditId]);
 
-  const fetchAuditData = async () => {
-    if (isInitialLoad) {
-      setLoading(true);
-    }
-
-    try {
-      const { data: auditData } = await supabase
-        .from('audits')
-        .select('id, status, progress, llms, sentiment, created_at')
-        .eq('id', auditId)
-        .single();
-
-      if (auditData) {
-        setAudit(prev => {
-          if (!prev || JSON.stringify(prev) !== JSON.stringify(auditData)) {
-            return auditData;
-          }
-          return prev;
-        });
-      }
-
-      await Promise.all([
-        fetchAuditSteps(),
-        fetchLlmResponses(),
-        fetchCitations()
-      ]);
-    } catch (error) {
-      console.error('Error fetching audit data:', error);
-    }
-
-    if (isInitialLoad) {
-      setLoading(false);
-      setIsInitialLoad(false);
-    }
+  const fetchAll = async () => {
+    await Promise.all([fetchAudit(), fetchSteps()]);
   };
 
-  const fetchAuditSteps = async () => {
+  const fetchAudit = async () => {
+    const { data } = await supabase
+      .from('audits')
+      .select('id, status, progress, llms, sentiment, pipeline_state, responses_expected, responses_received, competitors_processed, competitors_total, sentiment_processed, sentiment_total')
+      .eq('id', auditId)
+      .single();
+    if (data) setAudit(data);
+  };
+
+  const fetchSteps = async () => {
     const { data } = await supabase
       .from('audit_steps')
-      .select('id, audit_id, step, status, message, created_at')
+      .select('step, status, message, processed_count, total_count')
       .eq('audit_id', auditId)
       .order('created_at');
-
-    if (data) {
-      setSteps(prev => {
-        if (JSON.stringify(prev) !== JSON.stringify(data)) {
-          return data;
-        }
-        return prev;
-      });
-    }
-  };
-  const fetchLlmResponses = async () => {
-    const { data } = await supabase
-      .from('llm_responses')
-      .select(`
-        id,
-        llm,
-        snapshot_id,
-        answer_text,
-        raw_response_data,
-        sentiment_score,
-        sentiment_label,
-        prompts (
-          prompt_text,
-          prompt_group
-        )
-      `)
-      .eq('audit_id', auditId)
-      .order('created_at');
-
-    if (data) {
-      setLlmResponses(prev => {
-        if (JSON.stringify(prev) !== JSON.stringify(data)) {
-          console.log('AuditProgressModal: LLM responses updated:', data);
-          return data;
-        }
-        return prev;
-      });
-    }
+    if (data) setSteps(data);
   };
 
-  const fetchCitations = async () => {
-    const { data } = await supabase
-      .from('citations')
-      .select('id, audit_id, position')
-      .eq('audit_id', auditId)
-      .order('position');
+  const getProgressLabel = () => {
+    if (!audit) return 'Initializing...';
+    const state = audit.pipeline_state || audit.current_step;
+    if (!state) return 'Preparing audit...';
 
-    if (data) {
-      setCitations(prev => {
-        if (JSON.stringify(prev) !== JSON.stringify(data)) {
-          console.log('AuditProgressModal: Citations updated:', data.length);
-          return data;
-        }
-        return prev;
-      });
+    if (state === 'polling' && audit.responses_expected > 0) {
+      return `Receiving answers (${audit.responses_received || 0}/${audit.responses_expected})`;
     }
+    if (state === 'extracting_competitors' && audit.competitors_total > 0) {
+      return `Extracting competitors (${audit.competitors_processed || 0}/${audit.competitors_total})`;
+    }
+    if (state === 'analyzing_sentiment' && audit.sentiment_total > 0) {
+      return `Analyzing sentiment (${audit.sentiment_processed || 0}/${audit.sentiment_total})`;
+    }
+    return pipelineLabels[state] || state;
+  };
+
+  const getProgress = () => {
+    if (isCompleted) return 100;
+    return audit?.progress || 0;
   };
 
   const getStepStatus = (stepName: string) => {
@@ -209,102 +146,13 @@ export const AuditProgressModal: React.FC<AuditProgressModalProps> = ({
     return step?.status || 'pending';
   };
 
-  const getSentimentProgress = () => {
-    if (!audit?.sentiment || llmResponses.length === 0) return null;
-
-    const totalResponses = llmResponses.filter(r => r.answer_text).length;
-    const analyzedResponses = llmResponses.filter(r => r.sentiment_score !== null || r.sentiment_label !== null).length;
-
-    // Ensure analyzed never exceeds total
-    const cappedAnalyzed = Math.min(analyzedResponses, totalResponses);
-
-    // Calculate percentage and cap at 100%
-    const percentage = totalResponses > 0
-      ? Math.min(100, Math.round((cappedAnalyzed / totalResponses) * 100))
-      : 0;
-
-    return {
-      total: totalResponses,
-      analyzed: cappedAnalyzed,
-      percentage
-    };
-  };
-  const getResponseStatus = (response: LLMResponse) => {
-    // Check if response has been processed (either successfully or with error)
-    const hasData = response.raw_response_data && Object.keys(response.raw_response_data).length > 0;
-    const hasError = response.raw_response_data?.error;
-    
-    if (response.answer_text && hasData) return 'completed';
-    if (hasError) return 'failed';
-    if (hasData) return 'completed'; // Has data but no answer_text yet
-    if (response.snapshot_id) return 'processing';
-    return 'pending';
-  };
-
-  const getCompletedCount = () => {
-    return llmResponses.filter(r => {
-      const hasData = r.raw_response_data && Object.keys(r.raw_response_data).length > 0;
-      return hasData; // Count as completed if raw_response_data has content
-    }).length;
-  };
-
-  const getSuccessfulCount = () => {
-    return llmResponses.filter(r => {
-      const hasData = r.raw_response_data && Object.keys(r.raw_response_data).length > 0;
-      const hasError = r.raw_response_data?.error;
-      return hasData && !hasError; // Has data but no error
-    }).length;
-  };
-
-  const getFailedCount = () => {
-    return llmResponses.filter(r => r.raw_response_data?.error).length;
-  };
-
-  const isAuditCompleted = () => {
-    // First check database status
-    if (audit?.status === 'completed' || audit?.status === 'failed') return true;
-
-    // Check if all steps are completed
-    const allStepsCompleted = Object.keys(stepLabels).every(stepKey => {
-      // Skip sentiment step if not enabled
-      if (stepKey === 'sentiment' && !audit?.sentiment) return true;
-      const status = getStepStatus(stepKey);
-      return status === 'done';
-    });
-
-    // Also check if all responses are processed
-    const allResponsesProcessed = llmResponses.length > 0 && getCompletedCount() === llmResponses.length;
-
-    console.log('AuditProgressModal: Completion check:', {
-      allStepsCompleted,
-      allResponsesProcessed,
-      completedCount: getCompletedCount(),
-      total: llmResponses.length,
-      status: audit?.status
-    });
-
-    // Audit is completed only when all steps are done AND all responses are processed
-    return allStepsCompleted && allResponsesProcessed;
-  };
-
-  const getOverallProgress = () => {
-    // If audit is completed or failed, always return 100%
-    if (audit?.status === 'completed' || audit?.status === 'failed') return 100;
-
-    // If we have responses, calculate based on completion
-    if (llmResponses.length > 0) {
-      const completedCount = getCompletedCount();
-      const progress = Math.round((completedCount / llmResponses.length) * 100);
-      console.log('AuditProgressModal: Progress calculation:', { completedCount, total: llmResponses.length, progress, auditStatus: audit?.status });
-
-      // If all responses are completed but audit status isn't updated yet, show 100%
-      if (completedCount === llmResponses.length && llmResponses.length > 0) return 100;
-
-      return progress;
+  const getStepDetail = (stepName: string) => {
+    const step = steps.find(s => s.step === stepName);
+    if (!step) return null;
+    if (step.processed_count && step.total_count) {
+      return `${step.processed_count}/${step.total_count}`;
     }
-
-    // Use database progress as fallback
-    return audit?.progress || 0;
+    return step.message || null;
   };
 
   if (loading) {
@@ -324,39 +172,51 @@ export const AuditProgressModal: React.FC<AuditProgressModalProps> = ({
         {/* Overall Progress */}
         <div className="text-center">
           <div className="flex items-center justify-center space-x-3 mb-4">
-            {isAuditCompleted() ? (
+            {isCompleted ? (
               <CheckCircle className="w-8 h-8 text-green-500" />
             ) : (
               <Loader2 className="w-8 h-8 text-brand-primary animate-spin" />
             )}
             <h2 className="text-2xl font-bold text-gray-900 dark:text-gray-100">
-              {isAuditCompleted() ? 'Audit Completed' : 'Processing Audit'}
+              {isCompleted
+                ? (audit?.status === 'failed' ? 'Audit Failed' : 'Audit Completed')
+                : 'Processing Audit'}
             </h2>
           </div>
-          
+
           <div className="text-3xl font-bold text-brand-primary mb-2">
-            {getOverallProgress()}%
+            {getProgress()}%
           </div>
-          <Progress value={getOverallProgress()} className="mb-4" />
-          
+          <Progress value={getProgress()} className="mb-2" />
+          <div className="text-sm text-gray-600 dark:text-gray-400 mb-4">
+            {getProgressLabel()}
+          </div>
+
+          {/* Counters grid */}
           <div className="grid grid-cols-3 gap-4 text-sm">
             <div className="bg-blue-50 dark:bg-blue-900/20 rounded-xl p-3">
               <div className="text-2xl font-bold text-blue-600 dark:text-blue-400">
-                {getCompletedCount()}
+                {audit?.responses_received || 0}
               </div>
-              <div className="text-blue-700 dark:text-blue-300">Completed</div>
+              <div className="text-blue-700 dark:text-blue-300">
+                / {audit?.responses_expected || 0} Responses
+              </div>
             </div>
-            <div className="bg-green-50 dark:bg-green-900/20 rounded-xl p-3">
-              <div className="text-2xl font-bold text-green-600 dark:text-green-400">
-                {getSuccessfulCount()}
+            <div className="bg-purple-50 dark:bg-purple-900/20 rounded-xl p-3">
+              <div className="text-2xl font-bold text-purple-600 dark:text-purple-400">
+                {audit?.competitors_processed || 0}
               </div>
-              <div className="text-green-700 dark:text-green-300">Successful</div>
+              <div className="text-purple-700 dark:text-purple-300">
+                / {audit?.competitors_total || 0} Competitors
+              </div>
             </div>
-            <div className="bg-red-50 dark:bg-red-900/20 rounded-xl p-3">
-              <div className="text-2xl font-bold text-red-600 dark:text-red-400">
-                {getFailedCount()}
+            <div className="bg-amber-50 dark:bg-amber-900/20 rounded-xl p-3">
+              <div className="text-2xl font-bold text-amber-600 dark:text-amber-400">
+                {audit?.sentiment_processed || 0}
               </div>
-              <div className="text-red-700 dark:text-red-300">Failed</div>
+              <div className="text-amber-700 dark:text-amber-300">
+                / {audit?.sentiment_total || 0} Sentiment
+              </div>
             </div>
           </div>
         </div>
@@ -366,176 +226,78 @@ export const AuditProgressModal: React.FC<AuditProgressModalProps> = ({
           <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100">
             Process Steps
           </h3>
-          
+
           <div className="space-y-3">
             {Object.entries(stepLabels).map(([stepKey, label]) => {
-              const status = getStepStatus(stepKey);
-              const Icon = stepIcons[status];
-              
-              // Special handling for sentiment step
-              if (stepKey === 'sentiment' && audit?.sentiment) {
-                const sentimentProgress = getSentimentProgress();
-                return (
-                  <div key={stepKey} className="bg-gray-50 dark:bg-gray-800 rounded-xl p-4">
-                    <div className="flex items-center justify-between mb-2">
-                      <div className="flex items-center space-x-3">
-                        <Icon 
-                          className={`
-                            w-5 h-5
-                            ${status === 'done' ? 'text-green-500' : ''}
-                            ${status === 'running' ? 'text-blue-500 animate-spin' : ''}
-                            ${status === 'error' ? 'text-red-500' : ''}
-                            ${status === 'pending' ? 'text-gray-400' : ''}
-                          `}
-                        />
-                        <span className="font-medium text-gray-900 dark:text-gray-100">{label}</span>
-                      </div>
-                      {sentimentProgress && (
-                        <span className="text-sm text-gray-600 dark:text-gray-400">
-                          {sentimentProgress.analyzed}/{sentimentProgress.total} responses
-                        </span>
-                      )}
-                    </div>
-                    {sentimentProgress && sentimentProgress.total > 0 && (
-                      <div className="space-y-2">
-                        <Progress value={sentimentProgress.percentage} />
-                        <div className="text-xs text-gray-500 dark:text-gray-400">
-                          {sentimentProgress.percentage}% of responses analyzed for brand sentiment
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                );
-              }
-              
+              const status = getStepStatus(stepKey) as keyof typeof stepIcons;
+              const Icon = stepIcons[status] || Clock;
+              const detail = getStepDetail(stepKey);
+
               return (
-                <div key={stepKey} className="flex items-center space-x-3 p-3 bg-gray-50 dark:bg-gray-800 rounded-xl">
-                  <Icon 
-                    className={`
-                      w-5 h-5
-                      ${status === 'done' ? 'text-green-500' : ''}
-                      ${status === 'running' ? 'text-blue-500 animate-spin' : ''}
-                      ${status === 'error' ? 'text-red-500' : ''}
-                      ${status === 'pending' ? 'text-gray-400' : ''}
-                    `}
-                  />
-                  <span className="font-medium text-gray-900 dark:text-gray-100">{label}</span>
+                <div key={stepKey} className="flex items-center justify-between p-3 bg-gray-50 dark:bg-gray-800 rounded-xl">
+                  <div className="flex items-center space-x-3">
+                    <Icon
+                      className={`w-5 h-5 ${
+                        status === 'done' ? 'text-green-500' :
+                        status === 'running' ? 'text-blue-500 animate-spin' :
+                        status === 'error' ? 'text-red-500' : 'text-gray-400'
+                      }`}
+                    />
+                    <span className="font-medium text-gray-900 dark:text-gray-100">{label}</span>
+                  </div>
+                  {detail && (
+                    <span className="text-sm text-gray-500 dark:text-gray-400">{detail}</span>
+                  )}
                 </div>
               );
             })}
           </div>
         </div>
-        {/* LLM Responses Progress */}
-        <div className="space-y-4">
-          <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100">
-            LLM Responses ({getCompletedCount()}/{llmResponses.length})
-          </h3>
-          
-          <div className="space-y-3 max-h-96 overflow-y-auto">
-            {llmResponses.map((response, index) => {
-              const status = getResponseStatus(response);
-              return (
-                <motion.div
-                  key={response.id}
-                  initial={{ opacity: 0, x: -20 }}
-                  animate={{ opacity: 1, x: 0 }}
-                  transition={{ delay: index * 0.05 }}
-                  className={`
-                    flex items-center p-4 rounded-2xl border transition-all duration-200
-                    ${status === 'completed' 
-                      ? 'bg-green-50 dark:bg-green-900/20 border-green-200 dark:border-green-700' 
-                      : status === 'failed'
-                      ? 'bg-red-50 dark:bg-red-900/20 border-red-200 dark:border-red-700'
-                      : status === 'processing'
-                      ? 'bg-blue-50 dark:bg-blue-900/20 border-blue-200 dark:border-blue-700'
-                      : 'bg-gray-50 dark:bg-gray-800 border-gray-200 dark:border-gray-700'
-                    }
-                  `}
-                >
-                  <div className="flex items-center space-x-3 flex-1">
-                    <img 
-                      src={LLM_ICONS[response.llm as keyof typeof LLM_ICONS]} 
-                      alt={`${response.llm} icon`}
-                      className="w-6 h-6 object-contain"
-                    />
-                    <div className="flex-1">
-                      <div className="font-medium text-gray-900 dark:text-gray-100 capitalize">
-                        {response.llm}
-                      </div>
-                      <div className="text-sm text-gray-600 dark:text-gray-400 truncate">
-                        {response.prompts?.prompt_text || 'Unknown prompt'}
-                      </div>
-                      {response.prompts?.prompt_group && response.prompts.prompt_group !== 'General' && (
-                        <div className="text-xs text-gray-500 dark:text-gray-500">
-                          Group: {response.prompts.prompt_group}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                  
-                  <div className="flex items-center space-x-2">
-                    {status === 'completed' && (
-                      <CheckCircle className="w-5 h-5 text-green-500" />
-                    )}
-                    {status === 'failed' && (
-                      <AlertCircle className="w-5 h-5 text-red-500" />
-                    )}
-                    {status === 'processing' && (
-                      <Loader2 className="w-5 h-5 text-blue-500 animate-spin" />
-                    )}
-                    {status === 'pending' && (
-                      <Clock className="w-5 h-5 text-gray-400" />
-                    )}
-                  </div>
-                </motion.div>
-              );
-            })}
-          </div>
-        </div>
 
-        {/* Citations Summary */}
-        {citations.length > 0 && (
-          <div className="bg-gray-50 dark:bg-gray-800 rounded-2xl p-4">
-            <h4 className="font-medium text-gray-900 dark:text-gray-100 mb-2">
-              Citations Found
-            </h4>
-            <div className="text-2xl font-bold text-brand-primary">
-              {citations.length}
-            </div>
-            <div className="text-sm text-gray-600 dark:text-gray-400">
-              Total citations extracted from responses
+        {/* Per-LLM icons */}
+        {audit?.llms?.length > 0 && (
+          <div className="space-y-2">
+            <h3 className="text-sm font-semibold text-gray-700 dark:text-gray-300">LLMs</h3>
+            <div className="flex gap-3">
+              {audit.llms.map((llm: string) => (
+                <div key={llm} className="flex items-center space-x-2 bg-gray-50 dark:bg-gray-800 rounded-lg px-3 py-2">
+                  <img src={LLM_ICONS[llm]} alt={llm}
+                    className="w-5 h-5 object-contain rounded" />
+                  <span className="text-sm text-gray-700 dark:text-gray-300 capitalize">{llm}</span>
+                </div>
+              ))}
             </div>
           </div>
         )}
 
         {/* Completion Message */}
-        {isAuditCompleted() && (
-          <motion.div
-            initial={{ opacity: 0, scale: 0.95 }}
-            animate={{ opacity: 1, scale: 1 }}
-            className="text-center p-6 bg-green-50 dark:bg-green-900/20 rounded-2xl border border-green-200 dark:border-green-700"
-          >
+        {isCompleted && audit?.status === 'completed' && (
+          <div className="text-center p-6 bg-green-50 dark:bg-green-900/20 rounded-2xl border border-green-200 dark:border-green-700">
             <CheckCircle className="w-12 h-12 text-green-500 mx-auto mb-3" />
             <h3 className="text-xl font-bold text-green-700 dark:text-green-400 mb-2">
               Audit Completed Successfully!
             </h3>
             <p className="text-green-600 dark:text-green-300">
-              {getSuccessfulCount()} successful responses, {getFailedCount()} failed responses
+              {audit.responses_received || 0} responses processed
             </p>
-            {citations.length > 0 && (
-              <p className="text-green-600 dark:text-green-300 mt-1">
-                {citations.length} citations extracted
-              </p>
-            )}
-          </motion.div>
+          </div>
+        )}
+
+        {isCompleted && audit?.status === 'failed' && (
+          <div className="text-center p-6 bg-red-50 dark:bg-red-900/20 rounded-2xl border border-red-200 dark:border-red-700">
+            <AlertCircle className="w-12 h-12 text-red-500 mx-auto mb-3" />
+            <h3 className="text-xl font-bold text-red-700 dark:text-red-400 mb-2">
+              Audit Failed
+            </h3>
+          </div>
         )}
 
         {/* Actions */}
         <div className="flex justify-end space-x-3 pt-4 border-t border-gray-200 dark:border-gray-700">
           <Button variant="secondary" onClick={onClose}>
-            {isAuditCompleted() ? 'Close' : 'Close & Run in Background'}
+            {isCompleted ? 'Close' : 'Close & Run in Background'}
           </Button>
-          {isAuditCompleted() && (
+          {isCompleted && audit?.status === 'completed' && (
             <Button variant="gradient" onClick={onClose}>
               View Results
             </Button>
