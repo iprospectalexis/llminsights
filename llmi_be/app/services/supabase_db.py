@@ -8,7 +8,7 @@ Supabase tables (audits, llm_responses, citations, etc.).
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from sqlalchemy import text
@@ -222,7 +222,14 @@ class SupabaseDB:
         limit: int = 200,
     ) -> list[dict]:
         """Rows that need polling: no data yet AND not terminal AND not polled
-        too recently. Used by the pipeline polling handler."""
+        too recently. Used by the pipeline polling handler.
+
+        The cutoff is computed in Python and passed as a real `timestamptz`
+        bind — `make_interval(secs => :n)` was the only untested SQL idiom
+        left in this helper after the post-mortem of the
+        `CAST(:ids AS uuid[])` crash, so we just remove the risk entirely.
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=min_interval_seconds)
         async with AsyncSessionLocal() as s:
             rows = (await s.execute(
                 text("""
@@ -232,17 +239,24 @@ class SupabaseDB:
                       AND answer_text IS NULL
                       AND raw_response_data IS NULL
                       AND poll_terminal_reason IS NULL
-                      AND (last_polled_at IS NULL
-                           OR last_polled_at < now() - make_interval(secs => :min_interval))
+                      AND (last_polled_at IS NULL OR last_polled_at < :cutoff)
                     ORDER BY first_polled_at NULLS FIRST, id
                     LIMIT :lim
                 """),
-                {"audit_id": audit_id, "min_interval": min_interval_seconds, "lim": limit},
+                {"audit_id": audit_id, "cutoff": cutoff, "lim": limit},
             )).mappings().all()
             return [dict(r) for r in rows]
 
     async def mark_polling_attempt(self, row_ids: list[str]) -> None:
-        """Increment poll_attempts and stamp first/last_polled_at."""
+        """Increment poll_attempts and stamp first/last_polled_at.
+
+        NB: uses `ANY(:ids)` (no CAST). asyncpg+SQLAlchemy `text()` cannot
+        bind a Python list inside `CAST(:ids AS uuid[])` — that idiom was
+        the root cause of the polling-stuck incident on 2026-04-08, where
+        every tick crashed silently inside `mark_polling_terminal` and the
+        audit sat in `polling` for 40 minutes. The proven pattern is plain
+        `ANY(:ids)`, which is what `get_prompt_texts` already uses.
+        """
         if not row_ids:
             return
         async with AsyncSessionLocal() as s:
@@ -252,7 +266,7 @@ class SupabaseDB:
                     SET poll_attempts   = poll_attempts + 1,
                         first_polled_at = COALESCE(first_polled_at, now()),
                         last_polled_at  = now()
-                    WHERE id = ANY(CAST(:ids AS uuid[]))
+                    WHERE id = ANY(:ids)
                 """),
                 {"ids": list(row_ids)},
             )
@@ -264,6 +278,8 @@ class SupabaseDB:
         Also writes a minimal sentinel into raw_response_data so the row
         leaves the legacy `pending` set (answer_text NULL + raw_response_data
         NULL) used by older callers.
+
+        See `mark_polling_attempt` for the `ANY(:ids)` rationale.
         """
         if not row_ids:
             return 0
@@ -280,7 +296,7 @@ class SupabaseDB:
                             'failed_at', now()
                           )
                         )
-                    WHERE id = ANY(CAST(:ids AS uuid[]))
+                    WHERE id = ANY(:ids)
                     RETURNING id
                 """),
                 {"reason": reason, "ids": list(row_ids)},
@@ -319,6 +335,42 @@ class SupabaseDB:
                 "total": 0, "received": 0, "active_pending": 0,
                 "terminal": 0, "max_attempts": 0,
             }
+
+    async def insert_pipeline_log(
+        self,
+        audit_id: str,
+        state: str,
+        phase: str,
+        message: str,
+        level: str = "error",
+    ) -> None:
+        """Append one row to `audit_pipeline_log` — insert-only crash journal.
+
+        Catches its own exceptions: this is the LAST line of defense in the
+        observability chain, so it must never raise back into the caller's
+        except block (which would mask the original error). If even this
+        insert fails we log a warning and move on — the original exception
+        in `handle_polling` / `process_step` is still propagated upstream.
+        """
+        try:
+            async with AsyncSessionLocal() as s:
+                await s.execute(
+                    text("""
+                        INSERT INTO audit_pipeline_log
+                            (audit_id, state, phase, level, message)
+                        VALUES (:aid, :state, :phase, :level, :message)
+                    """),
+                    {
+                        "aid": audit_id,
+                        "state": state,
+                        "phase": phase,
+                        "level": level,
+                        "message": (message or "")[:1000],
+                    },
+                )
+                await s.commit()
+        except Exception as e:
+            logger.error(f"[pipeline_log] insert failed for {audit_id}: {e}")
 
     async def upsert_llm_responses(self, updates: list[dict]) -> None:
         """Batch upsert llm_responses by id."""

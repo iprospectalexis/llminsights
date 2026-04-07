@@ -38,6 +38,28 @@ async def lifespan(app: FastAPI):
     # Start audit scheduler if connected to PostgreSQL (Supabase)
     scheduler_task = None
     if settings.is_postgres:
+        # Self-test of polling SQL helpers BEFORE the scheduler starts.
+        # If any of these crash on the driver level (e.g. the
+        # `CAST(:ids AS uuid[])` bug from 2026-04-08, where every tick
+        # silently failed inside `mark_polling_terminal` and stuck a live
+        # audit for 40 minutes), we want to know on the first deploy line
+        # in the container log — not after a customer reports a stuck
+        # modal. The dummy UUID matches no rows so the calls are no-ops
+        # in terms of side effects.
+        from app.services.supabase_db import db
+        DUMMY = "00000000-0000-0000-0000-000000000000"
+        try:
+            await db.get_polling_status(DUMMY)
+            await db.get_active_pending_responses(DUMMY, min_interval_seconds=0, limit=1)
+            await db.mark_polling_attempt([])
+            await db.mark_polling_terminal([], "smoke")
+            logger.info("[startup] polling helpers self-test OK")
+        except Exception as e:
+            logger.error(
+                f"[startup] polling helpers self-test FAILED: {e}",
+                exc_info=True,
+            )
+
         scheduler_task = asyncio.create_task(start_scheduler())
         logger.info("Audit scheduler started (Supabase PostgreSQL detected)")
     else:

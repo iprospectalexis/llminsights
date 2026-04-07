@@ -237,290 +237,344 @@ async def handle_polling(audit_id: str, worker_id: str) -> None:
         fetch_onesearch_results, _fetch_brightdata_result, collect_citations
     )
 
-    await _heartbeat(audit_id)
+    # `phase` tracks where in the handler we currently are. On any uncaught
+    # exception the outer except block uses it to write a precise crash
+    # record to logs + `audits.error_message` + `audit_pipeline_log`. This
+    # is the *only* line of defense between a SQL helper crash and a
+    # silently-stuck audit (see incident: 2026-04-08, mark_polling_terminal
+    # crashing on `CAST(:ids AS uuid[])` for 40 minutes with no trace).
+    phase = "enter"
+    try:
+        phase = "heartbeat_in"
+        await _heartbeat(audit_id)
 
-    await db.update_audit_step(audit_id, "parse", {
-        "status": "running", "message": "Polling for LLM results..."
-    })
-
-    # ── Source of truth: SQL counts ─────────────────────────────────────
-    status = await db.get_polling_status(audit_id)
-    total          = status["total"]
-    received       = status["received"]
-    active_pending = status["active_pending"]
-    terminal       = status["terminal"]
-    max_attempts   = status["max_attempts"]
-
-    progress_pct = min(round(((received) / total) * 60) if total else 0, 60)
-    await update_progress_counters(
-        audit_id,
-        responses_expected=total,
-        responses_received=received,
-        progress=progress_pct,
-    )
-    logger.info(
-        f"[polling] {audit_id} total={total} received={received} "
-        f"active={active_pending} terminal={terminal} max_attempts={max_attempts}"
-    )
-
-    # ── Branch 1: nothing left to actively poll → single transition ─────
-    if total > 0 and active_pending == 0:
-        msg = (
-            f"{received}/{total} received ({terminal} dropped by provider)"
-            if terminal else f"All {total} responses received"
-        )
-        await db.update_audit_step(audit_id, "parse", {"status": "done", "message": msg})
-        await db.update_audit_step(audit_id, "fetch", {"status": "done"})
-        transitioned = await transition_state(
-            audit_id, "polling", "extracting_competitors", worker_id
-        )
-        if transitioned:
-            logger.info(f"[polling] {audit_id}: polling → extracting_competitors")
-        return
-
-    # ── Branch 2: global safety-net deadline ────────────────────────────
-    audit_row = await db.get_audit(audit_id)
-    anchor = (audit_row or {}).get("started_at") or (audit_row or {}).get("created_at")
-    if isinstance(anchor, str):
+        phase = "step_running"
         try:
-            anchor = datetime.fromisoformat(anchor.replace("Z", "+00:00"))
-        except ValueError:
-            anchor = None
-    if anchor and (datetime.now(timezone.utc) - anchor) > timedelta(minutes=POLLING_MAX_MINUTES):
-        logger.warning(
-            f"[polling] {audit_id}: deadline {POLLING_MAX_MINUTES}m hit, "
-            f"sweeping {active_pending} active rows as polling_timeout"
+            await db.update_audit_step(audit_id, "parse", {
+                "status": "running", "message": "Polling for LLM results..."
+            })
+        except Exception as e:
+            logger.warning(f"[polling] {audit_id} step_running ignored: {e}")
+
+        # ── Source of truth: SQL counts ─────────────────────────────────
+        phase = "get_polling_status"
+        status = await db.get_polling_status(audit_id)
+        total          = status["total"]
+        received       = status["received"]
+        active_pending = status["active_pending"]
+        terminal       = status["terminal"]
+        max_attempts   = status["max_attempts"]
+
+        phase = "update_progress_counters"
+        progress_pct = min(round(((received) / total) * 60) if total else 0, 60)
+        await update_progress_counters(
+            audit_id,
+            responses_expected=total,
+            responses_received=received,
+            progress=progress_pct,
         )
-        all_active = await db.get_active_pending_responses(
-            audit_id, min_interval_seconds=0, limit=10000
+
+        phase = "log_summary"
+        logger.info(
+            f"[polling] {audit_id} total={total} received={received} "
+            f"active={active_pending} terminal={terminal} max_attempts={max_attempts}"
         )
-        if all_active:
-            await db.mark_polling_terminal(
-                [str(r["id"]) for r in all_active], "polling_timeout"
+
+        # ── Branch 1: nothing left to actively poll → single transition ─
+        phase = "branch_active_zero"
+        if total > 0 and active_pending == 0:
+            msg = (
+                f"{received}/{total} received ({terminal} dropped by provider)"
+                if terminal else f"All {total} responses received"
             )
-        try:
-            await db.update_audit(audit_id, {
-                "error_message": (
-                    f"Polling: deadline {POLLING_MAX_MINUTES}m hit, "
-                    f"{len(all_active)} rows swept as polling_timeout"
-                )
-            })
-        except Exception:
-            pass
-        # Next tick will see active_pending == 0 and transition.
-        return
+            await db.update_audit_step(audit_id, "parse", {"status": "done", "message": msg})
+            await db.update_audit_step(audit_id, "fetch", {"status": "done"})
+            phase = "branch_active_zero_transition"
+            transitioned = await transition_state(
+                audit_id, "polling", "extracting_competitors", worker_id
+            )
+            if transitioned:
+                logger.info(f"[polling] {audit_id}: polling → extracting_competitors")
+            return
 
-    # ── Branch 3: fetch a bounded slice of "due" rows ───────────────────
-    due = await db.get_active_pending_responses(
-        audit_id,
-        min_interval_seconds=MIN_POLL_INTERVAL_SECONDS,
-        limit=200,
-    )
-    if not due:
-        # Nothing due yet (everything was polled within the last MIN_POLL_INTERVAL).
-        # Wait for the next tick.
-        return
-
-    # Bump attempts up-front so even fetch failures count toward exhaustion.
-    await db.mark_polling_attempt([str(r["id"]) for r in due])
-
-    # ── Group: orphans / legacy / job_groups ────────────────────────────
-    orphans: list[dict] = []
-    legacy_responses: list[dict] = []
-    job_groups: dict[str, list[dict]] = {}
-    for r in due:
-        has_job = bool(r.get("job_id"))
-        has_snap = bool(r.get("snapshot_id"))
-        if has_snap and not has_job:
-            legacy_responses.append(r)
-        elif has_job:
-            job_groups.setdefault(r["job_id"], []).append(r)
-        else:
-            orphans.append(r)
-
-    if orphans:
-        logger.warning(
-            f"[polling] {audit_id}: {len(orphans)} orphan rows "
-            "(no job_id and no snapshot_id) — marking orphan_no_job_id"
-        )
-        await db.mark_polling_terminal(
-            [str(r["id"]) for r in orphans], "orphan_no_job_id"
-        )
-        try:
-            await db.update_audit(audit_id, {
-                "error_message": f"Polling: {len(orphans)} orphan rows marked orphan_no_job_id"
-            })
-        except Exception:
-            pass
-
-    results: list[dict] = []
-    error_terminal_ids: list[str] = []   # provider_error
-    dropped_terminal_ids: list[str] = [] # provider_dropped
-
-    # Process legacy BrightData responses
-    if legacy_responses:
-        brightdata_api_key = settings.brightdata_api_key
-        for resp in legacy_responses:
+        # ── Branch 2: global safety-net deadline ────────────────────────
+        phase = "deadline_check"
+        audit_row = await db.get_audit(audit_id)
+        anchor = (audit_row or {}).get("started_at") or (audit_row or {}).get("created_at")
+        if isinstance(anchor, str):
             try:
-                result = await _fetch_brightdata_result(
-                    resp["llm"], resp["snapshot_id"], brightdata_api_key
+                anchor = datetime.fromisoformat(anchor.replace("Z", "+00:00"))
+            except ValueError:
+                anchor = None
+        if anchor and (datetime.now(timezone.utc) - anchor) > timedelta(minutes=POLLING_MAX_MINUTES):
+            logger.warning(
+                f"[polling] {audit_id}: deadline {POLLING_MAX_MINUTES}m hit, "
+                f"sweeping {active_pending} active rows as polling_timeout"
+            )
+            phase = "deadline_fetch_active"
+            all_active = await db.get_active_pending_responses(
+                audit_id, min_interval_seconds=0, limit=10000
+            )
+            phase = "deadline_mark_terminal"
+            if all_active:
+                await db.mark_polling_terminal(
+                    [str(r["id"]) for r in all_active], "polling_timeout"
                 )
-                if result:
-                    is_google = resp["llm"] in ("google-ai-overview", "google-ai-mode")
-                    answer_text = result.get("aio_text") if is_google else result.get("answer_text")
-                    answer_md = result.get("aio_text") if is_google else result.get("answer_text_markdown")
-                    cleaned = {k: v for k, v in result.items()
-                               if k not in ("answer_html", "response_raw", "source_html", "page_html")}
-                    results.append({
-                        "success": True, "response": resp, "result": result,
-                        "update": {
-                            "id": str(resp["id"]),
-                            "response_url": result.get("url"),
-                            "answer_text": answer_text,
-                            "answer_text_markdown": answer_md,
-                            "response_timestamp": result.get("timestamp"),
-                            "raw_response_data": cleaned,
-                            "web_search_query": result.get("web_search_query"),
-                        },
-                    })
-                else:
-                    # not_ready: do NOT write any update — attempts++ already counted.
-                    results.append({"success": False, "response": resp, "reason": "not_ready"})
-            except Exception as e:
-                logger.error(f"[polling] BrightData fetch error for {resp['llm']}: {e}")
-                error_terminal_ids.append(str(resp["id"]))
-
-    # Process OneSearch job-based responses
-    if job_groups:
-        all_prompt_ids = [
-            str(r["prompt_id"])
-            for responses in job_groups.values()
-            for r in responses
-            if r.get("prompt_id")
-        ]
-        prompts_map = await db.get_prompt_texts(all_prompt_ids)
-
-        for job_id, responses in job_groups.items():
+            phase = "deadline_log"
             try:
-                onesearch_results = await fetch_onesearch_results(job_id)
-                if onesearch_results:
-                    matched_count = 0
-                    for resp in responses:
-                        prompt_text = prompts_map.get(str(resp["prompt_id"]), "")
-                        matched = next(
-                            (r for r in onesearch_results if r.get("prompt") == prompt_text),
-                            None,
-                        )
-                        if matched:
-                            matched_count += 1
-                            results.append({
-                                "success": True, "response": resp, "result": matched,
-                                "update": {
-                                    "id": str(resp["id"]),
-                                    "response_url": matched.get("url"),
-                                    "answer_text": matched.get("answer_text"),
-                                    "answer_text_markdown": matched.get("answer_text_markdown"),
-                                    "response_timestamp": datetime.now(timezone.utc),
-                                    "raw_response_data": matched,
-                                    "web_search_query": matched.get("web_search_query"),
-                                    "citations": json.dumps(matched["citations"]) if matched.get("citations") else None,
-                                    "all_sources": json.dumps(matched["all_sources"]) if matched.get("all_sources") else None,
-                                    "links_attached": json.dumps(matched["links_attached"]) if matched.get("links_attached") else None,
-                                },
-                            })
-                        else:
-                            # Provider returned the snapshot but dropped this prompt → terminal.
-                            dropped_terminal_ids.append(str(resp["id"]))
-                    if matched_count < len(responses):
-                        logger.warning(
-                            f"[polling] {audit_id}: provider drop on job {job_id}: "
-                            f"submitted={len(responses)}, returned={matched_count}, "
-                            f"dropped={len(responses) - matched_count}"
-                        )
-                else:
-                    # not_ready for the whole job
-                    for resp in responses:
+                await db.update_audit(audit_id, {
+                    "error_message": (
+                        f"Polling: deadline {POLLING_MAX_MINUTES}m hit, "
+                        f"{len(all_active)} rows swept as polling_timeout"
+                    )
+                })
+            except Exception:
+                pass
+            # Next tick will see active_pending == 0 and transition.
+            return
+
+        # ── Branch 3: fetch a bounded slice of "due" rows ───────────────
+        phase = "fetch_due_slice"
+        due = await db.get_active_pending_responses(
+            audit_id,
+            min_interval_seconds=MIN_POLL_INTERVAL_SECONDS,
+            limit=200,
+        )
+        if not due:
+            # Nothing due yet (polled within the last MIN_POLL_INTERVAL).
+            return
+
+        # Bump attempts up-front so even fetch failures count toward exhaustion.
+        phase = "mark_polling_attempt"
+        await db.mark_polling_attempt([str(r["id"]) for r in due])
+
+        # ── Group: orphans / legacy / job_groups ────────────────────────
+        phase = "group_rows"
+        orphans: list[dict] = []
+        legacy_responses: list[dict] = []
+        job_groups: dict[str, list[dict]] = {}
+        for r in due:
+            has_job = bool(r.get("job_id"))
+            has_snap = bool(r.get("snapshot_id"))
+            if has_snap and not has_job:
+                legacy_responses.append(r)
+            elif has_job:
+                job_groups.setdefault(r["job_id"], []).append(r)
+            else:
+                orphans.append(r)
+
+        if orphans:
+            phase = "mark_orphans_terminal"
+            logger.warning(
+                f"[polling] {audit_id}: {len(orphans)} orphan rows "
+                "(no job_id and no snapshot_id) — marking orphan_no_job_id"
+            )
+            await db.mark_polling_terminal(
+                [str(r["id"]) for r in orphans], "orphan_no_job_id"
+            )
+            try:
+                await db.update_audit(audit_id, {
+                    "error_message": f"Polling: {len(orphans)} orphan rows marked orphan_no_job_id"
+                })
+            except Exception:
+                pass
+
+        results: list[dict] = []
+        error_terminal_ids: list[str] = []   # provider_error
+        dropped_terminal_ids: list[str] = [] # provider_dropped
+
+        # Process legacy BrightData responses
+        if legacy_responses:
+            phase = "fetch_brightdata"
+            brightdata_api_key = settings.brightdata_api_key
+            for resp in legacy_responses:
+                try:
+                    result = await _fetch_brightdata_result(
+                        resp["llm"], resp["snapshot_id"], brightdata_api_key
+                    )
+                    if result:
+                        is_google = resp["llm"] in ("google-ai-overview", "google-ai-mode")
+                        answer_text = result.get("aio_text") if is_google else result.get("answer_text")
+                        answer_md = result.get("aio_text") if is_google else result.get("answer_text_markdown")
+                        cleaned = {k: v for k, v in result.items()
+                                   if k not in ("answer_html", "response_raw", "source_html", "page_html")}
+                        results.append({
+                            "success": True, "response": resp, "result": result,
+                            "update": {
+                                "id": str(resp["id"]),
+                                "response_url": result.get("url"),
+                                "answer_text": answer_text,
+                                "answer_text_markdown": answer_md,
+                                "response_timestamp": result.get("timestamp"),
+                                "raw_response_data": cleaned,
+                                "web_search_query": result.get("web_search_query"),
+                            },
+                        })
+                    else:
+                        # not_ready: do NOT write any update — attempts++ already counted.
                         results.append({"success": False, "response": resp, "reason": "not_ready"})
-            except Exception as e:
-                logger.error(f"[polling] OneSearch error for job {job_id}: {e}")
-                for resp in responses:
+                except Exception as e:
+                    logger.error(f"[polling] BrightData fetch error for {resp['llm']}: {e}")
                     error_terminal_ids.append(str(resp["id"]))
 
-    # ── Persist: success updates first, then terminals ──────────────────
-    updates = [r["update"] for r in results if r.get("update")]
-    if updates:
-        await db.upsert_llm_responses(updates)
+        # Process OneSearch job-based responses
+        if job_groups:
+            phase = "fetch_onesearch"
+            all_prompt_ids = [
+                str(r["prompt_id"])
+                for responses in job_groups.values()
+                for r in responses
+                if r.get("prompt_id")
+            ]
+            prompts_map = await db.get_prompt_texts(all_prompt_ids)
 
-    # Citations for the freshly successful rows
-    successful = [r for r in results if r.get("success") and r.get("result")]
-    if successful:
-        all_citations = []
-        delete_keys = []
-        for r in successful:
-            resp = r["response"]
-            delete_keys.append({
-                "audit_id": str(resp["audit_id"]),
-                "prompt_id": str(resp["prompt_id"]),
-                "llm": resp["llm"],
-            })
-            all_citations.extend(collect_citations(r["result"], resp))
-        await db.delete_citations_batch(delete_keys)
-        if all_citations:
-            await db.insert_citations_batch(all_citations)
+            for job_id, responses in job_groups.items():
+                try:
+                    onesearch_results = await fetch_onesearch_results(job_id)
+                    if onesearch_results:
+                        matched_count = 0
+                        for resp in responses:
+                            prompt_text = prompts_map.get(str(resp["prompt_id"]), "")
+                            matched = next(
+                                (r for r in onesearch_results if r.get("prompt") == prompt_text),
+                                None,
+                            )
+                            if matched:
+                                matched_count += 1
+                                results.append({
+                                    "success": True, "response": resp, "result": matched,
+                                    "update": {
+                                        "id": str(resp["id"]),
+                                        "response_url": matched.get("url"),
+                                        "answer_text": matched.get("answer_text"),
+                                        "answer_text_markdown": matched.get("answer_text_markdown"),
+                                        "response_timestamp": datetime.now(timezone.utc),
+                                        "raw_response_data": matched,
+                                        "web_search_query": matched.get("web_search_query"),
+                                        "citations": json.dumps(matched["citations"]) if matched.get("citations") else None,
+                                        "all_sources": json.dumps(matched["all_sources"]) if matched.get("all_sources") else None,
+                                        "links_attached": json.dumps(matched["links_attached"]) if matched.get("links_attached") else None,
+                                    },
+                                })
+                            else:
+                                # Provider returned the snapshot but dropped this prompt → terminal.
+                                dropped_terminal_ids.append(str(resp["id"]))
+                        if matched_count < len(responses):
+                            logger.warning(
+                                f"[polling] {audit_id}: provider drop on job {job_id}: "
+                                f"submitted={len(responses)}, returned={matched_count}, "
+                                f"dropped={len(responses) - matched_count}"
+                            )
+                    else:
+                        # not_ready for the whole job
+                        for resp in responses:
+                            results.append({"success": False, "response": resp, "reason": "not_ready"})
+                except Exception as e:
+                    logger.error(f"[polling] OneSearch error for job {job_id}: {e}")
+                    for resp in responses:
+                        error_terminal_ids.append(str(resp["id"]))
 
-    if dropped_terminal_ids:
-        await db.mark_polling_terminal(dropped_terminal_ids, "provider_dropped")
-    if error_terminal_ids:
-        await db.mark_polling_terminal(error_terminal_ids, "provider_error")
+        # ── Persist: success updates first, then terminals ──────────────
+        phase = "persist_updates"
+        updates = [r["update"] for r in results if r.get("update")]
+        if updates:
+            await db.upsert_llm_responses(updates)
 
-    # ── Per-row exhaustion sweep ────────────────────────────────────────
-    # After bumping attempts above, any row whose `poll_attempts` has now
-    # reached the cap and is *still* active-pending must be marked terminal,
-    # otherwise it will block the audit indefinitely.
-    exhausted_ids: list[str] = []
-    successful_ids = {u["id"] for u in updates}
-    handled_terminal = set(dropped_terminal_ids) | set(error_terminal_ids)
-    for r in due:
-        rid = str(r["id"])
-        if rid in successful_ids or rid in handled_terminal:
-            continue
-        # `poll_attempts` was the value BEFORE we bumped — so compare against cap-1.
-        prev_attempts = int(r.get("poll_attempts") or 0)
-        if prev_attempts + 1 >= MAX_POLL_ATTEMPTS_PER_ROW:
-            exhausted_ids.append(rid)
-    if exhausted_ids:
-        logger.warning(
-            f"[polling] {audit_id}: {len(exhausted_ids)} rows exhausted "
-            f"after {MAX_POLL_ATTEMPTS_PER_ROW} attempts → provider_no_response"
+        # Citations for the freshly successful rows
+        phase = "persist_citations"
+        successful = [r for r in results if r.get("success") and r.get("result")]
+        if successful:
+            all_citations = []
+            delete_keys = []
+            for r in successful:
+                resp = r["response"]
+                delete_keys.append({
+                    "audit_id": str(resp["audit_id"]),
+                    "prompt_id": str(resp["prompt_id"]),
+                    "llm": resp["llm"],
+                })
+                all_citations.extend(collect_citations(r["result"], resp))
+            await db.delete_citations_batch(delete_keys)
+            if all_citations:
+                await db.insert_citations_batch(all_citations)
+
+        phase = "mark_dropped"
+        if dropped_terminal_ids:
+            await db.mark_polling_terminal(dropped_terminal_ids, "provider_dropped")
+        phase = "mark_errors"
+        if error_terminal_ids:
+            await db.mark_polling_terminal(error_terminal_ids, "provider_error")
+
+        # ── Per-row exhaustion sweep ────────────────────────────────────
+        phase = "exhaustion_sweep"
+        exhausted_ids: list[str] = []
+        successful_ids = {u["id"] for u in updates}
+        handled_terminal = set(dropped_terminal_ids) | set(error_terminal_ids)
+        for r in due:
+            rid = str(r["id"])
+            if rid in successful_ids or rid in handled_terminal:
+                continue
+            # `poll_attempts` was the value BEFORE we bumped — compare against cap-1.
+            prev_attempts = int(r.get("poll_attempts") or 0)
+            if prev_attempts + 1 >= MAX_POLL_ATTEMPTS_PER_ROW:
+                exhausted_ids.append(rid)
+        if exhausted_ids:
+            logger.warning(
+                f"[polling] {audit_id}: {len(exhausted_ids)} rows exhausted "
+                f"after {MAX_POLL_ATTEMPTS_PER_ROW} attempts → provider_no_response"
+            )
+            await db.mark_polling_terminal(exhausted_ids, "provider_no_response")
+            try:
+                await db.update_audit(audit_id, {
+                    "error_message": (
+                        f"Polling: {len(exhausted_ids)} rows marked provider_no_response "
+                        f"(exhausted {MAX_POLL_ATTEMPTS_PER_ROW} attempts)"
+                    )
+                })
+            except Exception:
+                pass
+
+        # Heartbeat at exit so long fetches don't look stale to auto-fail.
+        phase = "heartbeat_out"
+        await _heartbeat(audit_id)
+
+        phase = "exit_log"
+        ok = len(updates) - len(dropped_terminal_ids)  # successes only
+        not_ready = sum(1 for r in results if r.get("reason") == "not_ready")
+        logger.info(
+            f"[polling] {audit_id}: tick done due={len(due)} ok={ok} "
+            f"dropped={len(dropped_terminal_ids)} errors={len(error_terminal_ids)} "
+            f"exhausted={len(exhausted_ids)} not_ready={not_ready} "
+            f"orphans={len(orphans)}"
         )
-        await db.mark_polling_terminal(exhausted_ids, "provider_no_response")
+
+        # Try to refresh metrics (non-fatal)
+        phase = "refresh_metrics"
         try:
-            await db.update_audit(audit_id, {
-                "error_message": (
-                    f"Polling: {len(exhausted_ids)} rows marked provider_no_response "
-                    f"(exhausted {MAX_POLL_ATTEMPTS_PER_ROW} attempts)"
-                )
-            })
+            await db.refresh_audit_metrics(audit_id)
+        except Exception as e:
+            logger.warning(f"[pipeline] Metrics refresh warning: {e}")
+
+    except Exception as e:
+        # Crash record goes to THREE places, none of which can mask the
+        # other: stdout log (container), audits.error_message (modal/api),
+        # audit_pipeline_log (permanent journal queryable for the lifetime
+        # of the audit). The exception is then re-raised so process_step
+        # sees it and the scheduler's lock-release path runs.
+        crash_msg = (
+            f"polling crash @ {phase}: {type(e).__name__}: {str(e)[:300]}"
+        )
+        logger.error(f"[polling] {audit_id} {crash_msg}", exc_info=True)
+        await db.insert_pipeline_log(
+            audit_id, "polling", phase,
+            f"{type(e).__name__}: {e}",
+            level="error",
+        )
+        try:
+            await db.update_audit(audit_id, {"error_message": crash_msg[:500]})
         except Exception:
             pass
-
-    # Heartbeat at exit so long fetches don't look stale to the auto-fail sweep.
-    await _heartbeat(audit_id)
-
-    ok = len(updates) - len(dropped_terminal_ids)  # successes only
-    not_ready = sum(1 for r in results if r.get("reason") == "not_ready")
-    logger.info(
-        f"[polling] {audit_id}: tick done due={len(due)} ok={ok} "
-        f"dropped={len(dropped_terminal_ids)} errors={len(error_terminal_ids)} "
-        f"exhausted={len(exhausted_ids)} not_ready={not_ready} "
-        f"orphans={len(orphans)}"
-    )
-
-    # Try to refresh metrics (non-fatal)
-    try:
-        await db.refresh_audit_metrics(audit_id)
-    except Exception as e:
-        logger.warning(f"[pipeline] Metrics refresh warning: {e}")
+        raise
 
 
 async def _get_audit_run_by(audit_id: str) -> Optional[str]:
@@ -968,7 +1022,11 @@ async def process_step(audit: dict, worker_id: str) -> None:
         )
         # Don't fail the audit — the next tick will retry. The 60-min auto-fail
         # sweep in the scheduler will eventually catch genuinely dead audits.
-        # Best-effort surface the reason on the audit row so ops can see it.
+        await db.insert_pipeline_log(
+            audit_id, state or "unknown", "process_step_timeout",
+            f"Step timed out after {PER_STEP_TIMEOUT_SECONDS}s",
+            level="warning",
+        )
         try:
             await db.update_audit(audit_id, {
                 "error_message": f"Step '{state}' timed out after {PER_STEP_TIMEOUT_SECONDS}s (retrying)"
@@ -977,9 +1035,14 @@ async def process_step(audit: dict, worker_id: str) -> None:
             pass
     except Exception as e:
         logger.error(f"[pipeline] {audit_id} error in {state}: {e}", exc_info=True)
-        # Don't fail immediately — allow retries on next tick.
-        # Best-effort surface the reason on the audit row so ops can see it
-        # without grepping logs across all workers.
+        # Don't fail immediately — allow retries on next tick. Permanent
+        # journal entry first (insert-only, can't mask itself), then a
+        # best-effort `error_message` write for the modal.
+        await db.insert_pipeline_log(
+            audit_id, state or "unknown", "process_step_error",
+            f"{type(e).__name__}: {e}",
+            level="error",
+        )
         try:
             await db.update_audit(audit_id, {
                 "error_message": f"Step '{state}' error: {type(e).__name__}: {str(e)[:200]} (retrying)"
