@@ -4124,14 +4124,47 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
 
                     // Calculate mention rates by prompt group for each brand
                     const promptGroups = [...new Set(prompts.map(p => p.prompt_group))];
-                    let radarData: any[];
 
+                    // Empty state — mirrors the Citation Rate card so the user
+                    // gets a clear "no data" message instead of an unanchored
+                    // chart with no grid (recharts won't render PolarGrid /
+                    // PolarRadiusAxis when there is no <Radar> series).
                     if (brandsToDisplay.length === 0) {
-                      // Show empty radar with all prompt groups
-                      radarData = promptGroups.map(group => ({ group }));
-                    } else {
-                      // Calculate actual mention rates
-                      radarData = promptGroups.map(group => {
+                      return (
+                        <div>
+                          <div className="mb-4">
+                            <label className="flex items-center space-x-2">
+                              <input
+                                type="checkbox"
+                                checked={showCompetitorsInBrandChart}
+                                onChange={(e) => {
+                                  setShowCompetitorsInBrandChart(e.target.checked);
+                                  setSelectedCompetitorBrands([]);
+                                }}
+                                className="w-4 h-4 text-brand-primary border-gray-300 rounded focus:ring-brand-primary"
+                              />
+                              <span className="text-sm font-medium text-gray-700 dark:text-gray-300">
+                                Show Competitors
+                              </span>
+                            </label>
+                          </div>
+                          <div className="flex items-center justify-center h-64 text-gray-500 dark:text-gray-400">
+                            <div className="text-center">
+                              <BarChart3 className="w-12 h-12 mx-auto mb-2 opacity-50" />
+                              <p className="text-sm">No brand mention data available</p>
+                              <p className="text-xs">
+                                {ownBrands.length === 0 && competitorBrands.length > 0
+                                  ? 'Toggle "Show Competitors" to see competitor mentions'
+                                  : 'Run an audit to see mention rates'}
+                              </p>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    }
+
+                    // Calculate actual mention rates
+                    const radarData: any[] = promptGroups.map(group => {
                         // Get all prompts in this group
                         const groupPromptIds = prompts
                           .filter(p => p.prompt_group === group)
@@ -4164,7 +4197,6 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                         );
                         return groupResponses.length > 0;
                       });
-                    }
 
                     // Get all brands for consistent color assignment
                     const allRadarBrands = Array.from(brandMentions.keys());
