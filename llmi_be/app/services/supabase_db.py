@@ -283,16 +283,28 @@ class SupabaseDB:
         """
         if not row_ids:
             return 0
+        # NB: :reason is cast to text explicitly because it appears twice
+        # — once in SET (typed by the column) and once inside
+        # jsonb_build_object('error', :reason, ...). SQLAlchemy collapses
+        # the two occurrences into a single bind ($1), and asyncpg cannot
+        # infer the type because `jsonb_build_object`'s signature is
+        # `(text, "any", ...)` — so $1 has no resolved type and the whole
+        # statement raises `AmbiguousParameterError`. This was the SECOND
+        # bug uncovered by `audit_pipeline_log` on 2026-04-08 (after the
+        # CAST(:ids AS uuid[]) fix landed) and was the actual root cause
+        # of the polling-stuck incident — the first fix was a red herring.
+        # `ANY(:ids)` is left untouched (matches `mark_polling_attempt`
+        # and the proven `get_prompt_texts` pattern).
         async with AsyncSessionLocal() as s:
             result = await s.execute(
                 text("""
                     UPDATE llm_responses
-                    SET poll_terminal_reason = :reason,
+                    SET poll_terminal_reason = CAST(:reason AS text),
                         last_polled_at       = now(),
                         raw_response_data    = COALESCE(
                           raw_response_data,
                           jsonb_build_object(
-                            'error',     :reason,
+                            'error',     CAST(:reason AS text),
                             'failed_at', now()
                           )
                         )
