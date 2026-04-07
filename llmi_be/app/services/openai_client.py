@@ -25,6 +25,7 @@ _semaphore = asyncio.Semaphore(5)
 _client = AsyncOpenAI(api_key=settings.openai_api_key)
 
 MODEL = "gpt-5-mini"
+SENTIMENT_PROMPT_VERSION = "v2-2026-04-07"
 
 
 async def _call_openai(messages: list[dict], max_tokens: int = 2048,
@@ -191,7 +192,155 @@ async def extract_competitors(
     return {"brands": [], "error": "Max retries exceeded"}
 
 
-# ── Sentiment analysis ────────────────────────────────────────────────
+# ── Sentiment analysis V2 (multi-brand structured output) ────────────
+
+SENTIMENT_SCHEMA = {
+    "name": "brand_sentiments",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "brands": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "brand": {"type": "string"},
+                        "label": {
+                            "type": "string",
+                            "enum": ["positive", "neutral", "negative", "mention_only"],
+                        },
+                        "score": {"type": "number", "minimum": -1, "maximum": 1},
+                        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                        "reasoning": {"type": "string"},
+                    },
+                    "required": ["brand", "label", "score", "confidence", "reasoning"],
+                },
+            }
+        },
+        "required": ["brands"],
+    },
+}
+
+
+async def analyze_response_sentiment(
+    prompt_text: str,
+    answer_text: str,
+    brands_to_score: list[str],
+    industry: str = "",
+) -> dict:
+    """
+    Score every brand in `brands_to_score` against a single LLM answer in one call.
+    Uses OpenAI structured outputs (json_schema) so the response is guaranteed valid.
+
+    Returns:
+        {
+            "brands": [
+                {"brand": str, "label": str, "score": float,
+                 "confidence": float, "reasoning": str},
+                ...
+            ],
+            "_fallback": bool   # only set on hard failure
+        }
+    """
+    if not brands_to_score:
+        return {"brands": []}
+
+    industry_line = f"Industry context: {industry}\n" if industry else ""
+    brands_json = json.dumps(brands_to_score, ensure_ascii=False)
+
+    system_msg = (
+        "You are a brand-perception analyst. You read AI-assistant answers to user "
+        "queries and decide, for each brand in a given list, how the answer portrays "
+        "that brand. You always respond with a JSON object matching the provided schema."
+    )
+
+    user_msg = (
+        "For each brand in the 'Brands to score' list, output one entry with:\n"
+        '- label: "positive" (favorable opinion), "negative" (unfavorable opinion / warning), '
+        '"neutral" (balanced or factual opinion), or "mention_only" '
+        "(brand is listed/named but no opinion is attached).\n"
+        "- score: signed float in [-1, 1]. mention_only -> 0; neutral -> 0; "
+        "positive in (0, 1]; negative in [-1, 0). Magnitude reflects strength.\n"
+        "- confidence: float in [0, 1] for how sure you are.\n"
+        "- reasoning: one short sentence quoting the relevant part of the answer.\n\n"
+        "Use the user query to disambiguate framing (e.g. 'worst running shoes' inverts "
+        "the sentiment of a 'top recommendation').\n\n"
+        f"{industry_line}"
+        f"User query:\n{prompt_text}\n\n"
+        f"Answer:\n{answer_text}\n\n"
+        f"Brands to score: {brands_json}"
+    )
+
+    try:
+        raw = await _call_openai(
+            [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            max_tokens=800,
+            response_format={"type": "json_schema", "json_schema": SENTIMENT_SCHEMA},
+        )
+        if not raw:
+            return _sentiment_fallback(brands_to_score, "empty_response")
+
+        parsed = json.loads(raw)
+        # Normalize: ensure every requested brand has an entry; clamp scores
+        by_brand = {b["brand"]: b for b in parsed.get("brands", []) if isinstance(b, dict)}
+        out = []
+        for brand in brands_to_score:
+            entry = by_brand.get(brand)
+            if not entry:
+                out.append({
+                    "brand": brand, "label": "mention_only", "score": 0.0,
+                    "confidence": 0.0, "reasoning": "Model did not return an entry for this brand.",
+                })
+                continue
+            label = entry.get("label", "mention_only")
+            if label not in ("positive", "neutral", "negative", "mention_only"):
+                label = "mention_only"
+            try:
+                score = float(entry.get("score", 0.0))
+            except (TypeError, ValueError):
+                score = 0.0
+            score = max(-1.0, min(1.0, score))
+            try:
+                confidence = float(entry.get("confidence", 0.0))
+            except (TypeError, ValueError):
+                confidence = 0.0
+            confidence = max(0.0, min(1.0, confidence))
+            out.append({
+                "brand": brand,
+                "label": label,
+                "score": score,
+                "confidence": confidence,
+                "reasoning": str(entry.get("reasoning", ""))[:500],
+            })
+        return {"brands": out}
+
+    except Exception as e:
+        logger.error(f"analyze_response_sentiment failed: {e}")
+        return _sentiment_fallback(brands_to_score, str(e))
+
+
+def _sentiment_fallback(brands: list[str], error: str) -> dict:
+    """Build a fallback result when the LLM call fails outright."""
+    return {
+        "brands": [
+            {
+                "brand": b, "label": "mention_only", "score": 0.0,
+                "confidence": 0.0, "reasoning": f"Fallback (error: {error[:80]})",
+            }
+            for b in brands
+        ],
+        "_fallback": True,
+        "_error": error,
+    }
+
+
+# ── Legacy sentiment analysis (kept temporarily for backwards compat) ─
 
 async def analyze_sentiment(brand: str, answer_text: str) -> dict:
     """

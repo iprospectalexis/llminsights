@@ -1,0 +1,119 @@
+# Sentiment V2 evaluation set.
+#
+# Each example tests one brand (or many) in one answer. The eval harness
+# (scripts/sentiment_eval.py) feeds (prompt, answer, brands) into
+# openai_client.analyze_response_sentiment and compares against expected.
+#
+# Fields:
+#   prompt:    the user query that triggered the LLM answer (provides framing)
+#   answer:    the LLM answer text being analyzed
+#   brands:    list of brand names to score
+#   expected:  map of brand -> expected label
+#
+# Coverage targets:
+#   - positive / negative / neutral / mention_only
+#   - multi-brand single answer (W1 regression test)
+#   - inverted-framing query ("worst ...") (W6 regression test)
+#   - mention-only without opinion (W8 regression test)
+#   - alias / accented forms (covered separately by brand_matcher tests)
+#   - own-brand vs competitor (handled at pipeline level, not eval)
+
+examples:
+
+  # ── Positive ────────────────────────────────────────────────────────
+  - prompt: "What are the best trail running shoes?"
+    answer: "Salomon Speedcross is widely regarded as the best trail shoe for technical terrain — exceptional grip and durability."
+    brands: ["Salomon"]
+    expected: { Salomon: positive }
+
+  - prompt: "Recommend a reliable electric car for families"
+    answer: "The Tesla Model Y is an excellent choice — long range, spacious interior, and a top safety rating."
+    brands: ["Tesla"]
+    expected: { Tesla: positive }
+
+  - prompt: "Best smartphone for photography"
+    answer: "The iPhone 15 Pro stands out with its advanced camera system and computational photography features."
+    brands: ["Apple"]
+    expected: { Apple: positive }
+
+  # ── Negative ────────────────────────────────────────────────────────
+  - prompt: "Are Hoka shoes durable?"
+    answer: "Several reviewers report that Hoka midsoles compress quickly and lose cushioning after only 300 miles, which is disappointing for the price."
+    brands: ["Hoka"]
+    expected: { Hoka: negative }
+
+  - prompt: "Is the new Volkswagen ID.3 reliable?"
+    answer: "The ID.3 has been plagued by software bugs and infotainment glitches that have frustrated many owners."
+    brands: ["Volkswagen"]
+    expected: { Volkswagen: negative }
+
+  - prompt: "What do users say about Peloton?"
+    answer: "Peloton has lost significant market share, suffered recalls, and many customers report poor after-sales service."
+    brands: ["Peloton"]
+    expected: { Peloton: negative }
+
+  # ── Neutral (balanced) ──────────────────────────────────────────────
+  - prompt: "Compare Nike and Adidas running shoes"
+    answer: "Both Nike and Adidas offer solid running shoes; Nike tends toward responsive foam while Adidas focuses on energy return — the choice depends on your stride."
+    brands: ["Nike", "Adidas"]
+    expected: { Nike: neutral, Adidas: neutral }
+
+  - prompt: "Tell me about Toyota's hybrid lineup"
+    answer: "Toyota offers hybrid versions of most models including the Camry, RAV4, and Highlander, with fuel economy ranging from 35 to 52 mpg."
+    brands: ["Toyota"]
+    expected: { Toyota: neutral }
+
+  # ── Mention only (listed without opinion) ───────────────────────────
+  - prompt: "Top trail running shoe brands"
+    answer: "Some popular trail running brands include Salomon, Hoka, Brooks, La Sportiva, and Altra."
+    brands: ["Salomon", "Hoka", "Brooks", "La Sportiva", "Altra"]
+    expected:
+      Salomon: mention_only
+      Hoka: mention_only
+      Brooks: mention_only
+      La Sportiva: mention_only
+      Altra: mention_only
+
+  - prompt: "List the major German car brands"
+    answer: "Major German car manufacturers are Volkswagen, BMW, Mercedes-Benz, Audi, Porsche, and Opel."
+    brands: ["Volkswagen", "BMW", "Mercedes-Benz", "Audi", "Porsche"]
+    expected:
+      Volkswagen: mention_only
+      BMW: mention_only
+      Mercedes-Benz: mention_only
+      Audi: mention_only
+      Porsche: mention_only
+
+  # ── Multi-brand mixed sentiment in one answer (W1 regression) ───────
+  - prompt: "Which trail running brand should I buy?"
+    answer: "Salomon makes excellent technical trail shoes with great grip. Hoka, by contrast, has been criticized for midsoles that flatten too quickly. Nike has limited trail offerings."
+    brands: ["Salomon", "Hoka", "Nike"]
+    expected:
+      Salomon: positive
+      Hoka: negative
+      Nike: neutral
+
+  - prompt: "Compare the top streaming services"
+    answer: "Netflix offers the largest content library and remains the top choice. Disney+ has great family content but a smaller catalog. HBO Max has been criticized for confusing rebrands and bugs."
+    brands: ["Netflix", "Disney+", "HBO Max"]
+    expected:
+      Netflix: positive
+      Disney+: neutral
+      HBO Max: negative
+
+  # ── Inverted framing (W6 regression) ────────────────────────────────
+  - prompt: "What are the WORST running shoes for a marathon?"
+    answer: "The Brand X Heavy Runner is often cited as a poor marathon choice due to its 14oz weight and stiff sole."
+    brands: ["Brand X"]
+    expected: { Brand X: negative }
+
+  - prompt: "Which laptop brands should I AVOID for gaming?"
+    answer: "BrandLite laptops are frequently mentioned as ones to avoid — thermal throttling, mediocre GPUs, and a plastic chassis."
+    brands: ["BrandLite"]
+    expected: { BrandLite: negative }
+
+  # ── Mixed strength (positive but mild) ──────────────────────────────
+  - prompt: "Tell me about Patagonia jackets"
+    answer: "Patagonia jackets are decent and the company has a strong sustainability story, though the prices are high relative to comparable brands."
+    brands: ["Patagonia"]
+    expected: { Patagonia: positive }

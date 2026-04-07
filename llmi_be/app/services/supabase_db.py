@@ -273,7 +273,7 @@ class SupabaseDB:
             await s.commit()
 
     async def get_responses_for_sentiment(self, audit_id: str) -> list[dict]:
-        """Get responses that need sentiment analysis."""
+        """Get responses that need sentiment analysis (legacy, single-row)."""
         async with AsyncSessionLocal() as s:
             rows = (await s.execute(
                 text("""
@@ -295,6 +295,119 @@ class SupabaseDB:
                     text("UPDATE llm_responses SET sentiment_score = :score, sentiment_label = :label WHERE id = :id"),
                     u,
                 )
+            await s.commit()
+
+    # ── Sentiment V2 ──────────────────────────────────────────────────
+
+    async def get_responses_for_sentiment_v2(self, audit_id: str) -> list[dict]:
+        """
+        Get responses that still need V2 sentiment analysis.
+        Idempotent: skips responses that already have any row in
+        response_brand_sentiment for this audit, so a crashed batch
+        resumes cleanly on the next pipeline tick.
+        """
+        async with AsyncSessionLocal() as s:
+            rows = (await s.execute(
+                text("""
+                    SELECT lr.id, lr.audit_id, lr.llm, lr.answer_text, p.prompt_text
+                    FROM llm_responses lr
+                    JOIN prompts p ON lr.prompt_id = p.id
+                    WHERE lr.audit_id = :aid
+                      AND lr.answer_text IS NOT NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM response_brand_sentiment rbs
+                          WHERE rbs.response_id = lr.id
+                      )
+                """),
+                {"aid": audit_id},
+            )).mappings().all()
+            return [dict(r) for r in rows]
+
+    async def upsert_response_brand_sentiment(self, rows: list[dict]) -> None:
+        """Insert per-brand-per-response sentiment rows. ON CONFLICT updates."""
+        if not rows:
+            return
+        async with AsyncSessionLocal() as s:
+            for r in rows:
+                await s.execute(
+                    text("""
+                        INSERT INTO response_brand_sentiment
+                          (response_id, audit_id, brand, brand_kind, label, score,
+                           confidence, reasoning, is_fallback, model, prompt_version)
+                        VALUES
+                          (:response_id, :audit_id, :brand, :brand_kind, :label, :score,
+                           :confidence, :reasoning, :is_fallback, :model, :prompt_version)
+                        ON CONFLICT (response_id, brand) DO UPDATE SET
+                          brand_kind = EXCLUDED.brand_kind,
+                          label = EXCLUDED.label,
+                          score = EXCLUDED.score,
+                          confidence = EXCLUDED.confidence,
+                          reasoning = EXCLUDED.reasoning,
+                          is_fallback = EXCLUDED.is_fallback,
+                          model = EXCLUDED.model,
+                          prompt_version = EXCLUDED.prompt_version
+                    """),
+                    r,
+                )
+            await s.commit()
+
+    async def get_brand_specs(self, audit_id: str) -> tuple[list[dict], list[dict]]:
+        """
+        Return (own_brands, competitor_brands) as lists of dicts:
+            [{"name": str, "aliases": list[str]}, ...]
+        """
+        async with AsyncSessionLocal() as s:
+            row = (await s.execute(
+                text("SELECT project_id FROM audits WHERE id = :aid"),
+                {"aid": audit_id},
+            )).mappings().first()
+            if not row:
+                return [], []
+            pid = row["project_id"]
+            rows = (await s.execute(
+                text("""
+                    SELECT brand_name, is_competitor, COALESCE(aliases, '{}') AS aliases
+                    FROM brands WHERE project_id = :pid
+                """),
+                {"pid": pid},
+            )).mappings().all()
+        own, comp = [], []
+        for r in rows:
+            spec = {"name": r["brand_name"], "aliases": list(r["aliases"] or [])}
+            (comp if r["is_competitor"] else own).append(spec)
+        return own, comp
+
+    async def get_sentiment_cache(self, cache_key: str) -> Optional[dict]:
+        async with AsyncSessionLocal() as s:
+            row = (await s.execute(
+                text("SELECT result FROM sentiment_cache WHERE cache_key = :k"),
+                {"k": cache_key},
+            )).mappings().first()
+            if not row:
+                return None
+            # Bump usage stats (best-effort)
+            await s.execute(
+                text("""
+                    UPDATE sentiment_cache
+                    SET hit_count = hit_count + 1, last_used_at = now()
+                    WHERE cache_key = :k
+                """),
+                {"k": cache_key},
+            )
+            await s.commit()
+            return row["result"] if isinstance(row["result"], dict) else json.loads(row["result"])
+
+    async def put_sentiment_cache(self, cache_key: str, result: dict) -> None:
+        async with AsyncSessionLocal() as s:
+            await s.execute(
+                text("""
+                    INSERT INTO sentiment_cache (cache_key, result)
+                    VALUES (:k, CAST(:r AS jsonb))
+                    ON CONFLICT (cache_key) DO UPDATE SET
+                      result = EXCLUDED.result, last_used_at = now()
+                """),
+                {"k": cache_key, "r": json.dumps(result)},
+            )
             await s.commit()
 
     # ── Citations ─────────────────────────────────────────────────────

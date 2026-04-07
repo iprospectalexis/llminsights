@@ -10,7 +10,8 @@ import { Input } from '../components/ui/Input';
 import { Progress } from '../components/ui/Progress';
 import { supabase } from '../lib/supabase';
 import { queryCache } from '../lib/queryCache';
-import { Calendar, FileText, ChartBar as BarChart3, Globe, Users, Play, ArrowLeft, Brain, Download, Settings as SettingsIcon, PencilLine, X, MessageSquare, Crown, TrendingUp, Lightbulb, Trash2, Info, Settings, CalendarCheck, ArrowUpDown, ArrowUp, ArrowDown, BadgeCheck, MessageCircle, List, ChevronDown } from 'lucide-react';
+import { Calendar, FileText, ChartBar as BarChart3, Globe, Users, Play, ArrowLeft, Brain, Download, Settings as SettingsIcon, PencilLine, X, MessageSquare, Crown, TrendingUp, Lightbulb, Trash2, Info, Settings, CalendarCheck, ArrowUpDown, ArrowUp, ArrowDown, BadgeCheck, MessageCircle, List, ChevronDown, Smile } from 'lucide-react';
+import { SentimentDashboard } from '../components/sentiment/SentimentDashboard';
 import { PieChart, Pie, Cell, ResponsiveContainer, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, LineChart, Line, Legend } from 'recharts';
 import { RadarChart, Radar, PolarGrid, PolarAngleAxis, PolarRadiusAxis } from 'recharts';
 import { AuditProgressToast } from '../components/audit/AuditProgressToast';
@@ -2931,6 +2932,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     { id: 'domains', label: 'Domains', icon: Globe },
     { id: 'mentions', label: 'Mentions', icon: BadgeCheck },
     { id: 'insights', label: 'Insights', icon: Lightbulb },
+    { id: 'sentiment', label: 'Sentiment', icon: Smile },
     { id: 'settings', label: 'Settings', icon: Settings },
   ];
 
@@ -6632,6 +6634,10 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                 </div>
               )}
             </div>
+          )}
+
+          {activeTab === 'sentiment' && id && (
+            <SentimentDashboard projectId={id} />
           )}
 
           {activeTab === 'settings' && (

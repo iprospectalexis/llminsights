@@ -11,6 +11,8 @@ Design principles:
   - Observable: progress counters updated after every batch
 """
 
+import asyncio
+import hashlib
 import json
 import logging
 import uuid
@@ -22,6 +24,7 @@ import httpx
 from app.config import get_settings
 from app.services.supabase_db import db
 from app.services import openai_client
+from app.services.brand_matcher import BrandSpec, detect_brands_in_text
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -359,56 +362,153 @@ async def handle_competitors(audit_id: str, worker_id: str) -> None:
         logger.info(f"[pipeline] {audit_id}: extracting_competitors → analyzing_sentiment")
 
 
+def _sentiment_cache_key(answer_text: str, brands: list[str], model: str, version: str) -> str:
+    """Stable cache key: sha256 of answer_text + sorted brand list + model + prompt version."""
+    payload = json.dumps({
+        "a": answer_text, "b": sorted(brands), "m": model, "v": version,
+    }, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _legacy_summary_label(rows: list[dict]) -> tuple[float, str]:
+    """
+    Derive a legacy single-row summary from a list of per-brand sentiments.
+    Used to keep llm_responses.sentiment_score / sentiment_label populated for
+    backwards-compat dashboards. Picks the most-extreme signal: any negative
+    wins; else any positive; else neutral.
+    """
+    if not rows:
+        return 0.0, "neutral"
+    has_neg = any(r["label"] == "negative" for r in rows)
+    has_pos = any(r["label"] == "positive" for r in rows)
+    if has_neg:
+        avg = sum(r["score"] for r in rows if r["label"] == "negative") / sum(
+            1 for r in rows if r["label"] == "negative"
+        )
+        return avg, "negative"
+    if has_pos:
+        avg = sum(r["score"] for r in rows if r["label"] == "positive") / sum(
+            1 for r in rows if r["label"] == "positive"
+        )
+        return avg, "positive"
+    return 0.0, "neutral"
+
+
 async def handle_sentiment(audit_id: str, worker_id: str) -> None:
-    """Run sentiment analysis with per-batch checkpointing."""
+    """
+    Run sentiment analysis V2 with per-batch checkpointing.
+
+    Per-brand-per-response: detects all known brands (own + competitors) in
+    each answer using word-boundary matching, then asks gpt-5-mini in a single
+    structured-output call to score every detected brand at once.
+    """
     audit = await db.get_audit(audit_id)
     sentiment_enabled = audit.get("sentiment", False)
 
+    async def _skip(reason: str) -> None:
+        await db.update_audit_step(audit_id, "sentiment", {
+            "status": "done", "message": reason,
+        })
+        transitioned = await transition_state(audit_id, "analyzing_sentiment", "finalizing", worker_id)
+        if transitioned:
+            logger.info(f"[pipeline] {audit_id}: analyzing_sentiment → finalizing ({reason})")
+
     if not sentiment_enabled:
-        await db.update_audit_step(audit_id, "sentiment", {
-            "status": "done", "message": "Sentiment analysis disabled"
-        })
-        transitioned = await transition_state(audit_id, "analyzing_sentiment", "finalizing", worker_id)
-        if transitioned:
-            logger.info(f"[pipeline] {audit_id}: analyzing_sentiment → finalizing (disabled)")
+        await _skip("Sentiment analysis disabled")
         return
 
-    brands, project_id, created_by = await db.get_own_brands(audit_id)
-    if not brands:
-        await db.update_audit_step(audit_id, "sentiment", {
-            "status": "done", "message": "No brands for sentiment analysis"
-        })
-        transitioned = await transition_state(audit_id, "analyzing_sentiment", "finalizing", worker_id)
-        if transitioned:
-            logger.info(f"[pipeline] {audit_id}: analyzing_sentiment → finalizing (no brands)")
+    own_specs, comp_specs = await db.get_brand_specs(audit_id)
+    if not own_specs and not comp_specs:
+        await _skip("No brands for sentiment analysis")
         return
 
-    responses = await db.get_responses_for_sentiment(audit_id)
+    own_set = {s["name"] for s in own_specs}
+    all_specs = [BrandSpec(name=s["name"], aliases=s["aliases"]) for s in (own_specs + comp_specs)]
+
+    responses = await db.get_responses_for_sentiment_v2(audit_id)
     if not responses:
-        await db.update_audit_step(audit_id, "sentiment", {
-            "status": "done", "message": "No responses for sentiment analysis"
-        })
-        transitioned = await transition_state(audit_id, "analyzing_sentiment", "finalizing", worker_id)
-        if transitioned:
-            logger.info(f"[pipeline] {audit_id}: analyzing_sentiment → finalizing (0 responses)")
+        await _skip("No responses for sentiment analysis")
         return
+
+    project_name = await db.get_project_name(audit_id) or ""
 
     total = len(responses)
     await db.update_audit_step(audit_id, "sentiment", {
-        "status": "running", "message": f"Analyzing sentiment: 0/{total}"
+        "status": "running", "message": f"Analyzing sentiment: 0/{total}",
     })
     await update_progress_counters(audit_id, sentiment_total=total, sentiment_processed=0, progress=75)
 
-    logger.info(f"[pipeline] {audit_id}: sentiment analysis on {total} responses for brands: {brands}")
+    logger.info(
+        f"[pipeline] {audit_id}: sentiment v2 on {total} responses; "
+        f"own={len(own_specs)} competitors={len(comp_specs)}"
+    )
 
-    # Process in batches of 15, save after each batch (checkpoint)
-    batch_size = 15
+    batch_size = 10
     processed = 0
     for i in range(0, total, batch_size):
-        batch = [dict(r) for r in responses[i:i + batch_size]]
-        batch_updates = await openai_client.analyze_sentiment_batch(batch, brands, batch_size=batch_size)
-        if batch_updates:
-            await db.update_sentiment_batch(batch_updates)
+        batch = responses[i:i + batch_size]
+
+        async def process(resp: dict) -> tuple[list[dict], list[dict]]:
+            """Returns (rbs_rows, legacy_updates) for one response."""
+            answer_text = resp.get("answer_text") or ""
+            detected = detect_brands_in_text(answer_text, all_specs)
+            if not detected:
+                return [], []
+
+            cache_key = _sentiment_cache_key(
+                answer_text, detected, openai_client.MODEL, openai_client.SENTIMENT_PROMPT_VERSION,
+            )
+            cached = await db.get_sentiment_cache(cache_key)
+            if cached and isinstance(cached, dict) and "brands" in cached:
+                result = cached
+            else:
+                result = await openai_client.analyze_response_sentiment(
+                    prompt_text=resp.get("prompt_text") or "",
+                    answer_text=answer_text,
+                    brands_to_score=detected,
+                    industry=project_name,
+                )
+                if not result.get("_fallback"):
+                    await db.put_sentiment_cache(cache_key, result)
+
+            is_fallback = bool(result.get("_fallback"))
+            rbs_rows = []
+            for b in result.get("brands", []):
+                rbs_rows.append({
+                    "response_id": str(resp["id"]),
+                    "audit_id": audit_id,
+                    "brand": b["brand"],
+                    "brand_kind": "own" if b["brand"] in own_set else "competitor",
+                    "label": b["label"],
+                    "score": b["score"],
+                    "confidence": b.get("confidence"),
+                    "reasoning": b.get("reasoning"),
+                    "is_fallback": is_fallback,
+                    "model": openai_client.MODEL,
+                    "prompt_version": openai_client.SENTIMENT_PROMPT_VERSION,
+                })
+
+            # Legacy summary for backwards compat on llm_responses
+            score, label = _legacy_summary_label(rbs_rows)
+            legacy = [{"id": str(resp["id"]), "score": score, "label": label}]
+            return rbs_rows, legacy
+
+        results = await asyncio.gather(*(process(r) for r in batch), return_exceptions=True)
+
+        flat_rbs: list[dict] = []
+        flat_legacy: list[dict] = []
+        for r in results:
+            if isinstance(r, Exception):
+                logger.error(f"[pipeline] sentiment batch item failed: {r}")
+                continue
+            rbs, legacy = r
+            flat_rbs.extend(rbs)
+            flat_legacy.extend(legacy)
+
+        if flat_rbs:
+            await db.upsert_response_brand_sentiment(flat_rbs)
+        if flat_legacy:
+            await db.update_sentiment_batch(flat_legacy)
 
         processed = min(i + batch_size, total)
         progress = 75 + round((processed / total) * 15)  # 75-90% for sentiment
