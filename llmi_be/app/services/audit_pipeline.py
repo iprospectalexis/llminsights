@@ -130,6 +130,28 @@ async def update_progress_counters(audit_id: str, **kwargs) -> None:
     await db.update_audit(audit_id, kwargs)
 
 
+async def _heartbeat(audit_id: str) -> None:
+    """Bump `last_activity_at` so the scheduler knows we're still alive.
+
+    Called after every successful batch in long-running handlers
+    (`handle_competitors`, `handle_sentiment`). Without this, long but healthy
+    work would (a) be re-queued aggressively by the fair scheduler order
+    (`COALESCE(last_activity_at, started_at)`) and (b) risk being killed by
+    the 60-min auto-fail sweep even though it is making progress.
+    """
+    from app.database import AsyncSessionLocal
+    from sqlalchemy import text
+    try:
+        async with AsyncSessionLocal() as s:
+            await s.execute(
+                text("UPDATE audits SET last_activity_at = now() WHERE id = :id"),
+                {"id": audit_id},
+            )
+            await s.commit()
+    except Exception as e:
+        logger.warning(f"[pipeline] {audit_id}: heartbeat failed: {e}")
+
+
 # ── Step handlers ────────────────────────────────────────────────────
 
 POLLING_MAX_MINUTES = 30
@@ -137,8 +159,16 @@ POLLING_MAX_MINUTES = 30
 # Hard ceiling on a single handler invocation. If a handler hangs (slow OpenAI
 # response, network stall, etc.) `process_step` aborts via `asyncio.wait_for`
 # so the scheduler slot is freed and other audits keep moving. Must be longer
-# than the slowest healthy step.
-PER_STEP_TIMEOUT_SECONDS = 300  # 5 min
+# than the slowest healthy step. With the bounded-batch handlers below, a
+# single invocation processes at most ~50 responses, so 600s is generous.
+PER_STEP_TIMEOUT_SECONDS = 600  # 10 min
+
+# Maximum number of outer batches a single handler invocation will process
+# before yielding back to the scheduler. Keeps `extracting_competitors` and
+# `analyzing_sentiment` forward-progress safe: each tick makes a measurable,
+# checkpointed amount of progress and writes a heartbeat, instead of trying
+# to do hundreds of responses inside a single wait_for budget.
+MAX_BATCHES_PER_INVOCATION = 5  # = 50 responses with batch_size=10
 
 
 async def handle_created(audit_id: str, worker_id: str) -> None:
@@ -429,23 +459,55 @@ async def _get_audit_run_by(audit_id: str) -> Optional[str]:
 
 
 async def handle_competitors(audit_id: str, worker_id: str) -> None:
-    """Extract competitors with per-batch checkpointing."""
-    responses = await db.get_responses_for_competitors(audit_id)
+    """Extract competitors with per-batch checkpointing.
 
-    if not responses:
+    Bounded + resumable: each invocation processes at most
+    `MAX_BATCHES_PER_INVOCATION` outer batches, then yields back to the
+    scheduler. State only transitions to `analyzing_sentiment` once
+    `get_responses_for_competitors` returns 0 rows — the SQL filter excludes
+    rows whose `answer_competitors` is non-NULL and not the {brands:[]} or
+    {error:...} sentinels, so subsequent invocations resume where we left off.
+    """
+    pending = await db.get_responses_for_competitors(audit_id)
+
+    # Single transition path: only here, only when there's nothing left.
+    if not pending:
         await db.update_audit_step(audit_id, "competitors", {
-            "status": "done", "message": "No responses to process"
+            "status": "done", "message": "Competitors extracted"
         })
-        transitioned = await transition_state(audit_id, "extracting_competitors", "analyzing_sentiment", worker_id)
+        transitioned = await transition_state(
+            audit_id, "extracting_competitors", "analyzing_sentiment", worker_id
+        )
         if transitioned:
-            logger.info(f"[pipeline] {audit_id}: extracting_competitors → analyzing_sentiment (0 responses)")
+            logger.info(
+                f"[pipeline] {audit_id}: extracting_competitors → analyzing_sentiment"
+            )
         return
 
-    total = len(responses)
+    pending_count = len(pending)
+
+    # Discover total once and cache it on the audit row so the modal can show
+    # cumulative X/Y progress across multiple invocations. We re-derive total
+    # from the audit if it's already set, otherwise treat the first batch as
+    # establishing the baseline.
+    audit_row = await db.get_audit(audit_id) or {}
+    total = audit_row.get("competitors_total") or 0
+    processed_so_far = audit_row.get("competitors_processed") or 0
+    if total <= 0:
+        # First invocation — total = pending now (this is the full set).
+        total = pending_count
+        processed_so_far = 0
+
     await db.update_audit_step(audit_id, "competitors", {
-        "status": "running", "message": f"Extracting competitors: 0/{total}"
+        "status": "running",
+        "message": f"Extracting competitors: {processed_so_far}/{total}",
     })
-    await update_progress_counters(audit_id, competitors_total=total, competitors_processed=0, progress=60)
+    await update_progress_counters(
+        audit_id,
+        competitors_total=total,
+        competitors_processed=processed_so_far,
+        progress=60 + round((processed_so_far / total) * 15) if total else 60,
+    )
 
     # Fetch project context
     own_brands, project_id, _ = await db.get_own_brands(audit_id)
@@ -454,44 +516,74 @@ async def handle_competitors(audit_id: str, worker_id: str) -> None:
     user_id = await _get_audit_run_by(audit_id)
     cost_ctx = {"audit_id": audit_id, "project_id": project_id, "user_id": user_id}
 
-    logger.info(f"[pipeline] {audit_id}: extracting competitors from {total} responses")
-
-    # Process in batches of 10, save after each batch (checkpoint)
+    # Bounded slice — make some progress, then yield. The next scheduler tick
+    # picks the audit up again because the SQL filter still finds remaining work.
     batch_size = 10
-    processed = 0
-    for i in range(0, total, batch_size):
-        batch = responses[i:i + batch_size]
-        batch_updates = await openai_client.extract_competitors_batch(
-            batch, batch_size=batch_size, delay=0.2,
-            industry=project_name or "",
-            known_brands=own_brands,
-            known_competitors=competitor_brands,
-            _ctx=cost_ctx,
-        )
-        # Save immediately — crash after this batch loses nothing
-        if batch_updates:
-            await db.update_competitors_batch(batch_updates)
+    work = pending[: MAX_BATCHES_PER_INVOCATION * batch_size]
+    logger.info(
+        f"[pipeline] {audit_id}: competitors invocation — {len(work)}/{pending_count} "
+        f"this tick (cumulative {processed_so_far}/{total})"
+    )
 
-        processed = min(i + batch_size, total)
-        progress = 60 + round((processed / total) * 15)  # 60-75% for competitors
-        await update_progress_counters(audit_id, competitors_processed=processed, progress=progress)
+    processed_this_invocation = 0
+    for i in range(0, len(work), batch_size):
+        batch = work[i:i + batch_size]
+        try:
+            batch_updates = await openai_client.extract_competitors_batch(
+                batch, batch_size=batch_size, delay=0.2,
+                industry=project_name or "",
+                known_brands=own_brands,
+                known_competitors=competitor_brands,
+                _ctx=cost_ctx,
+            )
+            if batch_updates:
+                await db.update_competitors_batch(batch_updates)
+        except Exception as e:
+            # Don't let one poison batch lock the whole audit. Mark every row
+            # in this batch with an error sentinel — the SQL filter
+            # `answer_competitors ? 'error'` keeps them eligible for retry on
+            # the next tick, but they no longer block forward progress.
+            logger.error(
+                f"[pipeline] {audit_id}: competitors batch failed: {e}",
+                exc_info=True,
+            )
+            try:
+                await db.update_competitors_batch([
+                    {
+                        "id": r["id"],
+                        "competitors": json.dumps({"brands": [], "error": str(e)[:200]}),
+                    }
+                    for r in batch
+                ])
+            except Exception as save_err:
+                logger.error(
+                    f"[pipeline] {audit_id}: failed to write error sentinels: {save_err}"
+                )
+
+        processed_this_invocation = min(i + batch_size, len(work))
+        cumulative = min(processed_so_far + processed_this_invocation, total)
+        progress = 60 + (round((cumulative / total) * 15) if total else 0)
+
+        # Heartbeat + counters after EVERY batch — keeps last_activity_at fresh
+        # so the auto-fail sweep doesn't kill healthy long work and the modal
+        # advances X/Y in near-real time.
+        await _heartbeat(audit_id)
+        await update_progress_counters(
+            audit_id,
+            competitors_processed=cumulative,
+            progress=progress,
+        )
         await db.update_audit_step(audit_id, "competitors", {
             "status": "running",
-            "message": f"Extracting competitors: {processed}/{total}",
-            "processed_count": processed,
+            "message": f"Extracting competitors: {cumulative}/{total}",
+            "processed_count": cumulative,
             "total_count": total,
         })
 
-    await db.update_audit_step(audit_id, "competitors", {
-        "status": "done",
-        "message": f"Competitors extracted for {processed} responses",
-        "processed_count": processed,
-        "total_count": total,
-    })
-
-    transitioned = await transition_state(audit_id, "extracting_competitors", "analyzing_sentiment", worker_id)
-    if transitioned:
-        logger.info(f"[pipeline] {audit_id}: extracting_competitors → analyzing_sentiment")
+    # NB: no transition_state here. The next scheduler tick will call us again;
+    # if `get_responses_for_competitors` is now empty we hit the early-return
+    # branch above and transition there. Single transition path → easier to
+    # reason about + impossible to get stuck mid-loop.
 
 
 def _sentiment_cache_key(answer_text: str, brands: list[str], model: str, version: str) -> str:
@@ -533,6 +625,10 @@ async def handle_sentiment(audit_id: str, worker_id: str) -> None:
     Per-brand-per-response: detects all known brands (own + competitors) in
     each answer using word-boundary matching, then asks gpt-5-mini in a single
     structured-output call to score every detected brand at once.
+
+    Bounded + resumable like `handle_competitors`: each invocation processes
+    at most `MAX_BATCHES_PER_INVOCATION` outer batches and only transitions
+    to `finalizing` once `get_responses_for_sentiment_v2` returns 0 rows.
     """
     audit = await db.get_audit(audit_id)
     sentiment_enabled = audit.get("sentiment", False)
@@ -557,31 +653,49 @@ async def handle_sentiment(audit_id: str, worker_id: str) -> None:
     own_set = {s["name"] for s in own_specs}
     all_specs = [BrandSpec(name=s["name"], aliases=s["aliases"]) for s in (own_specs + comp_specs)]
 
-    responses = await db.get_responses_for_sentiment_v2(audit_id)
-    if not responses:
-        await _skip("No responses for sentiment analysis")
+    pending = await db.get_responses_for_sentiment_v2(audit_id)
+    if not pending:
+        await _skip("Sentiment analyzed")
         return
+
+    pending_count = len(pending)
 
     project_name = await db.get_project_name(audit_id) or ""
     _, project_id, _ = await db.get_own_brands(audit_id)
     user_id = await _get_audit_run_by(audit_id)
     cost_ctx = {"audit_id": audit_id, "project_id": project_id, "user_id": user_id}
 
-    total = len(responses)
+    # Cumulative total/processed across invocations (mirrors handle_competitors).
+    total = audit.get("sentiment_total") or 0
+    processed_so_far = audit.get("sentiment_processed") or 0
+    if total <= 0:
+        total = pending_count
+        processed_so_far = 0
+
     await db.update_audit_step(audit_id, "sentiment", {
-        "status": "running", "message": f"Analyzing sentiment: 0/{total}",
+        "status": "running",
+        "message": f"Analyzing sentiment: {processed_so_far}/{total}",
     })
-    await update_progress_counters(audit_id, sentiment_total=total, sentiment_processed=0, progress=75)
+    await update_progress_counters(
+        audit_id,
+        sentiment_total=total,
+        sentiment_processed=processed_so_far,
+        progress=75 + (round((processed_so_far / total) * 15) if total else 0),
+    )
+
+    # Bounded slice — yield to scheduler after MAX_BATCHES_PER_INVOCATION batches.
+    batch_size = 10
+    work = pending[: MAX_BATCHES_PER_INVOCATION * batch_size]
 
     logger.info(
-        f"[pipeline] {audit_id}: sentiment v2 on {total} responses; "
+        f"[pipeline] {audit_id}: sentiment v2 invocation — {len(work)}/{pending_count} "
+        f"this tick (cumulative {processed_so_far}/{total}); "
         f"own={len(own_specs)} competitors={len(comp_specs)}"
     )
 
-    batch_size = 10
-    processed = 0
-    for i in range(0, total, batch_size):
-        batch = responses[i:i + batch_size]
+    processed_this_invocation = 0
+    for i in range(0, len(work), batch_size):
+        batch = work[i:i + batch_size]
 
         async def process(resp: dict) -> tuple[list[dict], list[dict]]:
             """Returns (rbs_rows, legacy_updates) for one response."""
@@ -629,43 +743,62 @@ async def handle_sentiment(audit_id: str, worker_id: str) -> None:
             legacy = [{"id": str(resp["id"]), "score": score, "label": label}]
             return rbs_rows, legacy
 
-        results = await asyncio.gather(*(process(r) for r in batch), return_exceptions=True)
+        try:
+            results = await asyncio.gather(*(process(r) for r in batch), return_exceptions=True)
 
-        flat_rbs: list[dict] = []
-        flat_legacy: list[dict] = []
-        for r in results:
-            if isinstance(r, Exception):
-                logger.error(f"[pipeline] sentiment batch item failed: {r}")
-                continue
-            rbs, legacy = r
-            flat_rbs.extend(rbs)
-            flat_legacy.extend(legacy)
+            flat_rbs: list[dict] = []
+            flat_legacy: list[dict] = []
+            for r in results:
+                if isinstance(r, Exception):
+                    logger.error(f"[pipeline] sentiment batch item failed: {r}")
+                    continue
+                rbs, legacy = r
+                flat_rbs.extend(rbs)
+                flat_legacy.extend(legacy)
 
-        if flat_rbs:
-            await db.upsert_response_brand_sentiment(flat_rbs)
-        if flat_legacy:
-            await db.update_sentiment_batch(flat_legacy)
+            if flat_rbs:
+                await db.upsert_response_brand_sentiment(flat_rbs)
+            if flat_legacy:
+                await db.update_sentiment_batch(flat_legacy)
+        except Exception as e:
+            # Don't let one poison batch lock the whole audit. Mark every row
+            # in this batch with a neutral fallback so the SQL filter no longer
+            # picks them up — they will not block forward progress.
+            logger.error(
+                f"[pipeline] {audit_id}: sentiment batch failed: {e}",
+                exc_info=True,
+            )
+            try:
+                await db.update_sentiment_batch([
+                    {"id": str(r["id"]), "score": 0.0, "label": "neutral"}
+                    for r in batch
+                ])
+            except Exception as save_err:
+                logger.error(
+                    f"[pipeline] {audit_id}: failed to write sentiment fallback: {save_err}"
+                )
 
-        processed = min(i + batch_size, total)
-        progress = 75 + round((processed / total) * 15)  # 75-90% for sentiment
-        await update_progress_counters(audit_id, sentiment_processed=processed, progress=progress)
+        processed_this_invocation = min(i + batch_size, len(work))
+        cumulative = min(processed_so_far + processed_this_invocation, total)
+        progress = 75 + (round((cumulative / total) * 15) if total else 0)
+
+        # Heartbeat + counters after EVERY batch.
+        await _heartbeat(audit_id)
+        await update_progress_counters(
+            audit_id,
+            sentiment_processed=cumulative,
+            progress=progress,
+        )
         await db.update_audit_step(audit_id, "sentiment", {
             "status": "running",
-            "message": f"Analyzing sentiment: {processed}/{total}",
-            "processed_count": processed,
+            "message": f"Analyzing sentiment: {cumulative}/{total}",
+            "processed_count": cumulative,
             "total_count": total,
         })
 
-    await db.update_audit_step(audit_id, "sentiment", {
-        "status": "done",
-        "message": f"Sentiment analyzed for {processed} responses",
-        "processed_count": processed,
-        "total_count": total,
-    })
-
-    transitioned = await transition_state(audit_id, "analyzing_sentiment", "finalizing", worker_id)
-    if transitioned:
-        logger.info(f"[pipeline] {audit_id}: analyzing_sentiment → finalizing")
+    # NB: no transition_state here. Next tick will call us again; when
+    # `get_responses_for_sentiment_v2` returns 0 the early-return at the top
+    # transitions to `finalizing`. Single transition path.
 
 
 async def handle_finalize(audit_id: str, worker_id: str) -> None:
@@ -755,10 +888,24 @@ async def process_step(audit: dict, worker_id: str) -> None:
         )
         # Don't fail the audit — the next tick will retry. The 60-min auto-fail
         # sweep in the scheduler will eventually catch genuinely dead audits.
+        # Best-effort surface the reason on the audit row so ops can see it.
+        try:
+            await db.update_audit(audit_id, {
+                "error_message": f"Step '{state}' timed out after {PER_STEP_TIMEOUT_SECONDS}s (retrying)"
+            })
+        except Exception:
+            pass
     except Exception as e:
         logger.error(f"[pipeline] {audit_id} error in {state}: {e}", exc_info=True)
-        # Don't fail immediately — allow retries on next tick
-        # Only fail after sustained errors (timeout check in scheduler)
+        # Don't fail immediately — allow retries on next tick.
+        # Best-effort surface the reason on the audit row so ops can see it
+        # without grepping logs across all workers.
+        try:
+            await db.update_audit(audit_id, {
+                "error_message": f"Step '{state}' error: {type(e).__name__}: {str(e)[:200]} (retrying)"
+            })
+        except Exception:
+            pass
 
 
 async def get_active_audits() -> list[dict]:

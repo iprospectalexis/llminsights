@@ -49,7 +49,10 @@ async def _call_openai(messages: list[dict], max_tokens: int = 2048,
             kwargs["response_format"] = response_format
 
         try:
-            resp = await _client.chat.completions.create(**kwargs)
+            # Hard per-call timeout (60s). The SDK default is ~10 minutes,
+            # so without this a single hung connection blocks the surrounding
+            # asyncio.gather, the batch loop, and the per-step wait_for budget.
+            resp = await _client.chat.completions.create(timeout=60.0, **kwargs)
             choice = resp.choices[0]
             content = choice.message.content
             if not content:
