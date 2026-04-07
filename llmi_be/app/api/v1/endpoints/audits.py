@@ -323,20 +323,11 @@ async def run_audit(req: RunAuditRequest, background_tasks: BackgroundTasks):
                 "status": "done", "message": f"{successful}/{total} LLM jobs triggered"
             })
             logger.info(f"[run-audit] {audit_id}: {successful}/{total} jobs triggered → polling")
-
-            # Warm start: poke the pipeline immediately so the parse step
-            # transitions to 'running' (and the modal shows "Receiving answers")
-            # within ~1s instead of waiting up to 15s for the next scheduler tick.
-            # Best-effort: any error here is fine because the scheduler will
-            # pick the audit up on its next tick anyway.
-            try:
-                from app.services.audit_pipeline import WORKER_ID, process_step
-                await process_step(
-                    {"id": audit_id, "pipeline_state": "polling"},
-                    WORKER_ID,
-                )
-            except Exception as warm_err:
-                logger.warning(f"[run-audit] {audit_id}: warm-start poll failed: {warm_err}")
+            # Note: no inline warm-start. The scheduler picks the audit up on
+            # its next tick (≤15s) and `handle_polling` heartbeats + pushes
+            # counters from the very first iteration, so the modal flips to
+            # "Receiving answers" without a hidden coupling between this
+            # request handler and the pipeline module.
 
         except Exception as e:
             logger.error(f"[run-audit] Background error: {e}", exc_info=True)

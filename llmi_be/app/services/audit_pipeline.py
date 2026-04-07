@@ -154,7 +154,19 @@ async def _heartbeat(audit_id: str) -> None:
 
 # ── Step handlers ────────────────────────────────────────────────────
 
-POLLING_MAX_MINUTES = 30
+# Global per-audit safety net. The per-row exhaustion (MAX_POLL_ATTEMPTS_PER_ROW
+# below) usually fires first; this is the back-stop for audits where the row
+# state machine somehow drifted (e.g. clock skew, lost updates).
+POLLING_MAX_MINUTES = 10
+
+# Per-row exhaustion. After this many polling attempts on a single row, mark
+# it `provider_no_response` so it stops blocking the audit. With a 15s tick,
+# 8 attempts ≈ 2 min of provider unresponsiveness before we give up on a row.
+MAX_POLL_ATTEMPTS_PER_ROW = 8
+
+# Don't re-poll the same row faster than this. Prevents hammering the
+# provider when the scheduler tick interval drops or warm-starts overlap.
+MIN_POLL_INTERVAL_SECONDS = 5
 
 # Hard ceiling on a single handler invocation. If a handler hangs (slow OpenAI
 # response, network stall, etc.) `process_step` aborts via `asyncio.wait_for`
@@ -207,109 +219,158 @@ async def handle_created(audit_id: str, worker_id: str) -> None:
 
 
 async def handle_polling(audit_id: str, worker_id: str) -> None:
-    """Fetch results from OneSearch/BrightData jobs. Idempotent — skips already-fetched."""
+    """Bounded, per-row resumable polling.
+
+    Source of truth is `db.get_polling_status(audit_id)`. A row leaves the
+    "active_pending" set in exactly three ways:
+      1. `answer_text` populated by a successful fetch (upsert_llm_responses)
+      2. `raw_response_data` populated by a successful or partial fetch
+      3. `poll_terminal_reason` set by an exhaustion sweep
+            (provider_no_response, provider_dropped, provider_error,
+             polling_timeout, orphan_no_job_id, polling_giveup)
+
+    Single transition path: only the `active_pending == 0` branch advances
+    the audit out of `polling`. Everything else just makes per-row progress
+    and returns to the scheduler.
+    """
     from app.api.v1.endpoints.audits import (
         fetch_onesearch_results, _fetch_brightdata_result, collect_citations
     )
 
-    # Unconditional update — the state machine guarantees we only enter
-    # handle_polling once per audit per cycle, and the row update is idempotent.
-    # Previously this used status_filter="pending" which silently no-op'd if
-    # something else had already moved the row, leaving the modal stuck on
-    # "Sending requests" forever.
+    await _heartbeat(audit_id)
+
     await db.update_audit_step(audit_id, "parse", {
         "status": "running", "message": "Polling for LLM results..."
     })
 
-    # Count expected vs received for progress
-    all_responses = await db.get_all_responses_for_audit(audit_id)
-    total = len(all_responses)
-    received = sum(1 for r in all_responses if r.get("answer_text") or (
-        r.get("raw_response_data") and isinstance(r.get("raw_response_data"), dict) and r["raw_response_data"]
-    ))
-    await update_progress_counters(audit_id,
-        responses_expected=total, responses_received=received,
-        progress=min(round((received / total) * 60) if total else 0, 60),  # 0-60% for polling phase
+    # ── Source of truth: SQL counts ─────────────────────────────────────
+    status = await db.get_polling_status(audit_id)
+    total          = status["total"]
+    received       = status["received"]
+    active_pending = status["active_pending"]
+    terminal       = status["terminal"]
+    max_attempts   = status["max_attempts"]
+
+    progress_pct = min(round(((received) / total) * 60) if total else 0, 60)
+    await update_progress_counters(
+        audit_id,
+        responses_expected=total,
+        responses_received=received,
+        progress=progress_pct,
+    )
+    logger.info(
+        f"[polling] {audit_id} total={total} received={received} "
+        f"active={active_pending} terminal={terminal} max_attempts={max_attempts}"
     )
 
-    # Get pending responses
-    pending = await db.get_pending_responses(audit_id, limit=500)
-
-    # Hard polling deadline — if we've been polling too long, give up on
-    # whatever is still pending and let the audit advance. Without this the
-    # pipeline will spin forever when a provider drops some prompts from a
-    # snapshot (BrightData/OneSearch occasionally truncate large batches).
-    if pending:
-        audit_row = await db.get_audit(audit_id)
-        started_at = (audit_row or {}).get("started_at") or (audit_row or {}).get("created_at")
-        if started_at:
-            if isinstance(started_at, str):
-                try:
-                    started_at = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
-                except ValueError:
-                    started_at = None
-        if started_at and (datetime.now(timezone.utc) - started_at) > timedelta(minutes=POLLING_MAX_MINUTES):
-            logger.warning(
-                f"[pipeline] {audit_id}: polling deadline ({POLLING_MAX_MINUTES}m) exceeded, "
-                f"marking {len(pending)} stuck rows as polling_timeout"
-            )
-            timeout_iso = datetime.now(timezone.utc).isoformat()
-            await db.upsert_llm_responses([
-                {
-                    "id": str(r["id"]),
-                    "raw_response_data": {
-                        "error": "polling_timeout",
-                        "minutes": POLLING_MAX_MINUTES,
-                        "failed_at": timeout_iso,
-                    },
-                }
-                for r in pending
-            ])
-            await db.update_audit_step(audit_id, "parse", {
-                "status": "done",
-                "message": f"Polling deadline reached; {len(pending)} responses dropped by provider",
-            })
-            await db.update_audit_step(audit_id, "fetch", {"status": "done"})
-            transitioned = await transition_state(audit_id, "polling", "extracting_competitors", worker_id)
-            if transitioned:
-                logger.info(f"[pipeline] {audit_id}: polling → extracting_competitors (deadline)")
-            return
-
-    if not pending:
-        # All done — transition to competitors
-        await db.update_audit_step(audit_id, "parse", {
-            "status": "done", "message": f"All {total} responses received"
-        })
+    # ── Branch 1: nothing left to actively poll → single transition ─────
+    if total > 0 and active_pending == 0:
+        msg = (
+            f"{received}/{total} received ({terminal} dropped by provider)"
+            if terminal else f"All {total} responses received"
+        )
+        await db.update_audit_step(audit_id, "parse", {"status": "done", "message": msg})
         await db.update_audit_step(audit_id, "fetch", {"status": "done"})
-        transitioned = await transition_state(audit_id, "polling", "extracting_competitors", worker_id)
+        transitioned = await transition_state(
+            audit_id, "polling", "extracting_competitors", worker_id
+        )
         if transitioned:
-            logger.info(f"[pipeline] {audit_id}: polling → extracting_competitors")
+            logger.info(f"[polling] {audit_id}: polling → extracting_competitors")
         return
 
-    logger.info(f"[pipeline] {audit_id}: {len(pending)} pending responses")
+    # ── Branch 2: global safety-net deadline ────────────────────────────
+    audit_row = await db.get_audit(audit_id)
+    anchor = (audit_row or {}).get("started_at") or (audit_row or {}).get("created_at")
+    if isinstance(anchor, str):
+        try:
+            anchor = datetime.fromisoformat(anchor.replace("Z", "+00:00"))
+        except ValueError:
+            anchor = None
+    if anchor and (datetime.now(timezone.utc) - anchor) > timedelta(minutes=POLLING_MAX_MINUTES):
+        logger.warning(
+            f"[polling] {audit_id}: deadline {POLLING_MAX_MINUTES}m hit, "
+            f"sweeping {active_pending} active rows as polling_timeout"
+        )
+        all_active = await db.get_active_pending_responses(
+            audit_id, min_interval_seconds=0, limit=10000
+        )
+        if all_active:
+            await db.mark_polling_terminal(
+                [str(r["id"]) for r in all_active], "polling_timeout"
+            )
+        try:
+            await db.update_audit(audit_id, {
+                "error_message": (
+                    f"Polling: deadline {POLLING_MAX_MINUTES}m hit, "
+                    f"{len(all_active)} rows swept as polling_timeout"
+                )
+            })
+        except Exception:
+            pass
+        # Next tick will see active_pending == 0 and transition.
+        return
 
-    # Group by job_id
+    # ── Branch 3: fetch a bounded slice of "due" rows ───────────────────
+    due = await db.get_active_pending_responses(
+        audit_id,
+        min_interval_seconds=MIN_POLL_INTERVAL_SECONDS,
+        limit=200,
+    )
+    if not due:
+        # Nothing due yet (everything was polled within the last MIN_POLL_INTERVAL).
+        # Wait for the next tick.
+        return
+
+    # Bump attempts up-front so even fetch failures count toward exhaustion.
+    await db.mark_polling_attempt([str(r["id"]) for r in due])
+
+    # ── Group: orphans / legacy / job_groups ────────────────────────────
+    orphans: list[dict] = []
+    legacy_responses: list[dict] = []
     job_groups: dict[str, list[dict]] = {}
-    legacy_responses = []
-    for r in pending:
-        if r.get("snapshot_id") and not r.get("job_id"):
+    for r in due:
+        has_job = bool(r.get("job_id"))
+        has_snap = bool(r.get("snapshot_id"))
+        if has_snap and not has_job:
             legacy_responses.append(r)
-        elif r.get("job_id"):
+        elif has_job:
             job_groups.setdefault(r["job_id"], []).append(r)
+        else:
+            orphans.append(r)
 
-    results = []
+    if orphans:
+        logger.warning(
+            f"[polling] {audit_id}: {len(orphans)} orphan rows "
+            "(no job_id and no snapshot_id) — marking orphan_no_job_id"
+        )
+        await db.mark_polling_terminal(
+            [str(r["id"]) for r in orphans], "orphan_no_job_id"
+        )
+        try:
+            await db.update_audit(audit_id, {
+                "error_message": f"Polling: {len(orphans)} orphan rows marked orphan_no_job_id"
+            })
+        except Exception:
+            pass
+
+    results: list[dict] = []
+    error_terminal_ids: list[str] = []   # provider_error
+    dropped_terminal_ids: list[str] = [] # provider_dropped
 
     # Process legacy BrightData responses
     if legacy_responses:
         brightdata_api_key = settings.brightdata_api_key
         for resp in legacy_responses:
             try:
-                result = await _fetch_brightdata_result(resp["llm"], resp["snapshot_id"], brightdata_api_key)
+                result = await _fetch_brightdata_result(
+                    resp["llm"], resp["snapshot_id"], brightdata_api_key
+                )
                 if result:
                     is_google = resp["llm"] in ("google-ai-overview", "google-ai-mode")
                     answer_text = result.get("aio_text") if is_google else result.get("answer_text")
                     answer_md = result.get("aio_text") if is_google else result.get("answer_text_markdown")
-                    cleaned = {k: v for k, v in result.items() if k not in ("answer_html", "response_raw", "source_html", "page_html")}
+                    cleaned = {k: v for k, v in result.items()
+                               if k not in ("answer_html", "response_raw", "source_html", "page_html")}
                     results.append({
                         "success": True, "response": resp, "result": result,
                         "update": {
@@ -323,31 +384,33 @@ async def handle_polling(audit_id: str, worker_id: str) -> None:
                         },
                     })
                 else:
+                    # not_ready: do NOT write any update — attempts++ already counted.
                     results.append({"success": False, "response": resp, "reason": "not_ready"})
             except Exception as e:
-                logger.error(f"BrightData fetch error for {resp['llm']}: {e}")
-                results.append({
-                    "success": False, "response": resp,
-                    "update": {
-                        "id": str(resp["id"]),
-                        "raw_response_data": {"error": str(e), "failed_at": datetime.now(timezone.utc).isoformat()},
-                    },
-                })
+                logger.error(f"[polling] BrightData fetch error for {resp['llm']}: {e}")
+                error_terminal_ids.append(str(resp["id"]))
 
     # Process OneSearch job-based responses
     if job_groups:
-        all_prompt_ids = [str(r["prompt_id"]) for responses in job_groups.values() for r in responses if r.get("prompt_id")]
+        all_prompt_ids = [
+            str(r["prompt_id"])
+            for responses in job_groups.values()
+            for r in responses
+            if r.get("prompt_id")
+        ]
         prompts_map = await db.get_prompt_texts(all_prompt_ids)
 
         for job_id, responses in job_groups.items():
             try:
                 onesearch_results = await fetch_onesearch_results(job_id)
                 if onesearch_results:
-                    drop_iso = datetime.now(timezone.utc).isoformat()
                     matched_count = 0
                     for resp in responses:
                         prompt_text = prompts_map.get(str(resp["prompt_id"]), "")
-                        matched = next((r for r in onesearch_results if r.get("prompt") == prompt_text), None)
+                        matched = next(
+                            (r for r in onesearch_results if r.get("prompt") == prompt_text),
+                            None,
+                        )
                         if matched:
                             matched_count += 1
                             results.append({
@@ -366,46 +429,29 @@ async def handle_polling(audit_id: str, worker_id: str) -> None:
                                 },
                             })
                         else:
-                            # Snapshot is finalized (results came back) but this prompt
-                            # is not in the result list — provider dropped it. Mark as
-                            # terminal failure so it doesn't loop forever in polling.
-                            results.append({
-                                "success": False, "response": resp,
-                                "update": {
-                                    "id": str(resp["id"]),
-                                    "raw_response_data": {
-                                        "error": "provider_dropped",
-                                        "job_id": job_id,
-                                        "failed_at": drop_iso,
-                                    },
-                                },
-                            })
+                            # Provider returned the snapshot but dropped this prompt → terminal.
+                            dropped_terminal_ids.append(str(resp["id"]))
                     if matched_count < len(responses):
                         logger.warning(
-                            f"[pipeline] Provider drop on job {job_id}: "
+                            f"[polling] {audit_id}: provider drop on job {job_id}: "
                             f"submitted={len(responses)}, returned={matched_count}, "
                             f"dropped={len(responses) - matched_count}"
                         )
                 else:
+                    # not_ready for the whole job
                     for resp in responses:
                         results.append({"success": False, "response": resp, "reason": "not_ready"})
             except Exception as e:
-                logger.error(f"OneSearch error for job {job_id}: {e}")
+                logger.error(f"[polling] OneSearch error for job {job_id}: {e}")
                 for resp in responses:
-                    results.append({
-                        "success": False, "response": resp,
-                        "update": {
-                            "id": str(resp["id"]),
-                            "raw_response_data": {"error": str(e), "failed_at": datetime.now(timezone.utc).isoformat()},
-                        },
-                    })
+                    error_terminal_ids.append(str(resp["id"]))
 
-    # Batch update responses
+    # ── Persist: success updates first, then terminals ──────────────────
     updates = [r["update"] for r in results if r.get("update")]
     if updates:
         await db.upsert_llm_responses(updates)
 
-    # Batch process citations
+    # Citations for the freshly successful rows
     successful = [r for r in results if r.get("success") and r.get("result")]
     if successful:
         all_citations = []
@@ -418,22 +464,56 @@ async def handle_polling(audit_id: str, worker_id: str) -> None:
                 "llm": resp["llm"],
             })
             all_citations.extend(collect_citations(r["result"], resp))
-
         await db.delete_citations_batch(delete_keys)
         if all_citations:
             await db.insert_citations_batch(all_citations)
 
-    # Summary
-    ok = sum(1 for r in results if r.get("success"))
-    failed = sum(1 for r in results if not r.get("success") and r.get("update"))
-    not_ready = sum(1 for r in results if r.get("reason") == "not_ready")
-    logger.info(f"[pipeline] Poll {audit_id}: {ok} ok, {failed} failed, {not_ready} not ready")
+    if dropped_terminal_ids:
+        await db.mark_polling_terminal(dropped_terminal_ids, "provider_dropped")
+    if error_terminal_ids:
+        await db.mark_polling_terminal(error_terminal_ids, "provider_error")
 
-    # Update received count
-    new_received = received + ok + failed
-    await update_progress_counters(audit_id,
-        responses_received=new_received,
-        progress=min(round((new_received / total) * 60) if total else 0, 60),
+    # ── Per-row exhaustion sweep ────────────────────────────────────────
+    # After bumping attempts above, any row whose `poll_attempts` has now
+    # reached the cap and is *still* active-pending must be marked terminal,
+    # otherwise it will block the audit indefinitely.
+    exhausted_ids: list[str] = []
+    successful_ids = {u["id"] for u in updates}
+    handled_terminal = set(dropped_terminal_ids) | set(error_terminal_ids)
+    for r in due:
+        rid = str(r["id"])
+        if rid in successful_ids or rid in handled_terminal:
+            continue
+        # `poll_attempts` was the value BEFORE we bumped — so compare against cap-1.
+        prev_attempts = int(r.get("poll_attempts") or 0)
+        if prev_attempts + 1 >= MAX_POLL_ATTEMPTS_PER_ROW:
+            exhausted_ids.append(rid)
+    if exhausted_ids:
+        logger.warning(
+            f"[polling] {audit_id}: {len(exhausted_ids)} rows exhausted "
+            f"after {MAX_POLL_ATTEMPTS_PER_ROW} attempts → provider_no_response"
+        )
+        await db.mark_polling_terminal(exhausted_ids, "provider_no_response")
+        try:
+            await db.update_audit(audit_id, {
+                "error_message": (
+                    f"Polling: {len(exhausted_ids)} rows marked provider_no_response "
+                    f"(exhausted {MAX_POLL_ATTEMPTS_PER_ROW} attempts)"
+                )
+            })
+        except Exception:
+            pass
+
+    # Heartbeat at exit so long fetches don't look stale to the auto-fail sweep.
+    await _heartbeat(audit_id)
+
+    ok = len(updates) - len(dropped_terminal_ids)  # successes only
+    not_ready = sum(1 for r in results if r.get("reason") == "not_ready")
+    logger.info(
+        f"[polling] {audit_id}: tick done due={len(due)} ok={ok} "
+        f"dropped={len(dropped_terminal_ids)} errors={len(error_terminal_ids)} "
+        f"exhausted={len(exhausted_ids)} not_ready={not_ready} "
+        f"orphans={len(orphans)}"
     )
 
     # Try to refresh metrics (non-fatal)

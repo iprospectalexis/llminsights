@@ -201,6 +201,8 @@ class SupabaseDB:
 
     async def get_pending_responses(self, audit_id: str, limit: int = 100,
                                      llm_filter: Optional[str] = None) -> list[dict]:
+        """LEGACY: kept for any non-pipeline caller. New code should use
+        `get_active_pending_responses` which honours the per-row poll state."""
         where = "audit_id = :audit_id AND answer_text IS NULL AND raw_response_data IS NULL"
         params: dict[str, Any] = {"audit_id": audit_id, "lim": limit}
         if llm_filter:
@@ -212,6 +214,111 @@ class SupabaseDB:
                 params,
             )).mappings().all()
             return [dict(r) for r in rows]
+
+    async def get_active_pending_responses(
+        self,
+        audit_id: str,
+        min_interval_seconds: int = 5,
+        limit: int = 200,
+    ) -> list[dict]:
+        """Rows that need polling: no data yet AND not terminal AND not polled
+        too recently. Used by the pipeline polling handler."""
+        async with AsyncSessionLocal() as s:
+            rows = (await s.execute(
+                text("""
+                    SELECT *
+                    FROM llm_responses
+                    WHERE audit_id = :audit_id
+                      AND answer_text IS NULL
+                      AND raw_response_data IS NULL
+                      AND poll_terminal_reason IS NULL
+                      AND (last_polled_at IS NULL
+                           OR last_polled_at < now() - make_interval(secs => :min_interval))
+                    ORDER BY first_polled_at NULLS FIRST, id
+                    LIMIT :lim
+                """),
+                {"audit_id": audit_id, "min_interval": min_interval_seconds, "lim": limit},
+            )).mappings().all()
+            return [dict(r) for r in rows]
+
+    async def mark_polling_attempt(self, row_ids: list[str]) -> None:
+        """Increment poll_attempts and stamp first/last_polled_at."""
+        if not row_ids:
+            return
+        async with AsyncSessionLocal() as s:
+            await s.execute(
+                text("""
+                    UPDATE llm_responses
+                    SET poll_attempts   = poll_attempts + 1,
+                        first_polled_at = COALESCE(first_polled_at, now()),
+                        last_polled_at  = now()
+                    WHERE id = ANY(CAST(:ids AS uuid[]))
+                """),
+                {"ids": list(row_ids)},
+            )
+            await s.commit()
+
+    async def mark_polling_terminal(self, row_ids: list[str], reason: str) -> int:
+        """Mark rows as terminally failed at polling. Returns rows updated.
+
+        Also writes a minimal sentinel into raw_response_data so the row
+        leaves the legacy `pending` set (answer_text NULL + raw_response_data
+        NULL) used by older callers.
+        """
+        if not row_ids:
+            return 0
+        async with AsyncSessionLocal() as s:
+            result = await s.execute(
+                text("""
+                    UPDATE llm_responses
+                    SET poll_terminal_reason = :reason,
+                        last_polled_at       = now(),
+                        raw_response_data    = COALESCE(
+                          raw_response_data,
+                          jsonb_build_object(
+                            'error',     :reason,
+                            'failed_at', now()
+                          )
+                        )
+                    WHERE id = ANY(CAST(:ids AS uuid[]))
+                    RETURNING id
+                """),
+                {"reason": reason, "ids": list(row_ids)},
+            )
+            updated = len(result.fetchall())
+            await s.commit()
+            return updated
+
+    async def get_polling_status(self, audit_id: str) -> dict:
+        """Single-row health summary for an audit's polling progress.
+
+        Used by `handle_polling` as the source of truth for total/received/
+        active_pending/terminal — replaces the in-Python counter loop.
+        """
+        async with AsyncSessionLocal() as s:
+            row = (await s.execute(
+                text("""
+                    SELECT
+                      count(*)                                                                    AS total,
+                      count(*) FILTER (
+                        WHERE answer_text IS NOT NULL OR raw_response_data IS NOT NULL
+                      )                                                                           AS received,
+                      count(*) FILTER (
+                        WHERE answer_text IS NULL
+                          AND raw_response_data IS NULL
+                          AND poll_terminal_reason IS NULL
+                      )                                                                           AS active_pending,
+                      count(*) FILTER (WHERE poll_terminal_reason IS NOT NULL)                    AS terminal,
+                      COALESCE(max(poll_attempts), 0)                                             AS max_attempts
+                    FROM llm_responses
+                    WHERE audit_id = :aid
+                """),
+                {"aid": audit_id},
+            )).mappings().first()
+            return dict(row) if row else {
+                "total": 0, "received": 0, "active_pending": 0,
+                "terminal": 0, "max_attempts": 0,
+            }
 
     async def upsert_llm_responses(self, updates: list[dict]) -> None:
         """Batch upsert llm_responses by id."""
