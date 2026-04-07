@@ -253,7 +253,9 @@ class SupabaseDB:
                     JOIN prompts p ON lr.prompt_id = p.id
                     WHERE lr.audit_id = :aid
                       AND lr.answer_text IS NOT NULL
-                      AND (lr.answer_competitors IS NULL OR lr.answer_competitors = '{"brands": []}'::jsonb)
+                      AND (lr.answer_competitors IS NULL
+                           OR lr.answer_competitors = '{"brands": []}'::jsonb
+                           OR lr.answer_competitors ? 'error')
                 """),
                 {"aid": audit_id},
             )).mappings().all()
