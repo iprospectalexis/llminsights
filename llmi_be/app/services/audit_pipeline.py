@@ -16,7 +16,7 @@ import hashlib
 import json
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
@@ -130,6 +130,9 @@ async def update_progress_counters(audit_id: str, **kwargs) -> None:
 
 # ── Step handlers ────────────────────────────────────────────────────
 
+POLLING_MAX_MINUTES = 30
+
+
 async def handle_polling(audit_id: str, worker_id: str) -> None:
     """Fetch results from OneSearch/BrightData jobs. Idempotent — skips already-fetched."""
     from app.api.v1.endpoints.audits import (
@@ -153,6 +156,47 @@ async def handle_polling(audit_id: str, worker_id: str) -> None:
 
     # Get pending responses
     pending = await db.get_pending_responses(audit_id, limit=500)
+
+    # Hard polling deadline — if we've been polling too long, give up on
+    # whatever is still pending and let the audit advance. Without this the
+    # pipeline will spin forever when a provider drops some prompts from a
+    # snapshot (BrightData/OneSearch occasionally truncate large batches).
+    if pending:
+        audit_row = await db.get_audit(audit_id)
+        started_at = (audit_row or {}).get("started_at") or (audit_row or {}).get("created_at")
+        if started_at:
+            if isinstance(started_at, str):
+                try:
+                    started_at = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+                except ValueError:
+                    started_at = None
+        if started_at and (datetime.now(timezone.utc) - started_at) > timedelta(minutes=POLLING_MAX_MINUTES):
+            logger.warning(
+                f"[pipeline] {audit_id}: polling deadline ({POLLING_MAX_MINUTES}m) exceeded, "
+                f"marking {len(pending)} stuck rows as polling_timeout"
+            )
+            timeout_iso = datetime.now(timezone.utc).isoformat()
+            await db.upsert_llm_responses([
+                {
+                    "id": str(r["id"]),
+                    "raw_response_data": {
+                        "error": "polling_timeout",
+                        "minutes": POLLING_MAX_MINUTES,
+                        "failed_at": timeout_iso,
+                    },
+                }
+                for r in pending
+            ])
+            await db.update_audit_step(audit_id, "parse", {
+                "status": "done",
+                "message": f"Polling deadline reached; {len(pending)} responses dropped by provider",
+            })
+            await db.update_audit_step(audit_id, "fetch", {"status": "done"})
+            transitioned = await transition_state(audit_id, "polling", "extracting_competitors", worker_id)
+            if transitioned:
+                logger.info(f"[pipeline] {audit_id}: polling → extracting_competitors (deadline)")
+            return
+
     if not pending:
         # All done — transition to competitors
         await db.update_audit_step(audit_id, "parse", {
@@ -221,10 +265,13 @@ async def handle_polling(audit_id: str, worker_id: str) -> None:
             try:
                 onesearch_results = await fetch_onesearch_results(job_id)
                 if onesearch_results:
+                    drop_iso = datetime.now(timezone.utc).isoformat()
+                    matched_count = 0
                     for resp in responses:
                         prompt_text = prompts_map.get(str(resp["prompt_id"]), "")
                         matched = next((r for r in onesearch_results if r.get("prompt") == prompt_text), None)
                         if matched:
+                            matched_count += 1
                             results.append({
                                 "success": True, "response": resp, "result": matched,
                                 "update": {
@@ -241,7 +288,26 @@ async def handle_polling(audit_id: str, worker_id: str) -> None:
                                 },
                             })
                         else:
-                            results.append({"success": False, "response": resp, "reason": "no_match"})
+                            # Snapshot is finalized (results came back) but this prompt
+                            # is not in the result list — provider dropped it. Mark as
+                            # terminal failure so it doesn't loop forever in polling.
+                            results.append({
+                                "success": False, "response": resp,
+                                "update": {
+                                    "id": str(resp["id"]),
+                                    "raw_response_data": {
+                                        "error": "provider_dropped",
+                                        "job_id": job_id,
+                                        "failed_at": drop_iso,
+                                    },
+                                },
+                            })
+                    if matched_count < len(responses):
+                        logger.warning(
+                            f"[pipeline] Provider drop on job {job_id}: "
+                            f"submitted={len(responses)}, returned={matched_count}, "
+                            f"dropped={len(responses) - matched_count}"
+                        )
                 else:
                     for resp in responses:
                         results.append({"success": False, "response": resp, "reason": "not_ready"})
