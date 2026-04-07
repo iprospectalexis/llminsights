@@ -477,6 +477,12 @@ async def handle_polling(audit_id: str, worker_id: str) -> None:
         # ── Persist: success updates first, then terminals ──────────────
         phase = "persist_updates"
         updates = [r["update"] for r in results if r.get("update")]
+        # Capture successful_ids BEFORE the upsert so the exhaustion sweep
+        # below cannot trip on a downstream helper that mutates the list.
+        # Defense in depth — `upsert_llm_responses` no longer pops `id` in
+        # place, but the sweep is correctness-critical (one missing id
+        # there means a row gets marked provider_no_response by mistake).
+        successful_ids: set[str] = {u["id"] for u in updates if u.get("id")}
         if updates:
             await db.upsert_llm_responses(updates)
 
@@ -508,7 +514,7 @@ async def handle_polling(audit_id: str, worker_id: str) -> None:
         # ── Per-row exhaustion sweep ────────────────────────────────────
         phase = "exhaustion_sweep"
         exhausted_ids: list[str] = []
-        successful_ids = {u["id"] for u in updates}
+        # `successful_ids` was captured above before `upsert_llm_responses`.
         handled_terminal = set(dropped_terminal_ids) | set(error_terminal_ids)
         for r in due:
             rid = str(r["id"])

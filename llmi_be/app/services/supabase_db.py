@@ -385,12 +385,20 @@ class SupabaseDB:
             logger.error(f"[pipeline_log] insert failed for {audit_id}: {e}")
 
     async def upsert_llm_responses(self, updates: list[dict]) -> None:
-        """Batch upsert llm_responses by id."""
+        """Batch upsert llm_responses by id.
+
+        Treats `updates` as read-only — earlier versions did
+        `u.pop("id", None)` which silently mutated the caller's list and
+        caused a KeyError in `handle_polling`'s exhaustion_sweep when it
+        tried to read `u["id"]` afterwards. Now we copy each dict before
+        building the SET clause and never touch the original.
+        """
         if not updates:
             return
         async with AsyncSessionLocal() as s:
-            for u in updates:
-                uid = u.pop("id", None) or u.get("id")
+            for original in updates:
+                u = dict(original)             # local working copy
+                uid = u.pop("id", None)
                 if not uid:
                     continue
                 parts = []
