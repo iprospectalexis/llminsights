@@ -35,6 +35,7 @@ WORKER_ID = str(uuid.uuid4())[:8]
 # ── State transitions ────────────────────────────────────────────────
 
 VALID_TRANSITIONS = {
+    "created": "polling",
     "polling": "extracting_competitors",
     "extracting_competitors": "analyzing_sentiment",
     "analyzing_sentiment": "finalizing",
@@ -85,6 +86,7 @@ async def transition_state(audit_id: str, from_state: str, to_state: str,
         "finalizing": "completing",
         "completed": None,
         "failed": None,
+        "created": None,
     }
 
     async with AsyncSessionLocal() as s:
@@ -131,6 +133,41 @@ async def update_progress_counters(audit_id: str, **kwargs) -> None:
 # ── Step handlers ────────────────────────────────────────────────────
 
 POLLING_MAX_MINUTES = 30
+
+
+async def handle_created(audit_id: str, worker_id: str) -> None:
+    """
+    Recovery handler for audits stuck in `pipeline_state='created'`.
+
+    These audits were created by a path that didn't set `pipeline_state`
+    (e.g. the legacy `process_scheduled_audits_direct` SQL cron, or a
+    direct INSERT). Without this handler they would sit invisible to the
+    main scheduler forever and eventually be force-completed by legacy
+    cleanup crons — losing all competitor + sentiment data.
+
+    Strategy:
+      - If `llm_responses` rows already exist for this audit → transition
+        to `polling`. The polling handler is idempotent and will fast-
+        forward to `extracting_competitors` once it sees all answers are in.
+      - If 0 responses exist → mark the audit as failed (it was never
+        properly initialised; nothing to recover).
+    """
+    all_responses = await db.get_all_responses_for_audit(audit_id)
+    if not all_responses:
+        logger.error(
+            f"[pipeline] {audit_id}: stuck in 'created' with 0 llm_responses — "
+            "no jobs were ever triggered, marking failed"
+        )
+        await fail_audit(audit_id, "abandoned in 'created' state with no responses")
+        return
+
+    logger.warning(
+        f"[pipeline] {audit_id}: recovering from 'created' state "
+        f"({len(all_responses)} responses found) → polling"
+    )
+    transitioned = await transition_state(audit_id, "created", "polling", worker_id)
+    if transitioned:
+        logger.info(f"[pipeline] {audit_id}: created → polling (recovery)")
 
 
 async def handle_polling(audit_id: str, worker_id: str) -> None:
@@ -605,6 +642,29 @@ async def handle_finalize(audit_id: str, worker_id: str) -> None:
     })
     await update_progress_counters(audit_id, progress=90)
 
+    # Coverage check — surface silent extraction collapse before the user notices.
+    # If many responses have answer_text but very few have answer_competitors,
+    # something upstream skipped extraction and the dashboards will look empty.
+    try:
+        from app.database import AsyncSessionLocal
+        from sqlalchemy import text
+        async with AsyncSessionLocal() as s:
+            row = (await s.execute(text("""
+                SELECT COUNT(*) FILTER (WHERE answer_text IS NOT NULL) AS with_text,
+                       COUNT(*) FILTER (WHERE answer_competitors IS NOT NULL) AS with_comp
+                FROM llm_responses WHERE audit_id = :aid
+            """), {"aid": audit_id})).mappings().first()
+        with_text = (row or {}).get("with_text") or 0
+        with_comp = (row or {}).get("with_comp") or 0
+        if with_text >= 5 and with_comp < with_text * 0.8:
+            logger.error(
+                f"[pipeline] {audit_id}: LOW competitor extraction coverage "
+                f"({with_comp}/{with_text}) — Brand Leadership will look empty. "
+                "Investigate handle_competitors / extract_competitors path."
+            )
+    except Exception as e:
+        logger.warning(f"[pipeline] {audit_id}: coverage check failed: {e}")
+
     try:
         await db.calculate_project_metrics(audit_id)
     except Exception as e:
@@ -635,6 +695,7 @@ async def handle_finalize(audit_id: str, worker_id: str) -> None:
 # ── Main dispatcher ──────────────────────────────────────────────────
 
 HANDLERS = {
+    "created": handle_created,
     "polling": handle_polling,
     "extracting_competitors": handle_competitors,
     "analyzing_sentiment": handle_sentiment,
@@ -661,7 +722,14 @@ async def process_step(audit: dict, worker_id: str) -> None:
 
 
 async def get_active_audits() -> list[dict]:
-    """Get audits that need processing."""
+    """Get audits that need processing.
+
+    Includes 'created' so the recovery handler can pick up audits inserted
+    by paths that didn't set pipeline_state (e.g. legacy edge functions or
+    direct DB inserts). Without this, such audits silently rot forever.
+    Only picks up 'created' audits older than 2 minutes to avoid racing
+    the run_audit endpoint, which sets 'fetching' itself before transitioning.
+    """
     from app.database import AsyncSessionLocal
     from sqlalchemy import text
     async with AsyncSessionLocal() as s:
@@ -669,7 +737,10 @@ async def get_active_audits() -> list[dict]:
             SELECT id, pipeline_state, locked_by, locked_at, started_at, status, sentiment
             FROM audits
             WHERE pipeline_state IN ('polling', 'extracting_competitors', 'analyzing_sentiment', 'finalizing')
-            ORDER BY started_at ASC
+               OR (pipeline_state = 'created'
+                   AND status IN ('running', 'pending')
+                   AND created_at < now() - interval '2 minutes')
+            ORDER BY started_at ASC NULLS FIRST
             LIMIT 10
         """))
         return [dict(r._mapping) for r in result.fetchall()]
