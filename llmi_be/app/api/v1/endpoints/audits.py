@@ -137,6 +137,10 @@ def collect_citations(result: dict, response: dict) -> list[dict]:
 async def trigger_onesearch_job(
     llm: str, prompts: list[str], country: str, force_web_search: bool,
     provider_config: Optional[dict] = None,
+    *,
+    audit_id: Optional[str] = None,
+    project_id: Optional[str] = None,
+    user_id: Optional[str] = None,
 ) -> str:
     """Trigger a job on the OneSearch backend API (self — local)."""
     provider = (provider_config or {}).get("provider", "brightdata")
@@ -161,7 +165,24 @@ async def trigger_onesearch_job(
         resp.raise_for_status()
         data = resp.json()
         logger.info(f"[run-audit] {llm}: job {data['id']} created ({len(prompts)} prompts)")
-        return data["id"]
+
+    # Best-effort cost capture (Brightdata / OneSearch — 1 job × N prompts).
+    if audit_id:
+        try:
+            from app.services import cost_tracker
+            await cost_tracker.record_scrape_call(
+                audit_id=audit_id,
+                project_id=project_id,
+                user_id=user_id,
+                provider=provider,
+                llm=llm,
+                prompt_count=len(prompts),
+                metadata={"job_id": data.get("id"), "country": country or "FR"},
+            )
+        except Exception as ce:
+            logger.warning(f"cost_tracker: scrape event not recorded: {ce}")
+
+    return data["id"]
 
 
 async def fetch_onesearch_results(job_id: str) -> Optional[list[dict]]:
@@ -260,6 +281,8 @@ async def run_audit(req: RunAuditRequest, background_tasks: BackgroundTasks):
                     job_id = await trigger_onesearch_job(
                         llm, prompt_texts, project.get("country", "FR"),
                         force_web_search, provider_config_map.get(llm),
+                        audit_id=audit_id,
+                        project_id=req.projectId,
                     )
                     for p in prompts:
                         llm_responses.append({

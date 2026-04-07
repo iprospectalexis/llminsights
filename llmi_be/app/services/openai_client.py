@@ -14,6 +14,7 @@ from typing import Optional
 from openai import AsyncOpenAI
 
 from app.config import get_settings
+from app.services import cost_tracker
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -29,8 +30,15 @@ SENTIMENT_PROMPT_VERSION = "v2.1-2026-04-07"
 
 
 async def _call_openai(messages: list[dict], max_tokens: int = 2048,
-                        response_format: Optional[dict] = None) -> Optional[str]:
-    """Call OpenAI chat completions API with concurrency control."""
+                        response_format: Optional[dict] = None,
+                        _ctx: Optional[dict] = None,
+                        _operation: Optional[str] = None) -> Optional[str]:
+    """Call OpenAI chat completions API with concurrency control.
+
+    `_ctx` carries audit_id/project_id/user_id from the caller so the cost
+    tracker can attribute the spend. `_operation` is the high-level operation
+    name ('competitors_extract' or 'sentiment_analyze') stored on the event.
+    """
     async with _semaphore:
         kwargs: dict = {
             "model": MODEL,
@@ -54,6 +62,20 @@ async def _call_openai(messages: list[dict], max_tokens: int = 2048,
                     f"OpenAI returned empty content (finish_reason={finish}, "
                     f"usage={usage}, max_tokens={max_tokens})"
                 )
+            # Best-effort cost capture (never breaks the call on failure)
+            try:
+                usage = getattr(resp, "usage", None)
+                if usage is not None and _operation:
+                    finish_reason = getattr(choice, "finish_reason", None)
+                    await cost_tracker.record_openai_call(
+                        ctx=_ctx,
+                        model=MODEL,
+                        operation=_operation,
+                        usage=usage,
+                        metadata={"finish_reason": finish_reason} if finish_reason else None,
+                    )
+            except Exception as ce:
+                logger.warning(f"cost_tracker: openai event not recorded: {ce}")
             return content
         except Exception as e:
             logger.error(f"OpenAI API error: {e}")
@@ -103,6 +125,7 @@ async def extract_competitors(
     industry: str = "",
     known_brands: list[str] | None = None,
     known_competitors: list[str] | None = None,
+    _ctx: Optional[dict] = None,
 ) -> dict:
     """
     Extract brand/company names from an LLM response.
@@ -181,7 +204,8 @@ async def extract_competitors(
     for attempt in range(2):  # Retry once on empty output
         try:
             raw = await _call_openai(messages, max_tokens=4096,
-                                      response_format={"type": "json_object"})
+                                      response_format={"type": "json_object"},
+                                      _ctx=_ctx, _operation="competitors_extract")
             if not raw:
                 if attempt == 0:
                     logger.warning("OpenAI returned empty output, retrying...")
@@ -242,6 +266,7 @@ async def analyze_response_sentiment(
     answer_text: str,
     brands_to_score: list[str],
     industry: str = "",
+    _ctx: Optional[dict] = None,
 ) -> dict:
     """
     Score every brand in `brands_to_score` against a single LLM answer in one call.
@@ -317,6 +342,8 @@ async def analyze_response_sentiment(
             # reasoning tokens, so allocate generously per brand.
             max_tokens=4000,
             response_format={"type": "json_schema", "json_schema": SENTIMENT_SCHEMA},
+            _ctx=_ctx,
+            _operation="sentiment_analyze",
         )
         if not raw:
             return _sentiment_fallback(brands_to_score, "empty_response")
@@ -427,6 +454,7 @@ async def extract_competitors_batch(
     industry: str = "",
     known_brands: list[str] | None = None,
     known_competitors: list[str] | None = None,
+    _ctx: Optional[dict] = None,
 ) -> list[dict]:
     """
     Run competitor extraction on a list of responses.
@@ -443,6 +471,7 @@ async def extract_competitors_batch(
                 industry=industry,
                 known_brands=known_brands,
                 known_competitors=known_competitors,
+                _ctx=_ctx,
             )
             for r in batch
         ]

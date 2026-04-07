@@ -24,6 +24,7 @@ import { StatusPage } from './pages/StatusPage';
 import { BarometersPage } from './pages/BarometersPage';
 import { TopSourcesPage } from './pages/TopSourcesPage';
 import { SettingsPage } from './pages/SettingsPage';
+import { CostsPage } from './pages/admin/CostsPage';
 import ReportDetailPage from './pages/ReportDetailPage';
 import './i18n';
 
@@ -60,6 +61,7 @@ function App() {
             <Route path="barometers" element={<BarometersPage />} />
             <Route path="barometers/top-sources" element={<TopSourcesPage />} />
             <Route path="settings" element={<SettingsPage />} />
+            <Route path="admin/costs" element={<CostsPage />} />
           </Route>
 
           {/* Catch all */}

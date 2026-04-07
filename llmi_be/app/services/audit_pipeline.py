@@ -402,6 +402,21 @@ async def handle_polling(audit_id: str, worker_id: str) -> None:
         logger.warning(f"[pipeline] Metrics refresh warning: {e}")
 
 
+async def _get_audit_run_by(audit_id: str) -> Optional[str]:
+    """Look up the user who triggered the audit (audits.run_by)."""
+    from app.database import AsyncSessionLocal
+    from sqlalchemy import text
+    try:
+        async with AsyncSessionLocal() as s:
+            row = (await s.execute(
+                text("SELECT run_by FROM audits WHERE id = :aid"),
+                {"aid": audit_id},
+            )).mappings().first()
+            return str(row["run_by"]) if row and row.get("run_by") else None
+    except Exception:
+        return None
+
+
 async def handle_competitors(audit_id: str, worker_id: str) -> None:
     """Extract competitors with per-batch checkpointing."""
     responses = await db.get_responses_for_competitors(audit_id)
@@ -425,6 +440,8 @@ async def handle_competitors(audit_id: str, worker_id: str) -> None:
     own_brands, project_id, _ = await db.get_own_brands(audit_id)
     competitor_brands = await db.get_competitor_brands(audit_id)
     project_name = await db.get_project_name(audit_id)
+    user_id = await _get_audit_run_by(audit_id)
+    cost_ctx = {"audit_id": audit_id, "project_id": project_id, "user_id": user_id}
 
     logger.info(f"[pipeline] {audit_id}: extracting competitors from {total} responses")
 
@@ -438,6 +455,7 @@ async def handle_competitors(audit_id: str, worker_id: str) -> None:
             industry=project_name or "",
             known_brands=own_brands,
             known_competitors=competitor_brands,
+            _ctx=cost_ctx,
         )
         # Save immediately — crash after this batch loses nothing
         if batch_updates:
@@ -534,6 +552,9 @@ async def handle_sentiment(audit_id: str, worker_id: str) -> None:
         return
 
     project_name = await db.get_project_name(audit_id) or ""
+    _, project_id, _ = await db.get_own_brands(audit_id)
+    user_id = await _get_audit_run_by(audit_id)
+    cost_ctx = {"audit_id": audit_id, "project_id": project_id, "user_id": user_id}
 
     total = len(responses)
     await db.update_audit_step(audit_id, "sentiment", {
@@ -570,6 +591,7 @@ async def handle_sentiment(audit_id: str, worker_id: str) -> None:
                     answer_text=answer_text,
                     brands_to_score=detected,
                     industry=project_name,
+                    _ctx=cost_ctx,
                 )
                 if not result.get("_fallback"):
                     await db.put_sentiment_cache(cache_key, result)

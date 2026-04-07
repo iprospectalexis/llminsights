@@ -27,7 +27,8 @@ import {
   PanelLeftOpen,
   LayoutDashboard,
   Eye,
-  X
+  X,
+  DollarSign
 } from 'lucide-react';
 import { useProject } from '../../contexts/ProjectContext';
 
@@ -717,6 +718,35 @@ export const Sidebar: React.FC<SidebarProps> = ({ user, userProfile, isOpen, onT
                 )}
               </AnimatePresence>
             </NavLink>
+            {(userProfile?.role === 'admin' || userProfile?.role === 'manager') && (
+              <NavLink
+                to="/admin/costs"
+                className={`
+                  flex items-center px-3 py-2.5 text-sm font-medium rounded-xl transition-all duration-200
+                  ${location.pathname.startsWith('/admin/costs')
+                    ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-100'
+                    : 'text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800'
+                  }
+                  ${effectiveCollapsed ? 'justify-center' : ''}
+                `}
+                title={effectiveCollapsed ? 'API Costs' : ''}
+              >
+                <DollarSign className={`w-5 h-5 ${effectiveCollapsed ? '' : 'mr-3'} flex-shrink-0`} />
+                <AnimatePresence>
+                  {!effectiveCollapsed && (
+                    <motion.span
+                      initial={{ opacity: 0, width: 0 }}
+                      animate={{ opacity: 1, width: 'auto' }}
+                      exit={{ opacity: 0, width: 0 }}
+                      transition={{ duration: 0.2 }}
+                      className="overflow-hidden whitespace-nowrap"
+                    >
+                      API Costs
+                    </motion.span>
+                  )}
+                </AnimatePresence>
+              </NavLink>
+            )}
             {userProfile?.role === 'admin' && (
               <NavLink
                 to="/settings"
