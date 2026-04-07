@@ -130,9 +130,15 @@ async def record_openai_call(
         pass
 
     rates = await _get_rates("openai", model, "chat")
+    # Cached input tokens (when present) are billed at a discounted rate.
+    # OpenAI reports prompt_tokens as the TOTAL input including cached, so we
+    # subtract the cached portion from the full-rate billing.
+    cached = int(cached_tokens or 0)
+    non_cached_input = max(prompt_tokens - cached, 0)
     cost = (
-        prompt_tokens * rates.get("token_input", 0.0)
-        + completion_tokens * rates.get("token_output", 0.0)
+        non_cached_input  * rates.get("token_input",        0.0)
+        + cached          * rates.get("token_cached_input", 0.0)
+        + completion_tokens * rates.get("token_output",     0.0)
     )
 
     await _insert_event(

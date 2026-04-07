@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS api_pricing_rates (
   model           text,
   operation       text NOT NULL,
   unit            text NOT NULL,
-  unit_cost_usd   numeric(14,8) NOT NULL,
+  unit_cost_usd   numeric(18,12) NOT NULL,
   effective_from  timestamptz NOT NULL DEFAULT now(),
   notes           text,
   CHECK (unit_cost_usd >= 0)
@@ -57,8 +57,9 @@ CREATE INDEX IF NOT EXISTS api_pricing_lookup
 -- Seed rates. Adjust unit_cost_usd in SQL whenever pricing changes; the
 -- backend cache (5 min TTL) will pick the new values up automatically.
 INSERT INTO api_pricing_rates(provider, model, operation, unit, unit_cost_usd, notes) VALUES
-  ('openai',     'gpt-5-mini', 'chat',   'token_input',  0.00000025, '$0.25 / 1M input tokens'),
-  ('openai',     'gpt-5-mini', 'chat',   'token_output', 0.00000200, '$2.00 / 1M output tokens'),
+  ('openai',     'gpt-5-mini', 'chat',   'token_input',         0.000000250, '$0.25  / 1M input tokens'),
+  ('openai',     'gpt-5-mini', 'chat',   'token_cached_input',  0.000000025, '$0.025 / 1M cached input tokens'),
+  ('openai',     'gpt-5-mini', 'chat',   'token_output',        0.000002000, '$2.00  / 1M output tokens'),
   ('brightdata', NULL,         'scrape', 'prompt',       0.00150000, '~$0.0015 per scraped prompt (confirm with real billing)'),
   ('onesearch',  NULL,         'scrape', 'prompt',       0.00100000, '~$0.001 per scraped prompt');
 
@@ -76,7 +77,7 @@ CREATE TABLE IF NOT EXISTS api_usage_events (
   cached_tokens     integer,
   reasoning_tokens  integer,
   units             integer,
-  cost_usd          numeric(14,8) NOT NULL DEFAULT 0,
+  cost_usd          numeric(18,12) NOT NULL DEFAULT 0,
   metadata          jsonb,
   CHECK (cost_usd >= 0)
 );
