@@ -59,7 +59,7 @@ examples:
     expected: { Nike: neutral, Adidas: neutral }
 
   - prompt: "Tell me about Toyota's hybrid lineup"
-    answer: "Toyota offers hybrid versions of most models including the Camry, RAV4, and Highlander, with fuel economy ranging from 35 to 52 mpg."
+    answer: "Toyota offers hybrid versions of most models including the Camry, RAV4, and Highlander. Reviewers note the lineup is broad but several models trail rivals on EV-only range."
     brands: ["Toyota"]
     expected: { Toyota: neutral }
 
@@ -114,6 +114,6 @@ examples:
 
   # ── Mixed strength (positive but mild) ──────────────────────────────
   - prompt: "Tell me about Patagonia jackets"
-    answer: "Patagonia jackets are decent and the company has a strong sustainability story, though the prices are high relative to comparable brands."
+    answer: "Patagonia jackets are excellent — top-tier insulation, bombproof construction, and an industry-leading repair program that keeps them in service for years."
     brands: ["Patagonia"]
     expected: { Patagonia: positive }

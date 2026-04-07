@@ -42,7 +42,19 @@ async def _call_openai(messages: list[dict], max_tokens: int = 2048,
 
         try:
             resp = await _client.chat.completions.create(**kwargs)
-            return resp.choices[0].message.content
+            choice = resp.choices[0]
+            content = choice.message.content
+            if not content:
+                # gpt-5-mini can burn the whole completion budget on hidden
+                # reasoning tokens and return empty content with finish_reason=length.
+                # Log enough to diagnose without leaking the prompt.
+                finish = getattr(choice, "finish_reason", "?")
+                usage = getattr(resp, "usage", None)
+                logger.warning(
+                    f"OpenAI returned empty content (finish_reason={finish}, "
+                    f"usage={usage}, max_tokens={max_tokens})"
+                )
+            return content
         except Exception as e:
             logger.error(f"OpenAI API error: {e}")
             raise
@@ -280,7 +292,9 @@ async def analyze_response_sentiment(
                 {"role": "system", "content": system_msg},
                 {"role": "user", "content": user_msg},
             ],
-            max_tokens=800,
+            # gpt-5-mini reserves a large slice of this budget for invisible
+            # reasoning tokens, so allocate generously per brand.
+            max_tokens=4000,
             response_format={"type": "json_schema", "json_schema": SENTIMENT_SCHEMA},
         )
         if not raw:
