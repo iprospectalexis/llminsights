@@ -167,6 +167,37 @@ async def _scheduler_tick():
         except Exception as e:
             logger.error(f"Scheduler: scheduled-audit dispatch error: {e}", exc_info=True)
 
+        # Auto-fail audits with no activity for 60 min, regardless of which
+        # in-progress state they are stuck in. Generalises the polling-only
+        # 30-min deadline and catches the `fetching → polling` handoff hole
+        # where a failed _trigger_jobs leaves an audit invisible to recovery.
+        try:
+            from app.database import AsyncSessionLocal
+            from sqlalchemy import text
+            async with AsyncSessionLocal() as s:
+                result = await s.execute(text("""
+                    UPDATE audits
+                    SET status = 'failed',
+                        pipeline_state = 'failed',
+                        current_step = NULL,
+                        finished_at = now(),
+                        locked_by = NULL,
+                        locked_at = NULL,
+                        error_message = COALESCE(error_message, 'Auto-failed: no activity for 60 minutes')
+                    WHERE pipeline_state IN ('fetching','polling','extracting_competitors','analyzing_sentiment','finalizing')
+                      AND COALESCE(last_activity_at, started_at, created_at) < now() - interval '60 minutes'
+                    RETURNING id
+                """))
+                killed = result.fetchall()
+                await s.commit()
+                if killed:
+                    logger.warning(
+                        f"Scheduler: auto-failed {len(killed)} stuck audit(s): "
+                        f"{[str(r[0]) for r in killed]}"
+                    )
+        except Exception as e:
+            logger.error(f"Scheduler: auto-fail sweep error: {e}", exc_info=True)
+
     # Get active audits
     active_audits = await audit_pipeline.get_active_audits()
     if not active_audits:
@@ -188,5 +219,8 @@ async def _scheduler_tick():
             finally:
                 await audit_pipeline.release(audit_id, WORKER_ID)
 
-    tasks = [_process_one(a) for a in active_audits]
-    await asyncio.gather(*tasks, return_exceptions=True)
+    # Fire-and-forget: don't block the tick on in-flight work. The semaphore
+    # caps real concurrency at 5; one slow handler can no longer freeze the
+    # entire 15s cycle and starve healthy audits.
+    for a in active_audits:
+        asyncio.create_task(_process_one(a))

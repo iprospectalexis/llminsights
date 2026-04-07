@@ -134,6 +134,12 @@ async def update_progress_counters(audit_id: str, **kwargs) -> None:
 
 POLLING_MAX_MINUTES = 30
 
+# Hard ceiling on a single handler invocation. If a handler hangs (slow OpenAI
+# response, network stall, etc.) `process_step` aborts via `asyncio.wait_for`
+# so the scheduler slot is freed and other audits keep moving. Must be longer
+# than the slowest healthy step.
+PER_STEP_TIMEOUT_SECONDS = 300  # 5 min
+
 
 async def handle_created(audit_id: str, worker_id: str) -> None:
     """
@@ -176,9 +182,14 @@ async def handle_polling(audit_id: str, worker_id: str) -> None:
         fetch_onesearch_results, _fetch_brightdata_result, collect_citations
     )
 
+    # Unconditional update — the state machine guarantees we only enter
+    # handle_polling once per audit per cycle, and the row update is idempotent.
+    # Previously this used status_filter="pending" which silently no-op'd if
+    # something else had already moved the row, leaving the modal stuck on
+    # "Sending requests" forever.
     await db.update_audit_step(audit_id, "parse", {
         "status": "running", "message": "Polling for LLM results..."
-    }, status_filter="pending")
+    })
 
     # Count expected vs received for progress
     all_responses = await db.get_all_responses_for_audit(audit_id)
@@ -736,7 +747,14 @@ async def process_step(audit: dict, worker_id: str) -> None:
         return
 
     try:
-        await handler(audit_id, worker_id)
+        await asyncio.wait_for(handler(audit_id, worker_id), timeout=PER_STEP_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        logger.error(
+            f"[pipeline] {audit_id} step '{state}' timed out after "
+            f"{PER_STEP_TIMEOUT_SECONDS}s — releasing slot, will retry next tick"
+        )
+        # Don't fail the audit — the next tick will retry. The 60-min auto-fail
+        # sweep in the scheduler will eventually catch genuinely dead audits.
     except Exception as e:
         logger.error(f"[pipeline] {audit_id} error in {state}: {e}", exc_info=True)
         # Don't fail immediately — allow retries on next tick
@@ -762,7 +780,9 @@ async def get_active_audits() -> list[dict]:
                OR (pipeline_state = 'created'
                    AND status IN ('running', 'pending')
                    AND created_at < now() - interval '2 minutes')
-            ORDER BY started_at ASC NULLS FIRST
-            LIMIT 10
+            -- Order by least-recently-touched so zombies drift to the bottom
+            -- and audits making progress get fair round-robin treatment.
+            ORDER BY COALESCE(last_activity_at, started_at) ASC NULLS FIRST
+            LIMIT 50
         """))
         return [dict(r._mapping) for r in result.fetchall()]
