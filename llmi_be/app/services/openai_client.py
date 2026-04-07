@@ -25,7 +25,7 @@ _semaphore = asyncio.Semaphore(5)
 _client = AsyncOpenAI(api_key=settings.openai_api_key)
 
 MODEL = "gpt-5-mini"
-SENTIMENT_PROMPT_VERSION = "v2-2026-04-07"
+SENTIMENT_PROMPT_VERSION = "v2.1-2026-04-07"
 
 
 async def _call_openai(messages: list[dict], max_tokens: int = 2048,
@@ -271,15 +271,36 @@ async def analyze_response_sentiment(
 
     user_msg = (
         "For each brand in the 'Brands to score' list, output one entry with:\n"
-        '- label: "positive" (favorable opinion), "negative" (unfavorable opinion / warning), '
-        '"neutral" (balanced or factual opinion), or "mention_only" '
-        "(brand is listed/named but no opinion is attached).\n"
+        '- label: one of "positive", "negative", "neutral", "mention_only".\n'
         "- score: signed float in [-1, 1]. mention_only -> 0; neutral -> 0; "
         "positive in (0, 1]; negative in [-1, 0). Magnitude reflects strength.\n"
         "- confidence: float in [0, 1] for how sure you are.\n"
         "- reasoning: one short sentence quoting the relevant part of the answer.\n\n"
-        "Use the user query to disambiguate framing (e.g. 'worst running shoes' inverts "
-        "the sentiment of a 'top recommendation').\n\n"
+        "LABEL DEFINITIONS — read carefully:\n"
+        '  • "positive": the answer expresses a clearly favorable evaluation of the brand '
+        "(praises quality, recommends it, highlights specific strengths).\n"
+        '  • "negative": the answer expresses a clearly unfavorable evaluation '
+        "(criticism, warning, problem reports, advises against).\n"
+        '  • "neutral": the answer expresses a balanced or explicitly factual evaluation '
+        "(e.g. compares trade-offs, gives specs without judgment, says 'depends on use case').\n"
+        '  • "mention_only": the brand is named or listed but the answer attaches NO '
+        "evaluation to it.\n\n"
+        "CRITICAL — words that DO NOT count as an opinion (use mention_only):\n"
+        '  - "popular", "well-known", "common", "widely used", "famous", "leading", '
+        '"major", "top brand" describe market presence, NOT the speaker\'s evaluation.\n'
+        '  - Pure enumeration ("brands include X, Y, Z") is mention_only for every brand '
+        "even if a generic adjective like 'popular' or 'major' is attached to the list.\n"
+        '  - A brand named only as a category example ("German automakers like BMW") is '
+        "mention_only.\n\n"
+        "TIE-BREAKERS:\n"
+        "  - In a side-by-side comparison where the same generic adjective ('solid', "
+        "'good', 'capable') is applied symmetrically to two or more brands and the rest "
+        "of the sentence describes their differences factually, label each brand neutral, "
+        "not positive.\n"
+        "  - In a multi-brand answer, score each brand independently — one brand being "
+        "praised does not change the label of another.\n"
+        "  - Use the user query to flip framing: 'worst running shoes' inverts the "
+        "sentiment of a 'top recommendation'.\n\n"
         f"{industry_line}"
         f"User query:\n{prompt_text}\n\n"
         f"Answer:\n{answer_text}\n\n"
