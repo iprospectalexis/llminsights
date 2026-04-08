@@ -40,6 +40,7 @@ interface DailyRow {
 interface ProjectRow {
   project_id: string;
   project_name: string;
+  prompts_count: number;
   audits_count: number;
   total_cost_usd: number;
   openai_cost_usd: number;
@@ -81,6 +82,7 @@ interface AuditRow {
   user_email: string | null;
   started_at: string | null;
   status: string | null;
+  prompts_count: number;
   total_cost_usd: number;
   openai_cost_usd: number;
   scrape_cost_usd: number;
@@ -522,6 +524,7 @@ const ProjectTable: React.FC<{ rows: ProjectRow[]; total: number }> = ({ rows, t
         <thead className="border-b border-gray-200 dark:border-gray-700">
           <tr>
             <Th>Project</Th>
+            <Th>Prompts</Th>
             <Th>Audits</Th>
             <Th>OpenAI</Th>
             <Th>Scrape</Th>
@@ -533,6 +536,7 @@ const ProjectTable: React.FC<{ rows: ProjectRow[]; total: number }> = ({ rows, t
           {rows.map((r) => (
             <tr key={r.project_id} className="hover:bg-gray-50 dark:hover:bg-gray-800/50">
               <Td className="font-medium text-gray-900 dark:text-white">{r.project_name || '—'}</Td>
+              <Td>{fmtInt(r.prompts_count)}</Td>
               <Td>{fmtInt(r.audits_count)}</Td>
               <Td>{fmtUsd(r.openai_cost_usd)}</Td>
               <Td>{fmtUsd(Number(r.brightdata_cost_usd) + Number(r.onesearch_cost_usd))}</Td>
@@ -629,6 +633,7 @@ const AuditTable: React.FC<{ rows: AuditRow[]; onDrill: (r: AuditRow) => void }>
             <Th>Project</Th>
             <Th>User</Th>
             <Th>Status</Th>
+            <Th>Prompts</Th>
             <Th>Scrape</Th>
             <Th>Extract</Th>
             <Th>Sentiment</Th>
@@ -654,6 +659,7 @@ const AuditTable: React.FC<{ rows: AuditRow[]; onDrill: (r: AuditRow) => void }>
                   {r.status || '—'}
                 </span>
               </Td>
+              <Td>{fmtInt(r.prompts_count)}</Td>
               <Td>{fmtUsd(r.scrape_cost_usd)}</Td>
               <Td>{fmtUsd(r.competitors_cost_usd)}</Td>
               <Td>{fmtUsd(r.sentiment_cost_usd)}</Td>
