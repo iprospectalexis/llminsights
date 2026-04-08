@@ -28,9 +28,11 @@ import {
   LayoutDashboard,
   Eye,
   X,
-  DollarSign
+  DollarSign,
+  Inbox
 } from 'lucide-react';
 import { useProject } from '../../contexts/ProjectContext';
+import { useUnreadTicketsCount } from '../../lib/tickets';
 
 interface NavigationItem {
   name: string;
@@ -59,6 +61,10 @@ interface SidebarProps {
 export const Sidebar: React.FC<SidebarProps> = ({ user, userProfile, isOpen, onToggleCollapse, collapsed, isMobile, onMobileClose }) => {
   const location = useLocation();
   const { selectedProject } = useProject();
+  const { count: unreadTicketsCount } = useUnreadTicketsCount(
+    user?.id ?? null,
+    userProfile?.role ?? null
+  );
   const [isCollapsed, setIsCollapsed] = useState(isMobile ? false : (collapsed || false));
 
   // On mobile, sidebar is always expanded
@@ -717,6 +723,46 @@ export const Sidebar: React.FC<SidebarProps> = ({ user, userProfile, isOpen, onT
                   </motion.span>
                 )}
               </AnimatePresence>
+            </NavLink>
+            <NavLink
+              to="/tickets"
+              className={`
+                relative flex items-center px-3 py-2.5 text-sm font-medium rounded-xl transition-all duration-200
+                ${location.pathname.startsWith('/tickets')
+                  ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-100'
+                  : 'text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800'
+                }
+                ${effectiveCollapsed ? 'justify-center' : ''}
+              `}
+              title={effectiveCollapsed ? 'Tickets' : ''}
+            >
+              <Inbox className={`w-5 h-5 ${effectiveCollapsed ? '' : 'mr-3'} flex-shrink-0`} />
+              <AnimatePresence>
+                {!effectiveCollapsed && (
+                  <motion.span
+                    initial={{ opacity: 0, width: 0 }}
+                    animate={{ opacity: 1, width: 'auto' }}
+                    exit={{ opacity: 0, width: 0 }}
+                    transition={{ duration: 0.2 }}
+                    className="overflow-hidden whitespace-nowrap flex-1"
+                  >
+                    Tickets
+                  </motion.span>
+                )}
+              </AnimatePresence>
+              {unreadTicketsCount > 0 && (
+                <span
+                  className={`
+                    ${effectiveCollapsed
+                      ? 'absolute top-1 right-1 w-2 h-2 rounded-full bg-red-500'
+                      : 'ml-auto inline-flex items-center justify-center min-w-[1.25rem] h-5 px-1.5 text-[10px] font-semibold rounded-full bg-red-500 text-white'
+                    }
+                  `}
+                  title={`${unreadTicketsCount} unread`}
+                >
+                  {effectiveCollapsed ? '' : unreadTicketsCount}
+                </span>
+              )}
             </NavLink>
             {(userProfile?.role === 'admin' || userProfile?.role === 'manager') && (
               <NavLink
