@@ -157,7 +157,16 @@ async def _heartbeat(audit_id: str) -> None:
 # Global per-audit safety net. The per-row exhaustion (MAX_POLL_ATTEMPTS_PER_ROW
 # below) usually fires first; this is the back-stop for audits where the row
 # state machine somehow drifted (e.g. clock skew, lost updates).
-POLLING_MAX_MINUTES = 10
+#
+# 2026-04-08: bumped from 10 → 90 after Balenciaga_AUDIT_FR_non branded lost
+# all 145 SearchGPT rows to a premature `polling_timeout` sweep. OneSearch
+# processes SearchGPT as a single batch job spanning every prompt in the
+# audit, and for 100+ prompts that batch can easily take 30–60 minutes to
+# complete. 10 min was shorter than the provider's own latency — perplexity
+# happened to finish inside the window and survived, searchgpt did not.
+# 90 min gives real headroom (provider SLA is ~60 min worst-case for 200
+# prompts) while still cutting off audits that have genuinely drifted.
+POLLING_MAX_MINUTES = 90
 
 # Per-row exhaustion. After this many polling attempts on a single row, mark
 # it `provider_no_response` so it stops blocking the audit. With a 15s tick,

@@ -275,39 +275,35 @@ class SupabaseDB:
     async def mark_polling_terminal(self, row_ids: list[str], reason: str) -> int:
         """Mark rows as terminally failed at polling. Returns rows updated.
 
-        Also writes a minimal sentinel into raw_response_data so the row
-        leaves the legacy `pending` set (answer_text NULL + raw_response_data
-        NULL) used by older callers.
+        Only touches `poll_terminal_reason` + `last_polled_at`. Does NOT
+        write anything into `raw_response_data`.
+
+        History: until 2026-04-08 this helper ALSO wrote a
+        `{'error': reason, 'failed_at': now()}` sentinel into
+        `raw_response_data` (COALESCE-guarded, so it never clobbered real
+        data). The stated reason was that a legacy `get_pending_responses`
+        helper defined the "pending" set as `answer_text IS NULL AND
+        raw_response_data IS NULL`, and without the sentinel terminal rows
+        would stay in that set forever. But grep confirms that legacy
+        helper has zero callers — every live path (`get_polling_status`,
+        `get_active_pending_responses`) already filters on
+        `poll_terminal_reason IS NULL`, so the sentinel was pure
+        landmine: after a premature `polling_timeout` sweep, there was
+        no way to recover the row by re-fetching from the provider,
+        because something that looked like a response was already there.
+        Dropping the sentinel makes recovery from a false-positive sweep
+        a simple `UPDATE llm_responses SET poll_terminal_reason = NULL`.
 
         See `mark_polling_attempt` for the `ANY(:ids)` rationale.
         """
         if not row_ids:
             return 0
-        # NB: :reason is cast to text explicitly because it appears twice
-        # — once in SET (typed by the column) and once inside
-        # jsonb_build_object('error', :reason, ...). SQLAlchemy collapses
-        # the two occurrences into a single bind ($1), and asyncpg cannot
-        # infer the type because `jsonb_build_object`'s signature is
-        # `(text, "any", ...)` — so $1 has no resolved type and the whole
-        # statement raises `AmbiguousParameterError`. This was the SECOND
-        # bug uncovered by `audit_pipeline_log` on 2026-04-08 (after the
-        # CAST(:ids AS uuid[]) fix landed) and was the actual root cause
-        # of the polling-stuck incident — the first fix was a red herring.
-        # `ANY(:ids)` is left untouched (matches `mark_polling_attempt`
-        # and the proven `get_prompt_texts` pattern).
         async with AsyncSessionLocal() as s:
             result = await s.execute(
                 text("""
                     UPDATE llm_responses
-                    SET poll_terminal_reason = CAST(:reason AS text),
-                        last_polled_at       = now(),
-                        raw_response_data    = COALESCE(
-                          raw_response_data,
-                          jsonb_build_object(
-                            'error',     CAST(:reason AS text),
-                            'failed_at', now()
-                          )
-                        )
+                    SET poll_terminal_reason = :reason,
+                        last_polled_at       = now()
                     WHERE id = ANY(:ids)
                     RETURNING id
                 """),
@@ -328,8 +324,16 @@ class SupabaseDB:
                 text("""
                     SELECT
                       count(*)                                                                    AS total,
+                      -- "received" = row has left the pending set for ANY reason
+                      -- (real data, raw provider dump, or terminal failure). This
+                      -- also counts terminal rows so the progress bar keeps
+                      -- moving instead of freezing when the provider drops some
+                      -- rows — the separate `terminal` column below still lets
+                      -- the caller distinguish successes from drops.
                       count(*) FILTER (
-                        WHERE answer_text IS NOT NULL OR raw_response_data IS NOT NULL
+                        WHERE answer_text IS NOT NULL
+                           OR raw_response_data IS NOT NULL
+                           OR poll_terminal_reason IS NOT NULL
                       )                                                                           AS received,
                       count(*) FILTER (
                         WHERE answer_text IS NULL
