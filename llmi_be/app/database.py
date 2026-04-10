@@ -11,13 +11,15 @@ engine_kwargs = {
 }
 
 if settings.is_postgres:
-    # PostgreSQL with asyncpg: connection pooling for concurrent jobs
-    # Keep pool small to stay within Supabase session-mode pooler limits
-    # (typically 15-20 max clients on small plans)
-    engine_kwargs["pool_size"] = 5
-    engine_kwargs["max_overflow"] = 10
+    # PostgreSQL with asyncpg via Supabase transaction-mode pooler (port 6543).
+    # Transaction mode returns connections after each TX, allowing ~200 concurrent
+    # clients vs ~15 in session mode. Requires statement_cache_size=0 because
+    # PgBouncer doesn't support prepared statements.
+    engine_kwargs["pool_size"] = 3
+    engine_kwargs["max_overflow"] = 5       # max 8 conn/worker × 2 workers = 16
     engine_kwargs["pool_pre_ping"] = True
-    engine_kwargs["pool_recycle"] = 300  # recycle connections every 5 min
+    engine_kwargs["pool_recycle"] = 300     # recycle connections every 5 min
+    engine_kwargs["connect_args"] = {"statement_cache_size": 0}
 else:
     # SQLite with aiosqlite: allow multi-thread access
     engine_kwargs["connect_args"] = {"check_same_thread": False}
