@@ -640,6 +640,20 @@ async def handle_polling(audit_id: str, worker_id: str) -> None:
             except Exception:
                 pass
 
+        # Re-read counters after persisting so the UI reflects reality
+        # immediately instead of lagging by one tick (~15s).
+        phase = "post_fetch_counters"
+        post_status = await db.get_polling_status(audit_id)
+        post_received = post_status["received"]
+        post_pending = post_status["active_pending"]
+        post_pct = min(round((post_received / total) * 60) if total else 0, 60)
+        await update_progress_counters(
+            audit_id,
+            responses_expected=total,
+            responses_received=post_received,
+            progress=post_pct,
+        )
+
         # Heartbeat at exit so long fetches don't look stale to auto-fail.
         phase = "heartbeat_out"
         await _heartbeat(audit_id)
