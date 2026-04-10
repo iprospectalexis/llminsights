@@ -288,6 +288,20 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
       }
     });
 
+    // Dates where at least one citation or one LLM response with an answer
+    // exists. Used for the default "Last Audit" filter so we don't point at
+    // a force-completed / crashed empty audit and render a blank page.
+    const datesWithData = new Set<string>();
+    processedCitations.forEach(citation => {
+      const d = citation.audits?.created_at?.split('T')[0];
+      if (d) datesWithData.add(d);
+    });
+    llmResponses.forEach(response => {
+      if (response.answer_text && response.audits?.created_at) {
+        datesWithData.add(response.audits.created_at.split('T')[0]);
+      }
+    });
+
     if (processedCitations.length > 0) {
       // Extract available dates from citations
       const dates = processedCitations.map(c => c.checked_at.split('T')[0]);
@@ -319,10 +333,15 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
       setAuditDates(sortedAuditDates);
       setCitationsByAudit(citationsByAuditDate);
 
-      // Set last audit date (most recent date)
-      if (sortedAuditDates.length > 0) {
-        const mostRecentDate = sortedAuditDates[sortedAuditDates.length - 1];
-        setLastAuditDate(mostRecentDate);
+      // Set last audit date — prefer the most recent date that actually
+      // has data. Fall back to the most recent audit date overall so the
+      // dropdown label still renders something when no audit has any data
+      // yet (freshly created project, everything still running, etc.).
+      const sortedDatesWithData = Array.from(datesWithData).sort();
+      if (sortedDatesWithData.length > 0) {
+        setLastAuditDate(sortedDatesWithData[sortedDatesWithData.length - 1]);
+      } else if (sortedAuditDates.length > 0) {
+        setLastAuditDate(sortedAuditDates[sortedAuditDates.length - 1]);
       }
     } else if (auditDatesFromAudits.size > 0) {
       // Even if no citations, show audit dates
@@ -330,12 +349,16 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
       setAuditDates(sortedAuditDates);
       setCitationsByAudit({});
 
-      if (sortedAuditDates.length > 0) {
-        const mostRecentDate = sortedAuditDates[sortedAuditDates.length - 1];
-        setLastAuditDate(mostRecentDate);
+      // Same preference as above — a date with llm_response answers beats
+      // an empty force-completed audit at the top of the list.
+      const sortedDatesWithData = Array.from(datesWithData).sort();
+      if (sortedDatesWithData.length > 0) {
+        setLastAuditDate(sortedDatesWithData[sortedDatesWithData.length - 1]);
+      } else if (sortedAuditDates.length > 0) {
+        setLastAuditDate(sortedAuditDates[sortedAuditDates.length - 1]);
       }
     }
-  }, [processedCitations, auditsData]);
+  }, [processedCitations, auditsData, llmResponses]);
 
   const calculateBrandLeadership = () => {
     try {
@@ -2811,30 +2834,29 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
 
     if (ownBrands.length === 0) return { rate: 0, mentioned: 0, total: 0 };
 
-    // Count unique prompts (to match Prompts page calculation)
-    const uniquePrompts = new Set<string>();
-    const promptsWithMentions = new Set<string>();
+    // Response-level calculation — matches the tooltip formula:
+    //   "Responses mentioning your brand / Total responses × 100"
+    // Every llm_responses row counts independently: a prompt that runs on
+    // N LLMs contributes N rows to the denominator, not 1. Previous versions
+    // de-duplicated by (audit_id, prompt_id) which silently collapsed
+    // multi-LLM runs and reported the wrong total (e.g. 240 instead of 480
+    // for a 2-LLM / 240-prompt project).
+    const relevantResponses = filteredLlmResponses.filter(
+      r => r.audit_id && r.prompt_id
+    );
 
-    filteredLlmResponses
-      .filter(r => r.audit_id && r.prompt_id)
-      .forEach(response => {
-        const promptKey = `${response.audit_id}-${response.prompt_id}`;
-        uniquePrompts.add(promptKey);
+    const total = relevantResponses.length;
+    if (total === 0) return { rate: 0, mentioned: 0, total: 0 };
 
-        const answerText = response.answer_text?.toLowerCase() || '';
-        const hasMention = ownBrands.some(brandName =>
-          answerText.includes(brandName.toLowerCase())
-        );
+    const mentioned = relevantResponses.filter(response => {
+      const answerText = response.answer_text?.toLowerCase() || '';
+      return ownBrands.some(brandName =>
+        answerText.includes(brandName.toLowerCase())
+      );
+    }).length;
 
-        if (hasMention) {
-          promptsWithMentions.add(promptKey);
-        }
-      });
-
-    if (uniquePrompts.size === 0) return { rate: 0, mentioned: 0, total: 0 };
-
-    const rate = Math.round((promptsWithMentions.size / uniquePrompts.size) * 100);
-    return { rate, mentioned: promptsWithMentions.size, total: uniquePrompts.size };
+    const rate = Math.round((mentioned / total) * 100);
+    return { rate, mentioned, total };
   };
 
   // Calculate brand mentions data based on filtered responses
@@ -3470,7 +3492,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                     Citation Rate
                   </div>
                   <div className="text-xs text-white/70 mt-1">
-                    {getCitationRate().cited} of {getCitationRate().total} prompts cite your domain
+                    {getCitationRate().cited} of {getCitationRate().total} responses cite your domain
                   </div>
                 </div>
 
@@ -3490,7 +3512,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                     Mention Rate
                   </div>
                   <div className="text-xs text-white/70 mt-1">
-                    {getMentionRate().mentioned} of {getMentionRate().total} prompts mention your brand
+                    {getMentionRate().mentioned} of {getMentionRate().total} responses mention your brand
                   </div>
                 </div>
 
