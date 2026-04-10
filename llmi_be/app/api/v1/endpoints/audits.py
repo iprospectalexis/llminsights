@@ -141,8 +141,13 @@ async def trigger_onesearch_job(
     audit_id: Optional[str] = None,
     project_id: Optional[str] = None,
     user_id: Optional[str] = None,
+    max_retries: int = 3,
 ) -> str:
-    """Trigger a job on the OneSearch backend API (self — local)."""
+    """Trigger a job on the OneSearch backend API (self — local).
+
+    Retries up to `max_retries` times with exponential backoff (1s, 3s, 9s)
+    to handle transient network / OneSearch outages.
+    """
     provider = (provider_config or {}).get("provider", "brightdata")
     payload = {
         "prompts": prompts,
@@ -160,11 +165,32 @@ async def trigger_onesearch_job(
     if onesearch_key:
         headers["X-API-Key"] = onesearch_key
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(f"{onesearch_url}/api/v1/jobs", headers=headers, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-        logger.info(f"[run-audit] {llm}: job {data['id']} created ({len(prompts)} prompts)")
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(f"{onesearch_url}/api/v1/jobs", headers=headers, json=payload)
+                resp.raise_for_status()
+                data = resp.json()
+                if attempt > 1:
+                    logger.info(f"[run-audit] {llm}: job {data['id']} created on attempt {attempt}")
+                else:
+                    logger.info(f"[run-audit] {llm}: job {data['id']} created ({len(prompts)} prompts)")
+                break  # success
+        except Exception as e:
+            last_err = e
+            if attempt < max_retries:
+                delay = 3 ** (attempt - 1)  # 1s, 3s, 9s
+                logger.warning(
+                    f"[run-audit] {llm}: trigger attempt {attempt}/{max_retries} failed: {e} "
+                    f"— retrying in {delay}s"
+                )
+                await asyncio.sleep(delay)
+            else:
+                logger.error(
+                    f"[run-audit] {llm}: all {max_retries} trigger attempts failed: {e}"
+                )
+                raise last_err
 
     # Best-effort cost capture (Brightdata / OneSearch — 1 job × N prompts).
     if audit_id:
@@ -312,6 +338,29 @@ async def run_audit(req: RunAuditRequest, background_tasks: BackgroundTasks):
 
             successful = sum(1 for r in llm_responses if r.get("job_id"))
             total = len(llm_responses)
+
+            # ── Guard: fail audit if zero jobs were triggered ──────────
+            if total > 0 and successful == 0:
+                logger.error(
+                    f"[run-audit] {audit_id}: 0/{total} jobs triggered — "
+                    f"failing audit (OneSearch unreachable after retries)"
+                )
+                await db.update_audit(audit_id, {
+                    "status": "failed",
+                    "pipeline_state": "failed",
+                    "progress": 0,
+                    "responses_expected": total,
+                    "error_message": (
+                        f"All {len(audit_llms)} LLM job triggers failed after retries. "
+                        f"OneSearch API may be unreachable."
+                    ),
+                })
+                await db.update_audit_step(audit_id, "fetch", {
+                    "status": "error",
+                    "message": f"0/{total} LLM jobs triggered — all providers failed",
+                })
+                return  # Don't transition to polling
+
             progress = round((successful / total) * 10) if total else 0
 
             await db.update_audit(audit_id, {

@@ -292,6 +292,35 @@ async def handle_polling(audit_id: str, worker_id: str) -> None:
         # ── Branch 1: nothing left to actively poll → single transition ─
         phase = "branch_active_zero"
         if total > 0 and active_pending == 0:
+            # Safety net: if ALL responses were "received" but NONE have
+            # answer_text, the audit has no usable data (e.g. all OneSearch
+            # triggers failed). Fail instead of running an empty pipeline.
+            phase = "branch_active_zero_answer_check"
+            answer_count_row = await db.execute_scalar(
+                "SELECT count(*) FROM llm_responses "
+                "WHERE audit_id = :aid AND answer_text IS NOT NULL",
+                {"aid": audit_id},
+            )
+            answer_count = answer_count_row or 0
+            if answer_count == 0:
+                logger.error(
+                    f"[polling] {audit_id}: 0/{total} responses have answer_text "
+                    f"— failing audit (no usable data)"
+                )
+                await db.update_audit(audit_id, {
+                    "status": "failed",
+                    "pipeline_state": "failed",
+                    "error_message": (
+                        f"Polling finished but 0/{total} responses contain data. "
+                        f"All provider jobs may have failed."
+                    ),
+                })
+                await db.update_audit_step(audit_id, "parse", {
+                    "status": "error",
+                    "message": f"0/{total} responses have answers — no data to process",
+                })
+                return
+
             msg = (
                 f"{received}/{total} received ({terminal} dropped by provider)"
                 if terminal else f"All {total} responses received"

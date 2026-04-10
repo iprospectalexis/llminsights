@@ -71,6 +71,15 @@ class SupabaseDB:
     async def _session(self) -> AsyncSession:
         return AsyncSessionLocal()
 
+    # ── Generic helpers ─────────────────────────────────────────────
+
+    async def execute_scalar(self, sql: str, params: dict | None = None):
+        """Run a SQL query and return the first column of the first row."""
+        async with AsyncSessionLocal() as s:
+            result = await s.execute(text(sql), params or {})
+            row = result.first()
+            return row[0] if row else None
+
     # ── Audits ────────────────────────────────────────────────────────
 
     async def get_audit(self, audit_id: str) -> Optional[dict]:
