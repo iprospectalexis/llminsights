@@ -35,6 +35,7 @@ WORKER_ID = str(uuid.uuid4())[:8]
 # ── State transitions ────────────────────────────────────────────────
 
 VALID_TRANSITIONS = {
+    "fetching": "polling",
     "created": "polling",
     "polling": "extracting_competitors",
     "extracting_competitors": "analyzing_sentiment",
@@ -192,6 +193,62 @@ PER_STEP_TIMEOUT_SECONDS = 1800  # 30 min — 600s was too tight for 200+ respon
 MAX_BATCHES_PER_INVOCATION = 20  # = 200 responses with batch_size=10 (fits in 1800s timeout)
 
 
+async def handle_fetching(audit_id: str, worker_id: str) -> None:
+    """
+    Recovery handler for audits stuck in `pipeline_state='fetching'`.
+
+    The `run_audit` endpoint sets 'fetching' and launches `_trigger_jobs` as a
+    BackgroundTask. If that background task crashes (connection error, OOM,
+    worker restart) before transitioning to 'polling', the audit is invisible
+    to the main scheduler and rots until the 60-min auto-fail sweep.
+
+    Strategy:
+      - If `llm_responses` rows already exist → transition to 'polling'.
+        The polling handler is idempotent and will pick up from there.
+      - If 0 responses and audit is older than 5 min → fail (trigger never ran).
+      - Otherwise → do nothing; the background task may still be running.
+    """
+    all_responses = await db.get_all_responses_for_audit(audit_id)
+
+    if all_responses:
+        logger.warning(
+            f"[pipeline] {audit_id}: recovering from 'fetching' state "
+            f"({len(all_responses)} responses found) → polling"
+        )
+        transitioned = await transition_state(audit_id, "fetching", "polling", worker_id)
+        if transitioned:
+            logger.info(f"[pipeline] {audit_id}: fetching → polling (recovery)")
+        else:
+            logger.warning(f"[pipeline] {audit_id}: CAS fetching→polling failed (will retry)")
+        return
+
+    # No responses yet — check how old the audit is
+    audit_row = await db.get_audit(audit_id)
+    anchor = (audit_row or {}).get("started_at") or (audit_row or {}).get("created_at")
+    if isinstance(anchor, str):
+        try:
+            anchor = datetime.fromisoformat(anchor.replace("Z", "+00:00"))
+        except ValueError:
+            anchor = None
+
+    if anchor and (datetime.now(timezone.utc) - anchor) > timedelta(minutes=5):
+        logger.error(
+            f"[pipeline] {audit_id}: stuck in 'fetching' with 0 responses "
+            f"for >5 min — background trigger never completed, failing"
+        )
+        await fail_audit(
+            audit_id,
+            "Stuck in 'fetching' with no llm_responses — job trigger task crashed"
+        )
+        return
+
+    # < 5 min and no responses: background task may still be running, skip.
+    logger.info(
+        f"[pipeline] {audit_id}: in 'fetching' with 0 responses, "
+        f"waiting for background trigger task to finish"
+    )
+
+
 async def handle_created(audit_id: str, worker_id: str) -> None:
     """
     Recovery handler for audits stuck in `pipeline_state='created'`.
@@ -333,6 +390,11 @@ async def handle_polling(audit_id: str, worker_id: str) -> None:
             )
             if transitioned:
                 logger.info(f"[polling] {audit_id}: polling → extracting_competitors")
+            else:
+                logger.warning(
+                    f"[polling] {audit_id}: CAS transition polling→extracting_competitors "
+                    f"FAILED (will retry next tick)"
+                )
             return
 
         # ── Branch 2: global safety-net deadline ────────────────────────
@@ -1051,6 +1113,7 @@ async def handle_finalize(audit_id: str, worker_id: str) -> None:
 # ── Main dispatcher ──────────────────────────────────────────────────
 
 HANDLERS = {
+    "fetching": handle_fetching,
     "created": handle_created,
     "polling": handle_polling,
     "extracting_competitors": handle_competitors,
@@ -1126,6 +1189,9 @@ async def get_active_audits() -> list[dict]:
                OR (pipeline_state = 'created'
                    AND status IN ('running', 'pending')
                    AND created_at < now() - interval '2 minutes')
+               OR (pipeline_state = 'fetching'
+                   AND status = 'running'
+                   AND started_at < now() - interval '2 minutes')
             -- Order by least-recently-touched so zombies drift to the bottom
             -- and audits making progress get fair round-robin treatment.
             ORDER BY COALESCE(last_activity_at, started_at) ASC NULLS FIRST
