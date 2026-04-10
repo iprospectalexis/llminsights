@@ -496,7 +496,6 @@ class SupabaseDB:
                     WHERE lr.audit_id = :aid
                       AND lr.answer_text IS NOT NULL
                       AND (lr.answer_competitors IS NULL
-                           OR lr.answer_competitors = '{"brands": []}'::jsonb
                            OR (lr.answer_competitors ? 'error'
                                AND COALESCE(
                                    (lr.answer_competitors->>'_retry')::int, 0

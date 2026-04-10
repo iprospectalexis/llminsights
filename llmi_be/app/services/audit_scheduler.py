@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 # Max concurrent audit processing
 _semaphore = asyncio.Semaphore(5)
+_in_flight: set[str] = set()  # audit IDs currently being processed (prevents overlapping tasks)
 _running = False
 _scheduled_tick_counter = 0  # only dispatch scheduled audits every Nth tick
 
@@ -296,24 +297,33 @@ async def _scheduler_tick():
     if not active_audits:
         return
 
-    logger.info(f"Scheduler: {len(active_audits)} active audit(s)")
+    logger.info(f"Scheduler: {len(active_audits)} active audit(s) ({len(_in_flight)} in-flight)")
 
     async def _process_one(audit: dict):
-        async with _semaphore:
-            audit_id = str(audit["id"])
-            claimed = await audit_pipeline.try_claim(audit_id, WORKER_ID)
-            if not claimed:
-                return  # Another worker/tick owns it
+        audit_id = str(audit["id"])
+        # Guard: skip if a task from a previous tick is still processing this audit.
+        # Without this, overlapping ticks create duplicate tasks that fight over
+        # CAS locks and corrupt state transitions.
+        if audit_id in _in_flight:
+            return
+        _in_flight.add(audit_id)
+        try:
+            async with _semaphore:
+                claimed = await audit_pipeline.try_claim(audit_id, WORKER_ID)
+                if not claimed:
+                    return  # Another worker/tick owns it
 
-            try:
-                await audit_pipeline.process_step(audit, WORKER_ID)
-            except Exception as e:
-                logger.error(f"Scheduler pipeline error for {audit_id}: {e}")
-            finally:
-                await audit_pipeline.release(audit_id, WORKER_ID)
+                try:
+                    await audit_pipeline.process_step(audit, WORKER_ID)
+                except Exception as e:
+                    logger.error(f"Scheduler pipeline error for {audit_id}: {e}")
+                finally:
+                    await audit_pipeline.release(audit_id, WORKER_ID)
+        finally:
+            _in_flight.discard(audit_id)
 
     # Fire-and-forget: don't block the tick on in-flight work. The semaphore
-    # caps real concurrency at 5; one slow handler can no longer freeze the
-    # entire 15s cycle and starve healthy audits.
+    # caps real concurrency at 5; the _in_flight set prevents duplicate tasks
+    # for the same audit across overlapping ticks.
     for a in active_audits:
         asyncio.create_task(_process_one(a))

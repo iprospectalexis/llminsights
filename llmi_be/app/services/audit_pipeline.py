@@ -736,6 +736,11 @@ async def handle_competitors(audit_id: str, worker_id: str) -> None:
             logger.info(
                 f"[pipeline] {audit_id}: extracting_competitors → analyzing_sentiment"
             )
+        else:
+            logger.warning(
+                f"[pipeline] {audit_id}: CAS transition extracting_competitors→analyzing_sentiment "
+                f"FAILED (will retry next tick)"
+            )
         return
 
     pending_count = len(pending)
@@ -968,7 +973,24 @@ async def handle_sentiment(audit_id: str, worker_id: str) -> None:
             answer_text = resp.get("answer_text") or ""
             detected = detect_brands_in_text(answer_text, all_specs)
             if not detected:
-                return [], []
+                # No brands found — insert a sentinel row into response_brand_sentiment
+                # so the NOT EXISTS filter skips this response on the next tick.
+                # Without this, responses with no brands loop forever.
+                sentinel = [{
+                    "response_id": str(resp["id"]),
+                    "audit_id": audit_id,
+                    "brand": "__none__",
+                    "brand_kind": "none",
+                    "label": "mention_only",
+                    "score": 0.0,
+                    "confidence": 1.0,
+                    "reasoning": "No brands detected in response text",
+                    "is_fallback": True,
+                    "model": openai_client.MODEL_SENTIMENT,
+                    "prompt_version": openai_client.SENTIMENT_PROMPT_VERSION,
+                }]
+                legacy = [{"id": str(resp["id"]), "score": 0.0, "label": "neutral"}]
+                return sentinel, legacy
 
             cache_key = _sentiment_cache_key(
                 answer_text, detected, openai_client.MODEL, openai_client.SENTIMENT_PROMPT_VERSION,
