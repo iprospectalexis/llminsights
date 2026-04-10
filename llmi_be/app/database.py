@@ -12,9 +12,12 @@ engine_kwargs = {
 
 if settings.is_postgres:
     # PostgreSQL with asyncpg: connection pooling for concurrent jobs
-    engine_kwargs["pool_size"] = 10
-    engine_kwargs["max_overflow"] = 20
+    # Keep pool small to stay within Supabase session-mode pooler limits
+    # (typically 15-20 max clients on small plans)
+    engine_kwargs["pool_size"] = 5
+    engine_kwargs["max_overflow"] = 10
     engine_kwargs["pool_pre_ping"] = True
+    engine_kwargs["pool_recycle"] = 300  # recycle connections every 5 min
 else:
     # SQLite with aiosqlite: allow multi-thread access
     engine_kwargs["connect_args"] = {"check_same_thread": False}
