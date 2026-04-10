@@ -391,31 +391,76 @@ class SupabaseDB:
     async def upsert_llm_responses(self, updates: list[dict]) -> None:
         """Batch upsert llm_responses by id.
 
-        Treats `updates` as read-only — earlier versions did
-        `u.pop("id", None)` which silently mutated the caller's list and
-        caused a KeyError in `handle_polling`'s exhaustion_sweep when it
-        tried to read `u["id"]` afterwards. Now we copy each dict before
-        building the SET clause and never touch the original.
+        Groups rows by their column set, then uses UPDATE … FROM VALUES
+        for each group. Falls back to per-row UPDATE for groups with
+        jsonb columns that need casting.
+
+        Treats `updates` as read-only.
         """
         if not updates:
             return
+
+        # Group by column set so we can batch rows with identical shapes
+        from collections import defaultdict
+        groups: dict[frozenset[str], list[dict]] = defaultdict(list)
+        for original in updates:
+            u = dict(original)
+            uid = u.pop("id", None)
+            if not uid:
+                continue
+            u["id"] = uid  # keep id in the dict for batching
+            cols = frozenset(k for k in u if k != "id")
+            groups[cols].append(u)
+
+        CHUNK = 50
         async with AsyncSessionLocal() as s:
-            for original in updates:
-                u = dict(original)             # local working copy
-                uid = u.pop("id", None)
-                if not uid:
-                    continue
-                parts = []
-                params = {"id": uid}
-                for k, v in u.items():
-                    sv = _serialize_value(v, k)
-                    params[k] = sv
-                    if _needs_jsonb_cast(v, k):
-                        parts.append(f"{k} = CAST(:{k} AS jsonb)")
-                    else:
-                        parts.append(f"{k} = :{k}")
-                set_clause = ", ".join(parts)
-                await s.execute(text(f"UPDATE llm_responses SET {set_clause} WHERE id = :id"), params)
+            for cols_set, rows in groups.items():
+                cols = sorted(cols_set)
+                # Check if any column needs jsonb cast (use first row as representative)
+                sample = rows[0]
+                has_jsonb = any(_needs_jsonb_cast(sample.get(c), c) for c in cols)
+
+                if has_jsonb:
+                    # Jsonb columns need per-row CAST — batch is harder, use small-batch approach
+                    for row in rows:
+                        parts = []
+                        params: dict[str, Any] = {"id": row["id"]}
+                        for k in cols:
+                            sv = _serialize_value(row[k], k)
+                            params[k] = sv
+                            if _needs_jsonb_cast(row[k], k):
+                                parts.append(f"{k} = CAST(:{k} AS jsonb)")
+                            else:
+                                parts.append(f"{k} = :{k}")
+                        set_clause = ", ".join(parts)
+                        await s.execute(
+                            text(f"UPDATE llm_responses SET {set_clause} WHERE id = :id"),
+                            params,
+                        )
+                else:
+                    # Pure scalar columns — use UPDATE … FROM VALUES
+                    for i in range(0, len(rows), CHUNK):
+                        chunk = rows[i : i + CHUNK]
+                        # Build VALUES list with typed casts
+                        v_cols = ["id"] + cols
+                        values_parts = []
+                        params = {}
+                        for j, row in enumerate(chunk):
+                            ph = [f":id_{j}::uuid"]
+                            params[f"id_{j}"] = row["id"]
+                            for c in cols:
+                                sv = _serialize_value(row[c], c)
+                                params[f"{c}_{j}"] = sv
+                                ph.append(f":{c}_{j}")
+                            values_parts.append(f"({', '.join(ph)})")
+                        set_clause = ", ".join(f"{c} = v.{c}" for c in cols)
+                        v_col_list = ", ".join(v_cols)
+                        sql = f"""
+                            UPDATE llm_responses SET {set_clause}
+                            FROM (VALUES {', '.join(values_parts)}) AS v({v_col_list})
+                            WHERE llm_responses.id = v.id
+                        """
+                        await s.execute(text(sql), params)
             await s.commit()
 
     async def get_all_responses_for_audit(self, audit_id: str) -> list[dict]:
@@ -445,16 +490,26 @@ class SupabaseDB:
             return [dict(r) for r in rows]
 
     async def update_competitors_batch(self, updates: list[dict]) -> None:
-        """Batch update answer_competitors for multiple responses."""
+        """Batch-update answer_competitors using UPDATE … FROM VALUES."""
         if not updates:
             return
+        CHUNK = 100
         async with AsyncSessionLocal() as s:
-            for u in updates:
-                comp = _serialize_value(u["competitors"])
-                await s.execute(
-                    text("UPDATE llm_responses SET answer_competitors = CAST(:competitors AS jsonb) WHERE id = :id"),
-                    {"id": u["id"], "competitors": comp},
-                )
+            for i in range(0, len(updates), CHUNK):
+                chunk = updates[i : i + CHUNK]
+                values_parts = []
+                params: dict[str, Any] = {}
+                for j, u in enumerate(chunk):
+                    values_parts.append(f"(:id_{j}::uuid, :comp_{j}::jsonb)")
+                    params[f"id_{j}"] = u["id"]
+                    params[f"comp_{j}"] = _serialize_value(u["competitors"])
+                sql = f"""
+                    UPDATE llm_responses SET
+                      answer_competitors = v.competitors
+                    FROM (VALUES {', '.join(values_parts)}) AS v(id, competitors)
+                    WHERE llm_responses.id = v.id
+                """
+                await s.execute(text(sql), params)
             await s.commit()
 
     async def get_responses_for_sentiment(self, audit_id: str) -> list[dict]:
@@ -472,14 +527,28 @@ class SupabaseDB:
             return [dict(r) for r in rows]
 
     async def update_sentiment_batch(self, updates: list[dict]) -> None:
+        """Batch-update legacy sentiment columns using UPDATE … FROM VALUES."""
         if not updates:
             return
+        CHUNK = 200
         async with AsyncSessionLocal() as s:
-            for u in updates:
-                await s.execute(
-                    text("UPDATE llm_responses SET sentiment_score = :score, sentiment_label = :label WHERE id = :id"),
-                    u,
-                )
+            for i in range(0, len(updates), CHUNK):
+                chunk = updates[i : i + CHUNK]
+                values_parts = []
+                params: dict[str, Any] = {}
+                for j, u in enumerate(chunk):
+                    values_parts.append(f"(:id_{j}::uuid, :score_{j}::numeric, :label_{j}::text)")
+                    params[f"id_{j}"] = u["id"]
+                    params[f"score_{j}"] = u["score"]
+                    params[f"label_{j}"] = u["label"]
+                sql = f"""
+                    UPDATE llm_responses SET
+                      sentiment_score = v.score,
+                      sentiment_label = v.label
+                    FROM (VALUES {', '.join(values_parts)}) AS v(id, score, label)
+                    WHERE llm_responses.id = v.id
+                """
+                await s.execute(text(sql), params)
             await s.commit()
 
     # ── Sentiment V2 ──────────────────────────────────────────────────
@@ -509,31 +578,42 @@ class SupabaseDB:
             return [dict(r) for r in rows]
 
     async def upsert_response_brand_sentiment(self, rows: list[dict]) -> None:
-        """Insert per-brand-per-response sentiment rows. ON CONFLICT updates."""
+        """Insert per-brand-per-response sentiment rows. ON CONFLICT updates.
+
+        Uses multi-value INSERT in chunks of 100 to avoid N+1 query overhead.
+        """
         if not rows:
             return
+        _COLS = [
+            "response_id", "audit_id", "brand", "brand_kind", "label", "score",
+            "confidence", "reasoning", "is_fallback", "model", "prompt_version",
+        ]
+        CHUNK = 100
         async with AsyncSessionLocal() as s:
-            for r in rows:
-                await s.execute(
-                    text("""
-                        INSERT INTO response_brand_sentiment
-                          (response_id, audit_id, brand, brand_kind, label, score,
-                           confidence, reasoning, is_fallback, model, prompt_version)
-                        VALUES
-                          (:response_id, :audit_id, :brand, :brand_kind, :label, :score,
-                           :confidence, :reasoning, :is_fallback, :model, :prompt_version)
-                        ON CONFLICT (response_id, brand) DO UPDATE SET
-                          brand_kind = EXCLUDED.brand_kind,
-                          label = EXCLUDED.label,
-                          score = EXCLUDED.score,
-                          confidence = EXCLUDED.confidence,
-                          reasoning = EXCLUDED.reasoning,
-                          is_fallback = EXCLUDED.is_fallback,
-                          model = EXCLUDED.model,
-                          prompt_version = EXCLUDED.prompt_version
-                    """),
-                    r,
-                )
+            for i in range(0, len(rows), CHUNK):
+                chunk = rows[i : i + CHUNK]
+                values_parts = []
+                params: dict[str, Any] = {}
+                for j, r in enumerate(chunk):
+                    placeholders = ", ".join(f":{c}_{j}" for c in _COLS)
+                    values_parts.append(f"({placeholders})")
+                    for c in _COLS:
+                        params[f"{c}_{j}"] = r[c]
+                sql = f"""
+                    INSERT INTO response_brand_sentiment
+                      ({', '.join(_COLS)})
+                    VALUES {', '.join(values_parts)}
+                    ON CONFLICT (response_id, brand) DO UPDATE SET
+                      brand_kind = EXCLUDED.brand_kind,
+                      label = EXCLUDED.label,
+                      score = EXCLUDED.score,
+                      confidence = EXCLUDED.confidence,
+                      reasoning = EXCLUDED.reasoning,
+                      is_fallback = EXCLUDED.is_fallback,
+                      model = EXCLUDED.model,
+                      prompt_version = EXCLUDED.prompt_version
+                """
+                await s.execute(text(sql), params)
             await s.commit()
 
     async def get_brand_specs(self, audit_id: str) -> tuple[list[dict], list[dict]]:
@@ -617,11 +697,28 @@ class SupabaseDB:
             await s.commit()
 
     async def insert_citations_batch(self, citations: list[dict]) -> None:
+        """Batch-insert citations using multi-value INSERT, chunks of 100."""
         if not citations:
             return
+        _COLS = [
+            "audit_id", "prompt_id", "llm", "page_url", "domain",
+            "citation_text", "position", "checked_at", "cited",
+        ]
+        CHUNK = 100
         async with AsyncSessionLocal() as s:
-            for c in citations:
-                sql, params = _build_insert("citations", c, returning=False)
+            for i in range(0, len(citations), CHUNK):
+                chunk = citations[i : i + CHUNK]
+                values_parts = []
+                params: dict[str, Any] = {}
+                for j, c in enumerate(chunk):
+                    placeholders = ", ".join(f":{col}_{j}" for col in _COLS)
+                    values_parts.append(f"({placeholders})")
+                    for col in _COLS:
+                        params[f"{col}_{j}"] = c.get(col)
+                sql = f"""
+                    INSERT INTO citations ({', '.join(_COLS)})
+                    VALUES {', '.join(values_parts)}
+                """
                 await s.execute(text(sql), params)
             await s.commit()
 

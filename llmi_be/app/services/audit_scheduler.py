@@ -198,6 +198,23 @@ async def _scheduler_tick():
         except Exception as e:
             logger.error(f"Scheduler: auto-fail sweep error: {e}", exc_info=True)
 
+        # Staleness warning: flag audits with no activity for 5+ min (pre-zombie detection)
+        try:
+            async with AsyncSessionLocal() as s:
+                stale_rows = (await s.execute(text("""
+                    SELECT id, pipeline_state,
+                           EXTRACT(EPOCH FROM now() - COALESCE(last_activity_at, started_at, created_at))::int AS stale_seconds
+                    FROM audits
+                    WHERE pipeline_state IN ('fetching','polling','extracting_competitors','analyzing_sentiment','finalizing')
+                      AND COALESCE(last_activity_at, started_at, created_at) < now() - interval '5 minutes'
+                """))).fetchall()
+                for row in stale_rows:
+                    logger.warning(
+                        f"Scheduler: audit {row[0]} stale for {row[2]}s in state '{row[1]}' — may become zombie"
+                    )
+        except Exception as e:
+            logger.warning(f"Scheduler: staleness check error: {e}")
+
     # Get active audits
     active_audits = await audit_pipeline.get_active_audits()
     if not active_audits:
