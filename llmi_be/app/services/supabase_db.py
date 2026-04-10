@@ -455,7 +455,7 @@ class SupabaseDB:
                         values_parts = []
                         params = {}
                         for j, row in enumerate(chunk):
-                            ph = [f":id_{j}::uuid"]
+                            ph = [f"CAST(:id_{j} AS uuid)"]
                             params[f"id_{j}"] = row["id"]
                             for c in cols:
                                 sv = _serialize_value(row[c], c)
@@ -517,7 +517,7 @@ class SupabaseDB:
                 values_parts = []
                 params: dict[str, Any] = {}
                 for j, u in enumerate(chunk):
-                    values_parts.append(f"(:id_{j}::uuid, :comp_{j}::jsonb)")
+                    values_parts.append(f"(CAST(:id_{j} AS uuid), CAST(:comp_{j} AS jsonb))")
                     params[f"id_{j}"] = u["id"]
                     params[f"comp_{j}"] = _serialize_value(u["competitors"])
                 sql = f"""
@@ -554,7 +554,7 @@ class SupabaseDB:
                 values_parts = []
                 params: dict[str, Any] = {}
                 for j, u in enumerate(chunk):
-                    values_parts.append(f"(:id_{j}::uuid, :score_{j}::numeric, :label_{j}::text)")
+                    values_parts.append(f"(CAST(:id_{j} AS uuid), CAST(:score_{j} AS numeric), CAST(:label_{j} AS text))")
                     params[f"id_{j}"] = u["id"]
                     params[f"score_{j}"] = u["score"]
                     params[f"label_{j}"] = u["label"]
