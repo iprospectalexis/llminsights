@@ -13,6 +13,7 @@ import { ProjectPagesPage } from './pages/ProjectPagesPage';
 import { ProjectDomainsPage } from './pages/ProjectDomainsPage';
 import { ProjectMentionsPage } from './pages/ProjectMentionsPage';
 import { ProjectInsightsPage } from './pages/ProjectInsightsPage';
+import { ProjectSentimentPage } from './pages/ProjectSentimentPage';
 import { ProjectSettingsPage } from './pages/ProjectSettingsPage';
 import { PromptDetailPage } from './pages/PromptDetailPage';
 import { DomainDetailPage } from './pages/DomainDetailPage';
@@ -50,6 +51,7 @@ function App() {
             <Route path="projects/:id/pages" element={<ProjectPagesPage />} />
             <Route path="projects/:id/domains" element={<ProjectDomainsPage />} />
             <Route path="projects/:id/mentions" element={<ProjectMentionsPage />} />
+            <Route path="projects/:id/sentiment" element={<ProjectSentimentPage />} />
             <Route path="projects/:id/insights" element={<ProjectInsightsPage />} />
             <Route path="projects/:id/settings" element={<ProjectSettingsPage />} />
             <Route path="projects/:projectId/prompts/:promptId" element={<PromptDetailPage />} />
