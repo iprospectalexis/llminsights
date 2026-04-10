@@ -12,11 +12,15 @@ by the manual UI button. This replaces the legacy `process-scheduled-audits-job`
 pg_cron, which dispatched via a Supabase edge function and produced audits
 with `pipeline_state='created'` that the pipeline never picked up.
 
+On startup, `recover_stale_audits()` re-activates any audits that were running
+when the previous process died (stale `last_activity_at` > 5 min).
+
 Only ONE executor processes each audit at a time.
 """
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 
 from app.services import audit_pipeline
 from app.services.audit_pipeline import WORKER_ID
@@ -28,12 +32,82 @@ _semaphore = asyncio.Semaphore(5)
 _running = False
 _scheduled_tick_counter = 0  # only dispatch scheduled audits every Nth tick
 
+# ── Scheduler heartbeat ──────────────────────────────────────────────
+# Updated every tick so external callers (health endpoint) can detect a
+# dead scheduler without querying Postgres.
+_last_tick_at: datetime | None = None
+_tick_count: int = 0
+
+
+def get_scheduler_health() -> dict:
+    """Return scheduler liveness info (called by the health API)."""
+    now = datetime.now(timezone.utc)
+    stale_seconds = (
+        round((now - _last_tick_at).total_seconds()) if _last_tick_at else None
+    )
+    return {
+        "alive": _running and _last_tick_at is not None,
+        "last_tick": _last_tick_at.isoformat() if _last_tick_at else None,
+        "stale_seconds": stale_seconds,
+        "tick_count": _tick_count,
+        "worker_id": WORKER_ID,
+    }
+
+
+async def recover_stale_audits():
+    """Re-activate audits stranded by a previous process crash.
+
+    Called once on startup. Finds audits stuck in an active pipeline state
+    with stale `last_activity_at` (> 5 min), clears their lock, and bumps
+    `last_activity_at` so the scheduler picks them up on the first tick.
+    """
+    from app.database import AsyncSessionLocal
+    from sqlalchemy import text
+
+    try:
+        async with AsyncSessionLocal() as s:
+            result = await s.execute(text("""
+                UPDATE audits
+                SET locked_by = NULL,
+                    locked_at = NULL,
+                    last_activity_at = now(),
+                    error_message = COALESCE(
+                        NULLIF(error_message, ''),
+                        'Recovered after scheduler restart'
+                    )
+                WHERE status = 'running'
+                  AND pipeline_state IN (
+                      'polling', 'extracting_competitors',
+                      'analyzing_sentiment', 'finalizing'
+                  )
+                  AND COALESCE(last_activity_at, started_at, created_at)
+                      < now() - interval '5 minutes'
+                RETURNING id, pipeline_state
+            """))
+            recovered = result.fetchall()
+            await s.commit()
+
+        if recovered:
+            for row in recovered:
+                logger.warning(
+                    f"[startup-recovery] Recovered stale audit {row[0]} "
+                    f"(state={row[1]}) — will resume on next tick"
+                )
+            logger.info(f"[startup-recovery] Recovered {len(recovered)} stale audit(s)")
+        else:
+            logger.info("[startup-recovery] No stale audits to recover")
+    except Exception as e:
+        logger.error(f"[startup-recovery] Failed: {e}", exc_info=True)
+
 
 async def start_scheduler():
     """Start the background scheduling loop."""
     global _running
     _running = True
     logger.info(f"Audit scheduler started (worker={WORKER_ID}, 15s interval, max 5 concurrent)")
+
+    # Recover any audits stranded by a previous crash
+    await recover_stale_audits()
 
     while _running:
         try:
@@ -144,7 +218,9 @@ async def _dispatch_scheduled_audits():
 
 async def _scheduler_tick():
     """One tick — find active audits and process them."""
-    global _scheduled_tick_counter
+    global _scheduled_tick_counter, _last_tick_at, _tick_count
+    _last_tick_at = datetime.now(timezone.utc)
+    _tick_count += 1
 
     # Release stale locks first (workers that died)
     try:

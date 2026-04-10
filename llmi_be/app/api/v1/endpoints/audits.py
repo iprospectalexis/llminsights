@@ -241,6 +241,20 @@ async def fetch_onesearch_results(job_id: str) -> Optional[list[dict]]:
         return data.get("results", data) if isinstance(data, dict) else data
 
 
+# ── GET /audits/scheduler-health ─────────────────────────────────────
+# Must be defined BEFORE parameterized routes (/{audit_id}/...) to avoid
+# FastAPI matching "scheduler-health" as an audit_id.
+
+@router.get("/scheduler-health")
+async def scheduler_health():
+    """Check if the background scheduler is alive and ticking."""
+    from app.services.audit_scheduler import get_scheduler_health
+    health = get_scheduler_health()
+    if not health["alive"] or (health["stale_seconds"] or 0) >= 120:
+        raise HTTPException(status_code=503, detail={**health, "error": "Scheduler is not responding"})
+    return health
+
+
 # ── POST /audits/run ──────────────────────────────────────────────────
 
 @router.post("/run")
@@ -437,6 +451,55 @@ async def get_audit_status(audit_id: str):
         sentiment_total=audit.get("sentiment_total", 0),
         steps=[dict(s) for s in steps],
     )
+
+
+# ── POST /audits/{audit_id}/resume ────────────────────────────────────
+
+@router.post("/{audit_id}/resume")
+async def resume_audit(audit_id: str):
+    """Manually un-stick a stalled audit so the scheduler picks it up.
+
+    Clears the CAS lock, bumps ``last_activity_at`` to now(), and resets
+    ``error_message`` — the next scheduler tick will claim the audit and
+    continue from its current ``pipeline_state``.
+    """
+    audit = await db.get_audit(audit_id)
+    if not audit:
+        raise HTTPException(status_code=404, detail="Audit not found")
+
+    state = audit.get("pipeline_state", "")
+    status = audit.get("status", "")
+
+    if status not in ("running", "pending"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot resume audit with status '{status}' — only running/pending audits",
+        )
+
+    resumable = {
+        "polling", "extracting_competitors", "analyzing_sentiment",
+        "finalizing", "created", "fetching",
+    }
+    if state not in resumable:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot resume audit in pipeline_state '{state}'",
+        )
+
+    await db.update_audit(audit_id, {
+        "locked_by": None,
+        "locked_at": None,
+        "last_activity_at": datetime.now(timezone.utc).isoformat(),
+        "error_message": None,
+    })
+
+    logger.info(f"[resume] Audit {audit_id} manually resumed (state={state})")
+    return {
+        "success": True,
+        "message": f"Audit resumed — scheduler will pick it up within 15s",
+        "audit_id": audit_id,
+        "pipeline_state": state,
+    }
 
 
 # ── BrightData legacy fetch ──────────────────────────────────────────
