@@ -15,6 +15,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { Card } from '../ui/Card';
 import { LoadingSpinner } from '../ui/LoadingSpinner';
 import { supabase } from '../../lib/supabase';
+import { Info } from 'lucide-react';
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
   LineChart, Line, Legend,
@@ -213,9 +214,26 @@ export const SentimentDashboard: React.FC<Props> = ({ projectId }) => {
     <div className="space-y-6">
       {/* Brand vs competitor delta */}
       <Card className="p-6" hover={false}>
-        <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100 mb-4">
-          Own brands vs. competitors
-        </h3>
+        <div className="flex items-center mb-4">
+          <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100">
+            Own brands vs. competitors
+          </h3>
+          <div className="group relative inline-block ml-2">
+            <Info className="w-4 h-4 text-gray-400 hover:text-gray-600 dark:text-gray-500 dark:hover:text-gray-300 cursor-help transition-colors" />
+            <div className="absolute top-full left-0 mt-2 w-80 p-3 bg-gray-900 text-white text-xs rounded-lg shadow-xl opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 pointer-events-none z-10">
+              <div className="font-semibold mb-1">Sentiment Score Scale</div>
+              <div className="mb-2">Scores range from -1.0 (strongly negative) to +1.0 (strongly positive).</div>
+              <ul className="list-disc list-inside space-y-0.5 mb-2">
+                <li>+0.5 to +1.0 — Strongly positive (enthusiastic recommendation)</li>
+                <li>+0.1 to +0.5 — Mildly positive (favorable mention)</li>
+                <li>0.0 — Neutral or mention-only (no opinion expressed)</li>
+                <li>-0.1 to -0.5 — Mildly negative (criticism or concern)</li>
+                <li>-0.5 to -1.0 — Strongly negative (warning or discouragement)</li>
+              </ul>
+              <div className="text-white/70 italic">Delta = Own avg − Competitor avg. Positive delta means AI engines perceive your brand more favorably than competitors.</div>
+            </div>
+          </div>
+        </div>
         <div className="grid grid-cols-3 gap-4">
           <div>
             <div className="text-sm text-gray-500">Own avg score</div>
@@ -246,9 +264,19 @@ export const SentimentDashboard: React.FC<Props> = ({ projectId }) => {
       {/* Sentiment over time */}
       {timeSeries.length > 1 && (
         <Card className="p-6" hover={false}>
-          <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100 mb-4">
-            Sentiment over time
-          </h3>
+          <div className="flex items-center mb-4">
+            <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100">
+              Sentiment over time
+            </h3>
+            <div className="group relative inline-block ml-2">
+              <Info className="w-4 h-4 text-gray-400 hover:text-gray-600 dark:text-gray-500 dark:hover:text-gray-300 cursor-help transition-colors" />
+              <div className="absolute top-full left-0 mt-2 w-80 p-3 bg-gray-900 text-white text-xs rounded-lg shadow-xl opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 pointer-events-none z-10">
+                <div className="font-semibold mb-1">Sentiment Over Time</div>
+                <div className="mb-2">Average sentiment score per brand for each audit run. The Y-axis ranges from -1.0 (negative) to +1.0 (positive). A rising trend indicates improving brand perception across AI engines.</div>
+                <div className="text-white/70 italic">Each point is the mean score of all per-response evaluations for that brand in that audit.</div>
+              </div>
+            </div>
+          </div>
           <ResponsiveContainer width="100%" height={300}>
             <LineChart data={timeSeries}>
               <CartesianGrid strokeDasharray="3 3" />
@@ -272,9 +300,19 @@ export const SentimentDashboard: React.FC<Props> = ({ projectId }) => {
 
       {/* Per-LLM bias */}
       <Card className="p-6" hover={false}>
-        <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100 mb-4">
-          Per-LLM sentiment bias (avg score across all brands)
-        </h3>
+        <div className="flex items-center mb-4">
+          <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100">
+            Per-LLM sentiment bias (avg score across all brands)
+          </h3>
+          <div className="group relative inline-block ml-2">
+            <Info className="w-4 h-4 text-gray-400 hover:text-gray-600 dark:text-gray-500 dark:hover:text-gray-300 cursor-help transition-colors" />
+            <div className="absolute top-full left-0 mt-2 w-80 p-3 bg-gray-900 text-white text-xs rounded-lg shadow-xl opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 pointer-events-none z-10">
+              <div className="font-semibold mb-1">Per-LLM Sentiment Bias</div>
+              <div className="mb-2">Average sentiment score across all brands, broken down by AI engine. Reveals whether a specific LLM tends to evaluate brands more positively or negatively compared to others.</div>
+              <div className="text-white/70 italic">Values near 0 indicate balanced evaluation; large positive or negative values suggest systematic bias in that engine.</div>
+            </div>
+          </div>
+        </div>
         <ResponsiveContainer width="100%" height={250}>
           <BarChart data={perLlmBias}>
             <CartesianGrid strokeDasharray="3 3" />
@@ -288,9 +326,24 @@ export const SentimentDashboard: React.FC<Props> = ({ projectId }) => {
 
       {/* Share of voice heatmap */}
       <Card className="p-6" hover={false}>
-        <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100 mb-4">
-          Share of positive voice (brand × LLM)
-        </h3>
+        <div className="flex items-center mb-4">
+          <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100">
+            Share of positive voice (brand × LLM)
+          </h3>
+          <div className="group relative inline-block ml-2">
+            <Info className="w-4 h-4 text-gray-400 hover:text-gray-600 dark:text-gray-500 dark:hover:text-gray-300 cursor-help transition-colors" />
+            <div className="absolute top-full left-0 mt-2 w-80 p-3 bg-gray-900 text-white text-xs rounded-lg shadow-xl opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 pointer-events-none z-10">
+              <div className="font-semibold mb-1">Share of Positive Voice (SPV)</div>
+              <div className="mb-2">Formula: (Positive mentions − Negative mentions) / Total mentions. Ranges from -1.0 to +1.0:</div>
+              <ul className="list-disc list-inside space-y-0.5 mb-2">
+                <li>&gt; +0.2 (green) — Net positive perception</li>
+                <li>-0.2 to +0.2 (gray) — Balanced / neutral</li>
+                <li>&lt; -0.2 (red) — Net negative perception</li>
+              </ul>
+              <div className="text-white/70 italic">"Mentions" count only responses where the brand was detected. Neutral and mention-only responses count toward the total but not toward positive or negative.</div>
+            </div>
+          </div>
+        </div>
         <div className="overflow-x-auto">
           <table className="min-w-full text-sm">
             <thead>
