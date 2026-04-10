@@ -51,6 +51,12 @@ async def get_async_session() -> AsyncSession:
 
 
 async def init_db():
-    """Initialize database tables."""
+    """Initialize database tables.
+
+    Skipped for PostgreSQL/Supabase — schema is managed by migrations.
+    Only needed for local SQLite development.
+    """
+    if settings.is_postgres:
+        return  # Supabase manages the schema; create_all is a no-op but wastes a connection
     async with async_engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
