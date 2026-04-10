@@ -182,14 +182,14 @@ MIN_POLL_INTERVAL_SECONDS = 5
 # so the scheduler slot is freed and other audits keep moving. Must be longer
 # than the slowest healthy step. With the bounded-batch handlers below, a
 # single invocation processes at most ~50 responses, so 600s is generous.
-PER_STEP_TIMEOUT_SECONDS = 600  # 10 min
+PER_STEP_TIMEOUT_SECONDS = 1800  # 30 min — 600s was too tight for 200+ response audits
 
 # Maximum number of outer batches a single handler invocation will process
 # before yielding back to the scheduler. Keeps `extracting_competitors` and
 # `analyzing_sentiment` forward-progress safe: each tick makes a measurable,
 # checkpointed amount of progress and writes a heartbeat, instead of trying
 # to do hundreds of responses inside a single wait_for budget.
-MAX_BATCHES_PER_INVOCATION = 5  # = 50 responses with batch_size=10
+MAX_BATCHES_PER_INVOCATION = 20  # = 200 responses with batch_size=10 (fits in 1800s timeout)
 
 
 async def handle_created(audit_id: str, worker_id: str) -> None:
@@ -697,13 +697,25 @@ async def handle_competitors(audit_id: str, worker_id: str) -> None:
                 exc_info=True,
             )
             try:
-                await db.update_competitors_batch([
-                    {
+                error_updates = []
+                for r in batch:
+                    prev = r.get("answer_competitors")
+                    prev_retry = 0
+                    if isinstance(prev, dict):
+                        prev_retry = prev.get("_retry", 0)
+                    elif isinstance(prev, str):
+                        try:
+                            prev_retry = json.loads(prev).get("_retry", 0)
+                        except Exception:
+                            pass
+                    error_updates.append({
                         "id": r["id"],
-                        "competitors": json.dumps({"brands": [], "error": str(e)[:200]}),
-                    }
-                    for r in batch
-                ])
+                        "competitors": json.dumps({
+                            "brands": [], "error": str(e)[:200],
+                            "_retry": prev_retry + 1,
+                        }),
+                    })
+                await db.update_competitors_batch(error_updates)
             except Exception as save_err:
                 logger.error(
                     f"[pipeline] {audit_id}: failed to write error sentinels: {save_err}"

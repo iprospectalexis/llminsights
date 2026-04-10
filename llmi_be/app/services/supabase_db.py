@@ -472,7 +472,12 @@ class SupabaseDB:
             return [dict(r) for r in rows]
 
     async def get_responses_for_competitors(self, audit_id: str) -> list[dict]:
-        """Get responses that need competitor extraction."""
+        """Get responses that need competitor extraction.
+
+        Rows with an error sentinel are retried up to 3 times (tracked via
+        the ``_retry`` counter inside the JSONB). After 3 failures the row is
+        left as-is and excluded from future processing.
+        """
         async with AsyncSessionLocal() as s:
             rows = (await s.execute(
                 text("""
@@ -483,7 +488,10 @@ class SupabaseDB:
                       AND lr.answer_text IS NOT NULL
                       AND (lr.answer_competitors IS NULL
                            OR lr.answer_competitors = '{"brands": []}'::jsonb
-                           OR lr.answer_competitors ? 'error')
+                           OR (lr.answer_competitors ? 'error'
+                               AND COALESCE(
+                                   (lr.answer_competitors->>'_retry')::int, 0
+                               ) < 3))
                 """),
                 {"aid": audit_id},
             )).mappings().all()

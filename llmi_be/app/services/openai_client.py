@@ -19,8 +19,10 @@ from app.services import cost_tracker
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-# Concurrency control — max 5 parallel OpenAI calls
-_semaphore = asyncio.Semaphore(5)
+# Concurrency control — max 15 parallel OpenAI calls
+# OpenAI rate limits are TPM-based; 5 was too low and caused 600s step
+# timeouts when processing 200+ responses for competitor extraction.
+_semaphore = asyncio.Semaphore(15)
 
 # Official async OpenAI client
 _client = AsyncOpenAI(api_key=settings.openai_api_key)
@@ -481,7 +483,17 @@ async def extract_competitors_batch(
         batch_results = await asyncio.gather(*tasks, return_exceptions=True)
         for r, res in zip(batch, batch_results):
             if isinstance(res, Exception):
-                competitors = {"brands": [], "error": str(res)}
+                # Increment _retry counter so the SQL filter can cap retries
+                prev = r.get("answer_competitors")
+                prev_retry = 0
+                if isinstance(prev, dict):
+                    prev_retry = prev.get("_retry", 0)
+                elif isinstance(prev, str):
+                    try:
+                        prev_retry = json.loads(prev).get("_retry", 0)
+                    except Exception:
+                        pass
+                competitors = {"brands": [], "error": str(res), "_retry": prev_retry + 1}
             else:
                 competitors = res
                 if res.get("_skipped"):
