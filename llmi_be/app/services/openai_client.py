@@ -27,23 +27,27 @@ _semaphore = asyncio.Semaphore(15)
 # Official async OpenAI client
 _client = AsyncOpenAI(api_key=settings.openai_api_key)
 
-MODEL = "gpt-5-mini"
+MODEL = "gpt-5-mini"                   # default / legacy fallback
+MODEL_COMPETITORS = "gpt-5-nano"       # competitor extraction (structured JSON, simpler task)
+MODEL_SENTIMENT = "gpt-5-mini"         # sentiment analysis (needs nuanced scoring + reasoning)
 SENTIMENT_PROMPT_VERSION = "v2.1-2026-04-07"
 
 
 async def _call_openai(messages: list[dict], max_tokens: int = 2048,
                         response_format: Optional[dict] = None,
                         _ctx: Optional[dict] = None,
-                        _operation: Optional[str] = None) -> Optional[str]:
+                        _operation: Optional[str] = None,
+                        model: Optional[str] = None) -> Optional[str]:
     """Call OpenAI chat completions API with concurrency control.
 
     `_ctx` carries audit_id/project_id/user_id from the caller so the cost
     tracker can attribute the spend. `_operation` is the high-level operation
     name ('competitors_extract' or 'sentiment_analyze') stored on the event.
     """
+    effective_model = model or MODEL
     async with _semaphore:
         kwargs: dict = {
-            "model": MODEL,
+            "model": effective_model,
             "messages": messages,
             "max_completion_tokens": max_tokens,
         }
@@ -65,7 +69,7 @@ async def _call_openai(messages: list[dict], max_tokens: int = 2048,
                 usage = getattr(resp, "usage", None)
                 logger.warning(
                     f"OpenAI returned empty content (finish_reason={finish}, "
-                    f"usage={usage}, max_tokens={max_tokens})"
+                    f"usage={usage}, model={effective_model}, max_tokens={max_tokens})"
                 )
             # Best-effort cost capture (never breaks the call on failure)
             try:
@@ -74,7 +78,7 @@ async def _call_openai(messages: list[dict], max_tokens: int = 2048,
                     finish_reason = getattr(choice, "finish_reason", None)
                     await cost_tracker.record_openai_call(
                         ctx=_ctx,
-                        model=MODEL,
+                        model=effective_model,
                         operation=_operation,
                         usage=usage,
                         metadata={"finish_reason": finish_reason} if finish_reason else None,
@@ -210,7 +214,8 @@ async def extract_competitors(
         try:
             raw = await _call_openai(messages, max_tokens=4096,
                                       response_format={"type": "json_object"},
-                                      _ctx=_ctx, _operation="competitors_extract")
+                                      _ctx=_ctx, _operation="competitors_extract",
+                                      model=MODEL_COMPETITORS)
             if not raw:
                 if attempt == 0:
                     logger.warning("OpenAI returned empty output, retrying...")
@@ -349,6 +354,7 @@ async def analyze_response_sentiment(
             response_format={"type": "json_schema", "json_schema": SENTIMENT_SCHEMA},
             _ctx=_ctx,
             _operation="sentiment_analyze",
+            model=MODEL_SENTIMENT,
         )
         if not raw:
             return _sentiment_fallback(brands_to_score, "empty_response")
