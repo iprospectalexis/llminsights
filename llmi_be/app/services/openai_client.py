@@ -504,6 +504,21 @@ async def extract_competitors_batch(
                 competitors = res
                 if res.get("_skipped"):
                     skipped += 1
+                elif res.get("error"):
+                    # extract_competitors returned an error dict (not exception).
+                    # Add _retry counter so the SQL filter can cap retries.
+                    # Without this, error-dict results loop forever (no _retry key
+                    # → COALESCE defaults to 0 → always < 3).
+                    prev = r.get("answer_competitors")
+                    prev_retry = 0
+                    if isinstance(prev, dict):
+                        prev_retry = prev.get("_retry", 0)
+                    elif isinstance(prev, str):
+                        try:
+                            prev_retry = json.loads(prev).get("_retry", 0)
+                        except Exception:
+                            pass
+                    competitors["_retry"] = prev_retry + 1
             results.append({"id": r["id"], "competitors": json.dumps(competitors)})
 
         processed = min(i + batch_size, len(responses))

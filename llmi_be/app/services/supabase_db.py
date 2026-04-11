@@ -497,9 +497,8 @@ class SupabaseDB:
                       AND lr.answer_text IS NOT NULL
                       AND (lr.answer_competitors IS NULL
                            OR (lr.answer_competitors ? 'error'
-                               AND COALESCE(
-                                   (lr.answer_competitors->>'_retry')::int, 0
-                               ) < 3))
+                               AND lr.answer_competitors ? '_retry'
+                               AND (lr.answer_competitors->>'_retry')::int < 3))
                 """),
                 {"aid": audit_id},
             )).mappings().all()

@@ -745,6 +745,31 @@ async def handle_competitors(audit_id: str, worker_id: str) -> None:
 
     pending_count = len(pending)
 
+    # ── Force-skip guard ───────────────────────────────────────────────
+    # If competitors_processed >= competitors_total but SQL still returns
+    # pending rows, those rows are stuck in a retry loop (e.g. error-dict
+    # without _retry, or DB write failures). Force-mark them and move on.
+    audit_row_check = await db.get_audit(audit_id) or {}
+    _proc = audit_row_check.get("competitors_processed") or 0
+    _total = audit_row_check.get("competitors_total") or 0
+    if pending_count > 0 and _total > 0 and _proc >= _total:
+        logger.warning(
+            f"[pipeline] {audit_id}: all {_total} competitors processed but "
+            f"{pending_count} rows still pending — force-skipping stuck rows"
+        )
+        try:
+            force_updates = [{
+                "id": r["id"],
+                "competitors": json.dumps({
+                    "brands": [], "error": "force_skipped_stuck", "_retry": 999,
+                }),
+            } for r in pending]
+            await db.update_competitors_batch(force_updates)
+        except Exception as e:
+            logger.error(f"[pipeline] {audit_id}: force-skip write failed: {e}")
+        # Re-check pending — should now be empty, transition fires on next tick
+        return
+
     # Discover total once and cache it on the audit row so the modal can show
     # cumulative X/Y progress across multiple invocations. We re-derive total
     # from the audit if it's already set, otherwise treat the first batch as
@@ -931,6 +956,37 @@ async def handle_sentiment(audit_id: str, worker_id: str) -> None:
 
     pending_count = len(pending)
 
+    # ── Force-skip guard ───────────────────────────────────────────────
+    # Same pattern as handle_competitors: if all rows were processed but
+    # SQL still returns pending rows, force-mark them to unblock transition.
+    _s_proc = audit.get("sentiment_processed") or 0
+    _s_total = audit.get("sentiment_total") or 0
+    if pending_count > 0 and _s_total > 0 and _s_proc >= _s_total:
+        logger.warning(
+            f"[pipeline] {audit_id}: all {_s_total} sentiment processed but "
+            f"{pending_count} rows still pending — force-skipping stuck rows"
+        )
+        try:
+            sentinel_rows = [{
+                "response_id": str(r["id"]),
+                "audit_id": audit_id,
+                "brand": "__stuck__",
+                "brand_kind": "none",
+                "label": "mention_only",
+                "score": 0.0,
+                "confidence": 0.0,
+                "reasoning": "Force-skipped: stuck in retry loop",
+                "is_fallback": True,
+                "model": openai_client.MODEL_SENTIMENT,
+                "prompt_version": openai_client.SENTIMENT_PROMPT_VERSION,
+            } for r in pending]
+            await db.upsert_response_brand_sentiment(sentinel_rows)
+            legacy = [{"id": str(r["id"]), "score": 0.0, "label": "neutral"} for r in pending]
+            await db.update_sentiment_batch(legacy)
+        except Exception as e:
+            logger.error(f"[pipeline] {audit_id}: sentiment force-skip write failed: {e}")
+        return
+
     project_name = await db.get_project_name(audit_id) or ""
     _, project_id, _ = await db.get_own_brands(audit_id)
     user_id = await _get_audit_run_by(audit_id)
@@ -1036,9 +1092,26 @@ async def handle_sentiment(audit_id: str, worker_id: str) -> None:
 
             flat_rbs: list[dict] = []
             flat_legacy: list[dict] = []
-            for r in results:
+            for idx, r in enumerate(results):
                 if isinstance(r, Exception):
                     logger.error(f"[pipeline] sentiment batch item failed: {r}")
+                    # Insert __error__ sentinel so NOT EXISTS skips this row
+                    # on the next tick — prevents infinite retry loop.
+                    resp = batch[idx]
+                    flat_rbs.append({
+                        "response_id": str(resp["id"]),
+                        "audit_id": audit_id,
+                        "brand": "__error__",
+                        "brand_kind": "none",
+                        "label": "mention_only",
+                        "score": 0.0,
+                        "confidence": 0.0,
+                        "reasoning": f"Error: {str(r)[:200]}",
+                        "is_fallback": True,
+                        "model": openai_client.MODEL_SENTIMENT,
+                        "prompt_version": openai_client.SENTIMENT_PROMPT_VERSION,
+                    })
+                    flat_legacy.append({"id": str(resp["id"]), "score": 0.0, "label": "neutral"})
                     continue
                 rbs, legacy = r
                 flat_rbs.extend(rbs)
