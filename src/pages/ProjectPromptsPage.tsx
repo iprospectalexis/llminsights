@@ -53,6 +53,7 @@ export const ProjectPromptsPage: React.FC = () => {
   const [visibilityData, setVisibilityData] = useState<VisibilityData[]>([]);
   const [llmList, setLlmList] = useState<string[]>([]);
   const [googleAIData, setGoogleAIData] = useState<GoogleAIData[]>([]);
+  const [ownBrandNames, setOwnBrandNames] = useState<string[]>([]);
 
   useEffect(() => {
     if (id && activeTab === 'visibility') {
@@ -75,6 +76,16 @@ export const ProjectPromptsPage: React.FC = () => {
 
       if (projectError) throw projectError;
       setProject(projectData);
+
+      // Fetch own brands for mention detection
+      const { data: brandsData } = await supabase
+        .from('brands')
+        .select('brand_name')
+        .eq('project_id', id)
+        .eq('is_competitor', false);
+
+      const brandNames = (brandsData || []).map(b => b.brand_name.toLowerCase());
+      setOwnBrandNames(brandNames);
 
       // Get the most recent audit for this project
       const { data: mostRecentAudit, error: auditError } = await supabase
@@ -121,7 +132,7 @@ export const ProjectPromptsPage: React.FC = () => {
       // Load LLM responses for the most recent audit
       const { data: llmResponsesData, error: llmResponsesError } = await supabase
         .from('llm_responses')
-        .select('id, prompt_id, llm, answer_competitors, citations, links_attached')
+        .select('id, prompt_id, llm, answer_text, answer_competitors, citations, links_attached')
         .eq('audit_id', mostRecentAudit.id);
 
       if (llmResponsesError) throw llmResponsesError;
@@ -156,18 +167,8 @@ export const ProjectPromptsPage: React.FC = () => {
           const llmResponses = promptResponses.map((response: any) => {
             uniqueLlms.add(response.llm);
 
-            // Check if brand is mentioned in answer_competitors
-            // answer_competitors structure: { brands: [ { name: "Tesla", domain: "tesla.com", ... } ] }
-            let brandMentioned = false;
-            if (response.answer_competitors && response.answer_competitors.brands) {
-              const brands = response.answer_competitors.brands;
-              if (Array.isArray(brands)) {
-                brandMentioned = brands.some((comp: any) =>
-                  comp.domain?.toLowerCase().includes(projectData?.domain?.toLowerCase()) ||
-                  comp.name?.toLowerCase() === projectData?.name?.split(' ')[0]?.toLowerCase()
-                );
-              }
-            }
+            // Check if own brand is mentioned (via answer_competitors JSON or text fallback)
+            const brandMentioned = checkBrandMentioned(response, projectData);
 
             // Check if domain is cited - use links_attached for SearchGPT, citations for others
             let domainCited = false;
@@ -267,6 +268,16 @@ export const ProjectPromptsPage: React.FC = () => {
       if (projectError) throw projectError;
       setProject(projectData);
 
+      // Fetch own brands for mention detection
+      const { data: brandsData } = await supabase
+        .from('brands')
+        .select('brand_name')
+        .eq('project_id', id)
+        .eq('is_competitor', false);
+
+      const brandNames = (brandsData || []).map(b => b.brand_name.toLowerCase());
+      setOwnBrandNames(brandNames);
+
       // Get the most recent audit for this project
       const { data: mostRecentAudit, error: auditError } = await supabase
         .from('audits')
@@ -311,7 +322,7 @@ export const ProjectPromptsPage: React.FC = () => {
       // Load LLM responses for the most recent audit (only Google AI variants)
       const { data: llmResponsesData, error: llmResponsesError } = await supabase
         .from('llm_responses')
-        .select('id, prompt_id, llm, answer_competitors, citations, organic_results')
+        .select('id, prompt_id, llm, answer_text, answer_competitors, citations, organic_results')
         .eq('audit_id', mostRecentAudit.id)
         .in('llm', ['google-ai-overview', 'google-ai-mode']);
 
@@ -399,18 +410,20 @@ export const ProjectPromptsPage: React.FC = () => {
     }
   };
 
-  const checkBrandMentioned = (response: any, projectData: any) => {
-    let brandMentioned = false;
-    if (response.answer_competitors && response.answer_competitors.brands) {
-      const brands = response.answer_competitors.brands;
-      if (Array.isArray(brands)) {
-        brandMentioned = brands.some((comp: any) =>
-          comp.domain?.toLowerCase().includes(projectData?.domain?.toLowerCase()) ||
-          comp.name?.toLowerCase() === projectData?.name?.split(' ')[0]?.toLowerCase()
-        );
-      }
+  const checkBrandMentioned = (response: any, _projectData: any) => {
+    // Level 1: Check answer_competitors JSON against own brand names
+    if (response.answer_competitors?.brands && Array.isArray(response.answer_competitors.brands)) {
+      const found = response.answer_competitors.brands.some((comp: any) =>
+        ownBrandNames.some(bn =>
+          comp.name?.toLowerCase().includes(bn) || bn.includes(comp.name?.toLowerCase() || '')
+        )
+      );
+      if (found) return true;
     }
-    return brandMentioned;
+
+    // Level 2: Fallback — text search in answer_text
+    const answerText = response.answer_text?.toLowerCase() || '';
+    return ownBrandNames.some(bn => answerText.includes(bn));
   };
 
   const checkDomainCited = (response: any, projectData: any) => {
