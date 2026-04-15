@@ -737,10 +737,20 @@ async def handle_competitors(audit_id: str, worker_id: str) -> None:
                 f"[pipeline] {audit_id}: extracting_competitors → analyzing_sentiment"
             )
         else:
+            # CAS failed — likely stale lock from previous worker/deploy.
+            current = await db.get_audit(audit_id)
             logger.warning(
-                f"[pipeline] {audit_id}: CAS transition extracting_competitors→analyzing_sentiment "
-                f"FAILED (will retry next tick)"
+                f"[pipeline] {audit_id}: competitors CAS failed "
+                f"(state={current.get('pipeline_state')}, locked_by={current.get('locked_by')}, "
+                f"worker={worker_id}) — clearing lock and retrying"
             )
+            if current.get("pipeline_state") == "extracting_competitors":
+                await db.update_audit(audit_id, {"locked_by": None, "locked_at": None})
+                transitioned = await transition_state(
+                    audit_id, "extracting_competitors", "analyzing_sentiment", worker_id
+                )
+                if transitioned:
+                    logger.info(f"[pipeline] {audit_id}: extracting_competitors → analyzing_sentiment (after lock clear)")
         return
 
     pending_count = len(pending)
@@ -934,6 +944,20 @@ async def handle_sentiment(audit_id: str, worker_id: str) -> None:
         transitioned = await transition_state(audit_id, "analyzing_sentiment", "finalizing", worker_id)
         if transitioned:
             logger.info(f"[pipeline] {audit_id}: analyzing_sentiment → finalizing ({reason})")
+        else:
+            # CAS failed — likely stale lock from a previous worker/deploy.
+            # Force-clear the lock and retry once.
+            current = await db.get_audit(audit_id)
+            logger.warning(
+                f"[pipeline] {audit_id}: sentiment _skip CAS failed "
+                f"(state={current.get('pipeline_state')}, locked_by={current.get('locked_by')}, "
+                f"worker={worker_id}) — clearing lock and retrying"
+            )
+            if current.get("pipeline_state") == "analyzing_sentiment":
+                await db.update_audit(audit_id, {"locked_by": None, "locked_at": None})
+                transitioned = await transition_state(audit_id, "analyzing_sentiment", "finalizing", worker_id)
+                if transitioned:
+                    logger.info(f"[pipeline] {audit_id}: analyzing_sentiment → finalizing (after lock clear)")
 
     if not sentiment_enabled:
         await _skip("Sentiment analysis disabled")
