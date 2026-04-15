@@ -21,17 +21,14 @@
     email admin@llm-insights.com
 }
 
+# ── LLMI app ────────────────────────────────────────────────────────────
 app.llm-insights.com {
     encode gzip zstd
 
-    # Forward everything to the Docker container.
     reverse_proxy 127.0.0.1:8080 {
-        # Preserve the original Host / client IP so FastAPI sees them
-        # (uvicorn is started with --proxy-headers + --forwarded-allow-ips='*').
+        # Preserve original Host so FastAPI sees the real hostname
+        # (uvicorn: --proxy-headers + --forwarded-allow-ips='*').
         header_up Host {host}
-        header_up X-Real-IP {remote_host}
-        header_up X-Forwarded-For {remote_host}
-        header_up X-Forwarded-Proto {scheme}
 
         # Audit-polling endpoints can be slow — match nginx's 300s.
         transport http {
@@ -40,8 +37,6 @@ app.llm-insights.com {
         }
     }
 
-    # Small security-header set. Adjust CSP if you hit issues with
-    # third-party assets (Supabase, OpenAI, etc.).
     header {
         Strict-Transport-Security "max-age=31536000; includeSubDomains"
         X-Content-Type-Options     "nosniff"
@@ -50,11 +45,36 @@ app.llm-insights.com {
         -Server
     }
 
-    # Access + error logs (rotated by Caddy automatically).
     log {
         output file /var/log/caddy/app.llm-insights.com.log {
-            roll_size  50mb
-            roll_keep  7
+            roll_size 50mb
+            roll_keep 7
+        }
+        format json
+    }
+}
+
+# ── Socrate AI (kept behind the same Caddy) ─────────────────────────────
+# Its internal nginx container now binds to 127.0.0.1:8081 and speaks HTTP.
+# Caddy terminates TLS for socrate.alekseo.com and forwards to it.
+socrate.alekseo.com {
+    encode gzip zstd
+
+    reverse_proxy 127.0.0.1:8081 {
+        header_up Host {host}
+    }
+
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options     "nosniff"
+        Referrer-Policy            "strict-origin-when-cross-origin"
+        -Server
+    }
+
+    log {
+        output file /var/log/caddy/socrate.alekseo.com.log {
+            roll_size 50mb
+            roll_keep 7
         }
         format json
     }
