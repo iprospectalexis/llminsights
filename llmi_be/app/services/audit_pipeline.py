@@ -860,21 +860,19 @@ async def handle_competitors(audit_id: str, worker_id: str) -> None:
         cumulative = min(processed_so_far + processed_this_invocation, total)
         progress = 60 + (round((cumulative / total) * 15) if total else 0)
 
-        # Heartbeat + counters after EVERY batch — keeps last_activity_at fresh
-        # so the auto-fail sweep doesn't kill healthy long work and the modal
-        # advances X/Y in near-real time.
-        await _heartbeat(audit_id)
-        await update_progress_counters(
+        # Combined heartbeat + progress + step in ONE db session (was 3 separate).
+        # Reduces connection pool pressure from 3 sessions to 1 per batch.
+        await db.heartbeat_progress_step(
             audit_id,
-            competitors_processed=cumulative,
-            progress=progress,
+            progress_data={"competitors_processed": cumulative, "progress": progress},
+            step="competitors",
+            step_data={
+                "status": "running",
+                "message": f"Extracting competitors: {cumulative}/{total}",
+                "processed_count": cumulative,
+                "total_count": total,
+            },
         )
-        await db.update_audit_step(audit_id, "competitors", {
-            "status": "running",
-            "message": f"Extracting competitors: {cumulative}/{total}",
-            "processed_count": cumulative,
-            "total_count": total,
-        })
 
     # NB: no transition_state here. The next scheduler tick will call us again;
     # if `get_responses_for_competitors` is now empty we hit the early-return
@@ -1143,19 +1141,18 @@ async def handle_sentiment(audit_id: str, worker_id: str) -> None:
         cumulative = min(processed_so_far + processed_this_invocation, total)
         progress = 75 + (round((cumulative / total) * 15) if total else 0)
 
-        # Heartbeat + counters after EVERY batch.
-        await _heartbeat(audit_id)
-        await update_progress_counters(
+        # Combined heartbeat + progress + step in ONE db session (was 3 separate).
+        await db.heartbeat_progress_step(
             audit_id,
-            sentiment_processed=cumulative,
-            progress=progress,
+            progress_data={"sentiment_processed": cumulative, "progress": progress},
+            step="sentiment",
+            step_data={
+                "status": "running",
+                "message": f"Analyzing sentiment: {cumulative}/{total}",
+                "processed_count": cumulative,
+                "total_count": total,
+            },
         )
-        await db.update_audit_step(audit_id, "sentiment", {
-            "status": "running",
-            "message": f"Analyzing sentiment: {cumulative}/{total}",
-            "processed_count": cumulative,
-            "total_count": total,
-        })
 
     # NB: no transition_state here. Next tick will call us again; when
     # `get_responses_for_sentiment_v2` returns 0 the early-return at the top

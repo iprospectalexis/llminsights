@@ -15,8 +15,9 @@ if settings.is_postgres:
     # Transaction mode returns connections after each TX, allowing ~200 concurrent
     # clients vs ~15 in session mode. Requires statement_cache_size=0 because
     # PgBouncer doesn't support prepared statements.
-    engine_kwargs["pool_size"] = 3
-    engine_kwargs["max_overflow"] = 5       # max 8 conn/worker × 2 workers = 16
+    engine_kwargs["pool_size"] = 5
+    engine_kwargs["max_overflow"] = 7       # max 12 conn (< PgBouncer limit 15, leaves 3 for PostgREST/admin)
+    engine_kwargs["pool_timeout"] = 10      # fail fast instead of default 30s hang
     engine_kwargs["pool_pre_ping"] = True
     engine_kwargs["pool_recycle"] = 300     # recycle connections every 5 min
     engine_kwargs["connect_args"] = {"statement_cache_size": 0}

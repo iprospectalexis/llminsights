@@ -1094,6 +1094,8 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     if (!id) return;
 
     setLoading(true);
+    const abortController = new AbortController();
+    const timeoutId = setTimeout(() => abortController.abort(), 15_000);
     try {
       // Fetch project details (with cache for navigation back/forth)
       const cacheKey = `project:${id}:detail`;
@@ -1237,7 +1239,8 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
             audits (created_at, llms)
           `)
           .in('audit_id', recentAuditIds)
-          .order('created_at', { ascending: false });
+          .order('created_at', { ascending: false })
+          .abortSignal(abortController.signal);
 
         if (responsesError) {
           console.error('Error fetching LLM responses:', responsesError);
@@ -1266,7 +1269,8 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
             audits (created_at, llms)
           `)
           .in('audit_id', recentAuditIds)
-          .order('checked_at', { ascending: false });
+          .order('checked_at', { ascending: false })
+          .abortSignal(abortController.signal);
 
         if (citationsError) {
           console.error('Error fetching citations:', citationsError);
@@ -1279,10 +1283,16 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
       // Calculate citation consistency
       const consistency = calculateCitationConsistency(projectData.prompts || [], []);
       setCitationConsistency(consistency);
-    } catch (error) {
-      console.error('Error fetching project data:', error);
+    } catch (error: any) {
+      if (error?.name === 'AbortError') {
+        console.warn('Data fetch timed out — database may be under heavy load');
+      } else {
+        console.error('Error fetching project data:', error);
+      }
+    } finally {
+      clearTimeout(timeoutId);
+      setLoading(false);
     }
-    setLoading(false);
   };
 
   const calculateCitationConsistency = (prompts: any[], citations: any[]): number => {

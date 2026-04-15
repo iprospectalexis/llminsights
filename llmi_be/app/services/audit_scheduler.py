@@ -28,7 +28,7 @@ from app.services.audit_pipeline import WORKER_ID
 logger = logging.getLogger(__name__)
 
 # Max concurrent audit processing
-_semaphore = asyncio.Semaphore(5)
+_semaphore = asyncio.Semaphore(3)
 _in_flight: set[str] = set()  # audit IDs currently being processed (prevents overlapping tasks)
 _running = False
 _scheduled_tick_counter = 0  # only dispatch scheduled audits every Nth tick
@@ -105,7 +105,7 @@ async def start_scheduler():
     """Start the background scheduling loop."""
     global _running
     _running = True
-    logger.info(f"Audit scheduler started (worker={WORKER_ID}, 15s interval, max 5 concurrent)")
+    logger.info(f"Audit scheduler started (worker={WORKER_ID}, 15s interval, max 3 concurrent)")
 
     # Recover any audits stranded by a previous crash
     await recover_stale_audits()

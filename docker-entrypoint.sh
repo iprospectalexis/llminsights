@@ -13,7 +13,7 @@ cd /app
 exec uvicorn app.main:app \
     --host 0.0.0.0 \
     --port 8000 \
-    --workers ${UVICORN_WORKERS:-2} \
+    --workers ${UVICORN_WORKERS:-1} \
     --log-level ${LOG_LEVEL:-info} \
     --proxy-headers \
     --forwarded-allow-ips='*'

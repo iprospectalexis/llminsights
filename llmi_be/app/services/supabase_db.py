@@ -155,6 +155,42 @@ class SupabaseDB:
             )).mappings().first()
             return dict(row) if row else None
 
+    async def heartbeat_progress_step(
+        self,
+        audit_id: str,
+        progress_data: dict,
+        step: str,
+        step_data: dict,
+    ) -> None:
+        """Combined heartbeat + progress counters + step update in ONE session.
+
+        Replaces three separate calls (_heartbeat, update_progress_counters,
+        update_audit_step) to reduce connection pool pressure from 3 sessions
+        to 1 per batch iteration.
+        """
+        async with AsyncSessionLocal() as s:
+            # 1. Heartbeat + progress on audits table
+            audit_sets = ["last_activity_at = now()"]
+            params: dict[str, Any] = {"audit_id": audit_id, "step": step}
+            for k, v in progress_data.items():
+                audit_sets.append(f"{k} = :{k}")
+                params[k] = v
+            await s.execute(
+                text(f"UPDATE audits SET {', '.join(audit_sets)} WHERE id = :audit_id"),
+                params,
+            )
+            # 2. Step update on audit_steps table
+            step_sets = []
+            for k, v in step_data.items():
+                pname = f"s_{k}"
+                step_sets.append(f"{k} = :{pname}")
+                params[pname] = v
+            await s.execute(
+                text(f"UPDATE audit_steps SET {', '.join(step_sets)} WHERE audit_id = :audit_id AND step = :step"),
+                params,
+            )
+            await s.commit()
+
     # ── Projects & prompts ────────────────────────────────────────────
 
     async def get_project_with_prompts(self, project_id: str) -> Optional[dict]:
@@ -665,16 +701,9 @@ class SupabaseDB:
             )).mappings().first()
             if not row:
                 return None
-            # Bump usage stats (best-effort)
-            await s.execute(
-                text("""
-                    UPDATE sentiment_cache
-                    SET hit_count = hit_count + 1, last_used_at = now()
-                    WHERE cache_key = :k
-                """),
-                {"k": cache_key},
-            )
-            await s.commit()
+            # hit_count UPDATE removed — pure telemetry was doubling cache query
+            # cost (SELECT + UPDATE per hit). Under concurrent audits this flooded
+            # the connection pool.
             return row["result"] if isinstance(row["result"], dict) else json.loads(row["result"])
 
     async def put_sentiment_cache(self, cache_key: str, result: dict) -> None:
