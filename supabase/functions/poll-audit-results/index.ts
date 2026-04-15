@@ -583,11 +583,14 @@ async function completeAudit(auditId: string, supabaseClient: any) {
     .eq('audit_id', auditId)
     .in('step', ['sentiment', 'persist'])
 
-  // Complete the audit
+  // Complete the audit. `pipeline_state` MUST be written in the same UPDATE
+  // as `status` to satisfy the audits_status_pipeline_state CHECK constraint
+  // and prevent zombie audits (status=completed with pipeline_state stuck).
   await supabaseClient
     .from('audits')
     .update({
       status: 'completed',
+      pipeline_state: 'completed',
       progress: 100,
       current_step: null,
       finished_at: new Date().toISOString()

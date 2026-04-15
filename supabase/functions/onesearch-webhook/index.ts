@@ -84,6 +84,35 @@ Deno.serve(async (req) => {
 
     webhookLogId = logData?.id
 
+    // ── Handoff to Python pipeline ──────────────────────────────────────
+    // The Python backend (audit_pipeline.py + audit_scheduler.py) is now
+    // the single owner of the audit lifecycle: it polls OneSearch for
+    // results, extracts competitors, runs sentiment V2, and finalizes.
+    //
+    // The historical `completeAudit` path below writes `audit_steps`,
+    // `audits.pipeline_state`, and `llm_responses` via PostgREST, which
+    // races against the Python writer (asyncpg) and produces tuple-level
+    // deadlocks on `audit_steps` under load (40P01, observed on VPS).
+    //
+    // We keep this endpoint live so OneSearch/BrightData keeps getting a
+    // 200 OK (no retry storms), but short-circuit to acknowledgement only.
+    // `webhook_logs` still captures each delivery for audit/debugging.
+    //
+    // Everything after this return is dead code; leave it for now — it
+    // will be deleted in a follow-up cleanup once the Python pipeline
+    // handoff has been stable for a release cycle.
+    return new Response(
+      JSON.stringify({
+        ok: true,
+        handled_by: 'python_pipeline',
+        webhook_log_id: webhookLogId,
+      }),
+      {
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        status: 200,
+      }
+    )
+
     // Only process completed jobs
     if (payload.event !== 'job.completed' || payload.status !== 'completed') {
       console.log('[webhook] Skipping non-completed job')
@@ -411,13 +440,12 @@ async function completeAudit(auditId: string, supabaseClient: any) {
 
   const sentimentEnabled = auditData?.sentiment || false
 
-  // Run competitors extraction before sentiment analysis
+  // Run competitors extraction before any completion logic.
+  // NOTE: The webhook runs an older, inline extract-competitors path. The
+  // Python pipeline has its own handle_competitors; whichever finishes first
+  // "wins" and the second becomes a no-op because both are idempotent on
+  // llm_responses.answer_competitors.
   await runCompetitorsExtraction(auditId, supabaseClient)
-
-  if (sentimentEnabled) {
-    console.log(`[webhook] Running sentiment analysis for audit ${auditId}`)
-    await runSentimentAnalysis(auditId, supabaseClient)
-  }
 
   // Update parse step to done
   await supabaseClient
@@ -429,18 +457,70 @@ async function completeAudit(auditId: string, supabaseClient: any) {
     .eq('audit_id', auditId)
     .eq('step', 'parse')
 
-  // Update sentiment and persist steps to done as well
+  // Update persist step to done. `sentiment` step is handled per-branch below.
   await supabaseClient
     .from('audit_steps')
     .update({ status: 'done' })
     .eq('audit_id', auditId)
-    .in('step', ['sentiment', 'persist'])
+    .in('step', ['persist'])
 
-  // Complete the audit
+  if (sentimentEnabled) {
+    // Hand off to Python pipeline for V2 sentiment + finalize.
+    //
+    // The webhook's historical `runSentimentAnalysis` path is v1: it writes
+    // only the legacy `llm_responses.sentiment_score/label` columns and never
+    // populates `response_brand_sentiment`, which is what the current UI
+    // (Sentiment tab + /mentions) actually reads. Running it here leaves the
+    // dashboards empty and also races against the Python state machine,
+    // producing zombie audits (status=completed with pipeline_state=created).
+    //
+    // Correct behaviour: leave `status` untouched (stays 'processing'/'running'),
+    // advance `pipeline_state` to 'analyzing_sentiment' so the Python worker
+    // picks it up on its next scheduler tick. The Python `handle_sentiment` +
+    // `handle_finalize` will then set status='completed' + pipeline_state='completed'
+    // atomically via `transition_state`.
+    console.log(
+      `[webhook] Audit ${auditId}: handing off to Python pipeline for V2 sentiment`
+    )
+    await supabaseClient
+      .from('audits')
+      .update({
+        pipeline_state: 'analyzing_sentiment',
+        current_step: 'analyzing_sentiment',
+      })
+      .eq('id', auditId)
+
+    // Mark sentiment step as pending so the UI reflects the handoff.
+    await supabaseClient
+      .from('audit_steps')
+      .update({
+        status: 'running',
+        message: 'Waiting for Python pipeline to run V2 sentiment analysis',
+      })
+      .eq('audit_id', auditId)
+      .eq('step', 'sentiment')
+
+    // Still refresh metrics for what we already have (responses, citations,
+    // competitors). Python finalize will refresh them again later.
+    await calculateAndSaveProjectMetrics(auditId, supabaseClient)
+    return
+  }
+
+  // Sentiment disabled — no Python handoff is needed. Mark the audit fully
+  // complete here, BUT always set `status` and `pipeline_state` in the same
+  // UPDATE to keep them consistent (enforced by the audits_status_pipeline_state
+  // CHECK constraint introduced in the defense-in-depth migration).
+  await supabaseClient
+    .from('audit_steps')
+    .update({ status: 'done', message: 'Sentiment analysis disabled' })
+    .eq('audit_id', auditId)
+    .eq('step', 'sentiment')
+
   await supabaseClient
     .from('audits')
     .update({
       status: 'completed',
+      pipeline_state: 'completed',
       progress: 100,
       finished_at: new Date().toISOString()
     })
@@ -449,7 +529,7 @@ async function completeAudit(auditId: string, supabaseClient: any) {
   // Calculate and save project metrics
   await calculateAndSaveProjectMetrics(auditId, supabaseClient)
 
-  console.log(`[webhook] Audit ${auditId} completed successfully`)
+  console.log(`[webhook] Audit ${auditId} completed (sentiment disabled)`)
 }
 
 async function runCompetitorsExtraction(auditId: string, supabaseClient: any) {

@@ -252,6 +252,31 @@ async def _scheduler_tick():
             from app.database import AsyncSessionLocal
             from sqlalchemy import text
             async with AsyncSessionLocal() as s:
+                # Auto-COMPLETE audits with progress >= 90 (data fully processed,
+                # only finalization/metrics missing — safer to mark completed).
+                completed_result = await s.execute(text("""
+                    UPDATE audits
+                    SET status = 'completed',
+                        pipeline_state = 'completed',
+                        progress = 100,
+                        current_step = NULL,
+                        finished_at = now(),
+                        locked_by = NULL,
+                        locked_at = NULL,
+                        error_message = NULL
+                    WHERE pipeline_state IN ('finalizing', 'analyzing_sentiment')
+                      AND progress >= 90
+                      AND COALESCE(last_activity_at, started_at, created_at) < now() - interval '60 minutes'
+                    RETURNING id
+                """))
+                auto_completed = completed_result.fetchall()
+                if auto_completed:
+                    logger.warning(
+                        f"Scheduler: auto-completed {len(auto_completed)} near-done audit(s): "
+                        f"{[str(r[0]) for r in auto_completed]}"
+                    )
+
+                # Auto-FAIL the rest (early stages or low progress — genuinely stuck).
                 result = await s.execute(text("""
                     UPDATE audits
                     SET status = 'failed',
@@ -262,6 +287,7 @@ async def _scheduler_tick():
                         locked_at = NULL,
                         error_message = COALESCE(error_message, 'Auto-failed: no activity for 60 minutes')
                     WHERE pipeline_state IN ('fetching','polling','extracting_competitors','analyzing_sentiment','finalizing')
+                      AND progress < 90
                       AND COALESCE(last_activity_at, started_at, created_at) < now() - interval '60 minutes'
                     RETURNING id
                 """))

@@ -16,6 +16,24 @@ Deno.serve(async (req) => {
     return new Response(null, { headers: corsHeaders })
   }
 
+  // ── Disabled: races with Python pipeline ──────────────────────────────
+  // This edge function does bulk `UPDATE audit_steps WHERE step = ANY(...)`
+  // via PostgREST, which deadlocks with the Python pipeline's asyncpg
+  // writers on the same rows. The Python scheduler recovers stuck audits
+  // automatically (`audit_scheduler.recover_stale_audits` on startup,
+  // 5-min staleness warning, 60-min auto-fail/auto-complete sweep).
+  //
+  // If targeted reprocessing is ever needed again, expose it as a
+  // Python endpoint that uses the same `audit_pipeline.transition_state`
+  // discipline so it can't race with the scheduler.
+  return new Response(
+    JSON.stringify({
+      error: 'Reprocess is disabled — Python pipeline recovers stuck audits automatically.',
+      code: 'reprocess_disabled',
+    }),
+    { headers: { ...corsHeaders, 'Content-Type': 'application/json' }, status: 409 }
+  )
+
   try {
     const authHeader = req.headers.get('Authorization')
     if (!authHeader) {
@@ -392,10 +410,14 @@ async function completeAudit(auditId: string, supabaseClient: any) {
     .eq('audit_id', auditId)
     .in('step', ['sentiment', 'persist'])
 
+  // Write `status` and `pipeline_state` in the same UPDATE so the
+  // audits_status_pipeline_state CHECK constraint is satisfied and this
+  // completion cannot create a zombie audit.
   await supabaseClient
     .from('audits')
     .update({
       status: 'completed',
+      pipeline_state: 'completed',
       progress: 100,
       finished_at: new Date().toISOString()
     })

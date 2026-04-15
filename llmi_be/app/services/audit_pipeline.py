@@ -190,7 +190,7 @@ PER_STEP_TIMEOUT_SECONDS = 1800  # 30 min — 600s was too tight for 200+ respon
 # `analyzing_sentiment` forward-progress safe: each tick makes a measurable,
 # checkpointed amount of progress and writes a heartbeat, instead of trying
 # to do hundreds of responses inside a single wait_for budget.
-MAX_BATCHES_PER_INVOCATION = 20  # = 200 responses with batch_size=10 (fits in 1800s timeout)
+MAX_BATCHES_PER_INVOCATION = 40  # = 800 responses with batch_size=20 (fits in 1800s timeout)
 
 
 async def handle_fetching(audit_id: str, worker_id: str) -> None:
@@ -812,7 +812,7 @@ async def handle_competitors(audit_id: str, worker_id: str) -> None:
 
     # Bounded slice — make some progress, then yield. The next scheduler tick
     # picks the audit up again because the SQL filter still finds remaining work.
-    batch_size = 10
+    batch_size = 20  # up from 10 — 20 concurrent OpenAI calls per batch via gather
     work = pending[: MAX_BATCHES_PER_INVOCATION * batch_size]
     logger.info(
         f"[pipeline] {audit_id}: competitors invocation — {len(work)}/{pending_count} "
@@ -993,7 +993,10 @@ async def handle_sentiment(audit_id: str, worker_id: str) -> None:
                 "response_id": str(r["id"]),
                 "audit_id": audit_id,
                 "brand": "__stuck__",
-                "brand_kind": "none",
+                # CHECK constraint requires IN ('own','competitor'); the sentinel
+                # is filtered downstream by brand='__stuck__' / is_fallback=True,
+                # so the kind value is arbitrary — pick 'own' to satisfy the check.
+                "brand_kind": "own",
                 "label": "mention_only",
                 "score": 0.0,
                 "confidence": 0.0,
@@ -1033,7 +1036,7 @@ async def handle_sentiment(audit_id: str, worker_id: str) -> None:
     )
 
     # Bounded slice — yield to scheduler after MAX_BATCHES_PER_INVOCATION batches.
-    batch_size = 10
+    batch_size = 20  # up from 10 — 20 concurrent OpenAI calls per batch via gather
     work = pending[: MAX_BATCHES_PER_INVOCATION * batch_size]
 
     logger.info(
@@ -1185,6 +1188,9 @@ async def handle_sentiment(audit_id: str, worker_id: str) -> None:
 
 async def handle_finalize(audit_id: str, worker_id: str) -> None:
     """Compute metrics, refresh materialized views, mark completed."""
+    # Heartbeat first — keeps last_activity_at fresh so the 60-min auto-fail
+    # sweep doesn't kill a finalizing audit that's retrying after an error.
+    await _heartbeat(audit_id)
     await db.update_audit_step(audit_id, "persist", {
         "status": "running", "message": "Computing metrics..."
     })
@@ -1223,21 +1229,26 @@ async def handle_finalize(audit_id: str, worker_id: str) -> None:
     except Exception as e:
         logger.warning(f"[pipeline] {audit_id}: audit metrics refresh warning: {e}")
 
-    await db.update_audit_step(audit_id, "persist", {
-        "status": "done", "message": "Results saved"
-    })
+    try:
+        await db.update_audit_step(audit_id, "persist", {
+            "status": "done", "message": "Results saved"
+        })
 
-    now = datetime.now(timezone.utc)
-    await db.update_audit(audit_id, {
-        "status": "completed",
-        "progress": 100,
-        "current_step": None,
-        "pipeline_state": "completed",
-        "finished_at": now,
-        "locked_by": None,
-        "locked_at": None,
-    })
-    logger.info(f"[pipeline] Audit {audit_id} COMPLETED")
+        now = datetime.now(timezone.utc)
+        await db.update_audit(audit_id, {
+            "status": "completed",
+            "progress": 100,
+            "current_step": None,
+            "pipeline_state": "completed",
+            "finished_at": now,
+            "locked_by": None,
+            "locked_at": None,
+        })
+        logger.info(f"[pipeline] Audit {audit_id} COMPLETED")
+    except Exception as e:
+        logger.error(
+            f"[pipeline] {audit_id}: finalize update failed: {e}, will retry next tick"
+        )
 
 
 # ── Main dispatcher ──────────────────────────────────────────────────
