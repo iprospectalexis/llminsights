@@ -1,0 +1,61 @@
+# =============================================================================
+# Caddy reverse proxy for LLMI
+# Installed on the VPS host at /etc/caddy/Caddyfile
+# =============================================================================
+#
+# Responsibilities:
+#   - TLS termination for app.llm-insights.com (auto Let's Encrypt)
+#   - HTTP (80) → HTTPS (443) redirect (Caddy does this automatically)
+#   - Reverse proxy to the llmi container on 127.0.0.1:8080
+#
+# The llmi container binds its nginx only to 127.0.0.1:8080 (see
+# docker-compose.yml), so Caddy is the only thing listening on public
+# 80/443 and is the sole edge for the app.
+#
+# Reload after edits:  sudo systemctl reload caddy
+# Logs:                sudo journalctl -u caddy -f
+
+{
+    # Email for Let's Encrypt account / expiry notifications.
+    # Replace with an address you monitor.
+    email admin@llm-insights.com
+}
+
+app.llm-insights.com {
+    encode gzip zstd
+
+    # Forward everything to the Docker container.
+    reverse_proxy 127.0.0.1:8080 {
+        # Preserve the original Host / client IP so FastAPI sees them
+        # (uvicorn is started with --proxy-headers + --forwarded-allow-ips='*').
+        header_up Host {host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+
+        # Audit-polling endpoints can be slow — match nginx's 300s.
+        transport http {
+            read_timeout 300s
+            dial_timeout 10s
+        }
+    }
+
+    # Small security-header set. Adjust CSP if you hit issues with
+    # third-party assets (Supabase, OpenAI, etc.).
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options     "nosniff"
+        X-Frame-Options            "SAMEORIGIN"
+        Referrer-Policy            "strict-origin-when-cross-origin"
+        -Server
+    }
+
+    # Access + error logs (rotated by Caddy automatically).
+    log {
+        output file /var/log/caddy/app.llm-insights.com.log {
+            roll_size  50mb
+            roll_keep  7
+        }
+        format json
+    }
+}
