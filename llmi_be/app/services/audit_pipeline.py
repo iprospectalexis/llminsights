@@ -96,7 +96,9 @@ async def transition_state(audit_id: str, from_state: str, to_state: str,
             SET pipeline_state = :to_state,
                 current_step = :legacy_step,
                 locked_at = now(),
-                last_activity_at = now()
+                last_activity_at = now(),
+                pipeline_state_entered_at = now(),
+                consecutive_batch_failures = 0
             WHERE id = :id
               AND pipeline_state = :from_state
               AND (locked_by IS NULL OR locked_by = :worker)
@@ -151,6 +153,55 @@ async def _heartbeat(audit_id: str) -> None:
             await s.commit()
     except Exception as e:
         logger.warning(f"[pipeline] {audit_id}: heartbeat failed: {e}")
+
+
+# Fail audit after this many consecutive batch exceptions in one handler.
+# Converts silent hangs (handler looping on broken OpenAI / broken schema)
+# into loud, debuggable failures. Reset to 0 on any successful batch.
+MAX_CONSECUTIVE_BATCH_FAILURES = 3
+
+
+async def _record_batch_failure(audit_id: str, handler: str, err: Exception) -> bool:
+    """Increment consecutive_batch_failures. Return True if audit should fail.
+
+    The counter is reset to 0 on any successful batch (and on state transitions).
+    """
+    from app.database import AsyncSessionLocal
+    from sqlalchemy import text
+    try:
+        async with AsyncSessionLocal() as s:
+            row = (await s.execute(text("""
+                UPDATE audits
+                SET consecutive_batch_failures = consecutive_batch_failures + 1
+                WHERE id = :id
+                RETURNING consecutive_batch_failures
+            """), {"id": audit_id})).first()
+            await s.commit()
+            count = row[0] if row else 0
+    except Exception as e:
+        logger.warning(f"[pipeline] {audit_id}: failure-counter update failed: {e}")
+        return False
+
+    logger.warning(
+        f"[pipeline] {audit_id}: {handler} batch failure #{count}/{MAX_CONSECUTIVE_BATCH_FAILURES}: {err}"
+    )
+    return count >= MAX_CONSECUTIVE_BATCH_FAILURES
+
+
+async def _reset_batch_failure_counter(audit_id: str) -> None:
+    """Reset consecutive_batch_failures to 0 after a successful batch."""
+    from app.database import AsyncSessionLocal
+    from sqlalchemy import text
+    try:
+        async with AsyncSessionLocal() as s:
+            await s.execute(
+                text("UPDATE audits SET consecutive_batch_failures = 0 "
+                     "WHERE id = :id AND consecutive_batch_failures > 0"),
+                {"id": audit_id},
+            )
+            await s.commit()
+    except Exception as e:
+        logger.debug(f"[pipeline] {audit_id}: counter reset failed: {e}")
 
 
 # ── Step handlers ────────────────────────────────────────────────────
@@ -873,6 +924,7 @@ async def handle_competitors(audit_id: str, worker_id: str) -> None:
             )
             if batch_updates:
                 await db.update_competitors_batch(batch_updates)
+            await _reset_batch_failure_counter(audit_id)
         except Exception as e:
             # Don't let one poison batch lock the whole audit. Mark every row
             # in this batch with an error sentinel — the SQL filter
@@ -882,6 +934,13 @@ async def handle_competitors(audit_id: str, worker_id: str) -> None:
                 f"[pipeline] {audit_id}: competitors batch failed: {e}",
                 exc_info=True,
             )
+            if await _record_batch_failure(audit_id, "competitors", e):
+                await fail_audit(
+                    audit_id,
+                    f"Competitors handler failed {MAX_CONSECUTIVE_BATCH_FAILURES} "
+                    f"consecutive batches: {str(e)[:200]}",
+                )
+                return
             try:
                 error_updates = []
                 for r in batch:
@@ -1160,14 +1219,45 @@ async def handle_sentiment(audit_id: str, worker_id: str) -> None:
                 await db.upsert_response_brand_sentiment(flat_rbs)
             if flat_legacy:
                 await db.update_sentiment_batch(flat_legacy)
+            await _reset_batch_failure_counter(audit_id)
         except Exception as e:
-            # Don't let one poison batch lock the whole audit. Mark every row
-            # in this batch with a neutral fallback so the SQL filter no longer
-            # picks them up — they will not block forward progress.
+            # Don't let one poison batch lock the whole audit. Write BOTH:
+            #   1. __batch_error__ sentinels into response_brand_sentiment so
+            #      the NOT EXISTS filter excludes these rows on the next tick
+            #      (without this, the audit loops forever in this handler);
+            #   2. A neutral fallback on llm_responses for legacy dashboards.
+            # If the upsert itself fails (e.g. schema drift), downgrade to
+            # legacy-only — the 60-min auto-fail will eventually catch it.
             logger.error(
                 f"[pipeline] {audit_id}: sentiment batch failed: {e}",
                 exc_info=True,
             )
+            if await _record_batch_failure(audit_id, "sentiment", e):
+                await fail_audit(
+                    audit_id,
+                    f"Sentiment handler failed {MAX_CONSECUTIVE_BATCH_FAILURES} "
+                    f"consecutive batches: {str(e)[:200]}",
+                )
+                return
+            try:
+                batch_err_sentinels = [{
+                    "response_id": str(r["id"]),
+                    "audit_id": audit_id,
+                    "brand": "__batch_error__",
+                    "brand_kind": "none",
+                    "label": "mention_only",
+                    "score": 0.0,
+                    "confidence": 0.0,
+                    "reasoning": f"Batch failed: {str(e)[:200]}",
+                    "is_fallback": True,
+                    "model": openai_client.MODEL_SENTIMENT,
+                    "prompt_version": openai_client.SENTIMENT_PROMPT_VERSION,
+                } for r in batch]
+                await db.upsert_response_brand_sentiment(batch_err_sentinels)
+            except Exception as rbs_err:
+                logger.error(
+                    f"[pipeline] {audit_id}: failed to write batch-error sentinels: {rbs_err}"
+                )
             try:
                 await db.update_sentiment_batch([
                     {"id": str(r["id"]), "score": 0.0, "label": "neutral"}

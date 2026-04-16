@@ -292,11 +292,40 @@ async def _scheduler_tick():
                     RETURNING id
                 """))
                 killed = result.fetchall()
+
+                # State-duration watchdog: zombie audits that heartbeat but
+                # never transition. Happens when a handler loops on a broken
+                # OpenAI / broken schema — last_activity_at stays fresh so the
+                # 60-min-idle sweep above misses them. If an audit has been in
+                # the same pipeline_state for > 45 min, fail it loud.
+                zombie_result = await s.execute(text("""
+                    UPDATE audits
+                    SET status = 'failed',
+                        pipeline_state = 'failed',
+                        current_step = NULL,
+                        finished_at = now(),
+                        locked_by = NULL,
+                        locked_at = NULL,
+                        error_message = COALESCE(
+                            error_message,
+                            'Auto-failed: stuck in ' || pipeline_state || ' for >45min (handler loop)'
+                        )
+                    WHERE pipeline_state IN ('extracting_competitors','analyzing_sentiment','finalizing')
+                      AND pipeline_state_entered_at IS NOT NULL
+                      AND pipeline_state_entered_at < now() - interval '45 minutes'
+                    RETURNING id, pipeline_state
+                """))
+                zombies = zombie_result.fetchall()
                 await s.commit()
                 if killed:
                     logger.warning(
-                        f"Scheduler: auto-failed {len(killed)} stuck audit(s): "
+                        f"Scheduler: auto-failed {len(killed)} idle audit(s): "
                         f"{[str(r[0]) for r in killed]}"
+                    )
+                if zombies:
+                    logger.error(
+                        f"Scheduler: zombie-killed {len(zombies)} stuck-in-state audit(s): "
+                        f"{[(str(r[0]), r[1]) for r in zombies]}"
                     )
         except Exception as e:
             logger.error(f"Scheduler: auto-fail sweep error: {e}", exc_info=True)

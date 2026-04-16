@@ -37,15 +37,17 @@ async def _call_openai(messages: list[dict], max_tokens: int = 2048,
                         response_format: Optional[dict] = None,
                         _ctx: Optional[dict] = None,
                         _operation: Optional[str] = None,
-                        model: Optional[str] = None,
-                        reasoning_effort: Optional[str] = None) -> Optional[str]:
+                        model: Optional[str] = None) -> Optional[str]:
     """Call OpenAI chat completions API with concurrency control.
 
     `_ctx` carries audit_id/project_id/user_id from the caller so the cost
     tracker can attribute the spend. `_operation` is the high-level operation
     name ('competitors_extract' or 'sentiment_analyze') stored on the event.
-    `reasoning_effort` can be "low", "medium", or "high" to control how many
-    tokens the model spends on chain-of-thought reasoning (gpt-5 family).
+
+    NOTE: do NOT add a `reasoning` / `reasoning_effort` parameter here. The
+    Chat Completions API on gpt-5-nano / gpt-5-mini rejects it with
+    "unexpected keyword argument 'reasoning'" and crashes every call. If you
+    need reasoning-effort control, switch to the Responses API instead.
     """
     effective_model = model or MODEL
     async with _semaphore:
@@ -56,8 +58,6 @@ async def _call_openai(messages: list[dict], max_tokens: int = 2048,
         }
         if response_format:
             kwargs["response_format"] = response_format
-        if reasoning_effort:
-            kwargs["reasoning"] = {"effort": reasoning_effort}
 
         try:
             # Hard per-call timeout (60s). The SDK default is ~10 minutes,
@@ -360,7 +360,6 @@ async def analyze_response_sentiment(
             _ctx=_ctx,
             _operation="sentiment_analyze",
             model=MODEL_SENTIMENT,
-            reasoning_effort="low",
         )
         if not raw:
             return _sentiment_fallback(brands_to_score, "empty_response")
