@@ -212,7 +212,11 @@ async def trigger_onesearch_job(
 
 
 async def fetch_onesearch_results(job_id: str) -> Optional[list[dict]]:
-    """Check job status and fetch converted results if completed."""
+    """Check job status and fetch converted results if completed.
+
+    Paginates through all pages (per_page=500, API max) so jobs with
+    >100 prompts return every result instead of only the first page.
+    """
     onesearch_url = settings.onesearch_api_url
     onesearch_key = settings.onesearch_api_key
 
@@ -233,12 +237,33 @@ async def fetch_onesearch_results(job_id: str) -> Optional[list[dict]]:
         if status_data.get("status") != "completed" or not status_data.get("converted_results_file"):
             return None
 
-        results_resp = await client.get(
-            f"{onesearch_url}/api/v1/jobs/{job_id}/results?format=converted", headers=headers
-        )
-        results_resp.raise_for_status()
-        data = results_resp.json()
-        return data.get("results", data) if isinstance(data, dict) else data
+        # Fetch first page with max per_page to minimise round-trips.
+        all_results: list[dict] = []
+        page = 1
+        while True:
+            results_resp = await client.get(
+                f"{onesearch_url}/api/v1/jobs/{job_id}/results"
+                f"?format=converted&per_page=500&page={page}",
+                headers=headers,
+            )
+            results_resp.raise_for_status()
+            data = results_resp.json()
+
+            if isinstance(data, list):
+                # No pagination wrapper — raw list (legacy format)
+                all_results.extend(data)
+                break
+
+            page_results = data.get("results", [])
+            all_results.extend(page_results)
+
+            pagination = data.get("pagination", {})
+            total_pages = pagination.get("pages", 1)
+            if page >= total_pages:
+                break
+            page += 1
+
+        return all_results
 
 
 # ── GET /audits/scheduler-health ─────────────────────────────────────

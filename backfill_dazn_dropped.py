@@ -30,7 +30,7 @@ def normalize(s: str) -> str:
 
 
 async def fetch_onesearch_results(job_id: str) -> list[dict]:
-    """Fetch converted results from OneSearch API."""
+    """Fetch ALL converted results from OneSearch API (paginated)."""
     url = settings.onesearch_api_url
     key = settings.onesearch_api_key
     headers = {}
@@ -48,14 +48,32 @@ async def fetch_onesearch_results(job_id: str) -> list[dict]:
             print(f"  WARNING: job not completed, skipping")
             return []
 
-        results_resp = await client.get(
-            f"{url}/api/v1/jobs/{job_id}/results?format=converted", headers=headers
-        )
-        results_resp.raise_for_status()
-        data = results_resp.json()
-        results = data.get("results", data) if isinstance(data, dict) else data
-        print(f"  Fetched {len(results)} results")
-        return results
+        all_results: list[dict] = []
+        page = 1
+        while True:
+            results_resp = await client.get(
+                f"{url}/api/v1/jobs/{job_id}/results"
+                f"?format=converted&per_page=500&page={page}",
+                headers=headers,
+            )
+            results_resp.raise_for_status()
+            data = results_resp.json()
+
+            if isinstance(data, list):
+                all_results.extend(data)
+                break
+
+            page_results = data.get("results", [])
+            all_results.extend(page_results)
+
+            pagination = data.get("pagination", {})
+            total_pages = pagination.get("pages", 1)
+            if page >= total_pages:
+                break
+            page += 1
+
+        print(f"  Fetched {len(all_results)} results (paginated)")
+        return all_results
 
 
 async def main():
