@@ -786,13 +786,17 @@ async def handle_competitors(audit_id: str, worker_id: str) -> None:
     pending_count = len(pending)
 
     # ── Force-skip guard ───────────────────────────────────────────────
-    # If competitors_processed >= competitors_total but SQL still returns
-    # pending rows, those rows are stuck in a retry loop (e.g. error-dict
-    # without _retry, or DB write failures). Force-mark them and move on.
+    # `competitors_processed` counts *attempts* (including failures), not
+    # successes. After one full pass, _proc >= _total even if all rows
+    # failed with _retry: 1. Those rows are still eligible for retry
+    # (_retry < 3 in the SQL filter). The guard must allow 3 full passes
+    # (matching the SQL retry cap) before force-skipping. Only truly stuck
+    # rows — DB write failures where answer_competitors stays NULL — will
+    # still be pending after 3 passes.
     audit_row_check = await db.get_audit(audit_id) or {}
     _proc = audit_row_check.get("competitors_processed") or 0
     _total = audit_row_check.get("competitors_total") or 0
-    if pending_count > 0 and _total > 0 and _proc >= _total:
+    if pending_count > 0 and _total > 0 and _proc >= _total * 3:
         logger.warning(
             f"[pipeline] {audit_id}: all {_total} competitors processed but "
             f"{pending_count} rows still pending — force-skipping stuck rows"
@@ -1009,11 +1013,12 @@ async def handle_sentiment(audit_id: str, worker_id: str) -> None:
     pending_count = len(pending)
 
     # ── Force-skip guard ───────────────────────────────────────────────
-    # Same pattern as handle_competitors: if all rows were processed but
-    # SQL still returns pending rows, force-mark them to unblock transition.
+    # Same pattern as handle_competitors: allow 3 full passes before
+    # force-skipping. Sentiment rows that fail get retry chances via the
+    # NOT EXISTS filter in get_responses_for_sentiment_v2.
     _s_proc = audit.get("sentiment_processed") or 0
     _s_total = audit.get("sentiment_total") or 0
-    if pending_count > 0 and _s_total > 0 and _s_proc >= _s_total:
+    if pending_count > 0 and _s_total > 0 and _s_proc >= _s_total * 3:
         logger.warning(
             f"[pipeline] {audit_id}: all {_s_total} sentiment processed but "
             f"{pending_count} rows still pending — force-skipping stuck rows"
