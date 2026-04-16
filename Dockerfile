@@ -44,6 +44,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy backend source
 COPY llmi_be/ ./
 
+# Copy SQL migrations so run_migrations.py can apply pending ones at startup
+COPY supabase/migrations/ /app/migrations/
+
 # Copy built frontend into nginx serving directory
 COPY --from=frontend-build /app/dist /usr/share/nginx/html
 
