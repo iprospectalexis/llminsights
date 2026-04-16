@@ -567,7 +567,7 @@ async def handle_polling(audit_id: str, worker_id: str) -> None:
                                         "answer_text_markdown": matched.get("answer_text_markdown"),
                                         "response_timestamp": datetime.now(timezone.utc),
                                         "raw_response_data": matched,
-                                        "web_search_query": matched.get("web_search_query"),
+                                        "web_search_query": json.dumps(matched["web_search_query"]) if isinstance(matched.get("web_search_query"), list) else matched.get("web_search_query"),
                                         "citations": json.dumps(matched["citations"]) if matched.get("citations") else None,
                                         "all_sources": json.dumps(matched["all_sources"]) if matched.get("all_sources") else None,
                                         "links_attached": json.dumps(matched["links_attached"]) if matched.get("links_attached") else None,
