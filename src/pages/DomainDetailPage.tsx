@@ -116,7 +116,8 @@ export const DomainDetailPage: React.FC = () => {
         `)
         .eq('domain', decodedDomain)
         .eq('audits.project_id', projectId)
-        .order('checked_at', { ascending: false });
+        .order('checked_at', { ascending: false })
+        .limit(200);
 
       if (citations) {
         processUrlData(citations);

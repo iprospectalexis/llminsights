@@ -1270,6 +1270,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
           `)
           .in('audit_id', recentAuditIds)
           .order('checked_at', { ascending: false })
+          .limit(500)
           .abortSignal(abortController.signal);
 
         if (citationsError) {

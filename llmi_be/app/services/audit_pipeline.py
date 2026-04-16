@@ -528,18 +528,35 @@ async def handle_polling(audit_id: str, worker_id: str) -> None:
             ]
             prompts_map = await db.get_prompt_texts(all_prompt_ids)
 
+            def _normalize_prompt(text: str) -> str:
+                """Normalize prompt text for robust matching.
+                Strips whitespace, normalizes Unicode, collapses internal
+                whitespace runs — handles provider-side reformatting."""
+                import unicodedata
+                text = unicodedata.normalize("NFC", text.strip())
+                return " ".join(text.split())
+
             for job_id, responses in job_groups.items():
                 try:
                     onesearch_results = await fetch_onesearch_results(job_id)
                     if onesearch_results:
                         matched_count = 0
+                        # Pre-build normalized lookup for O(N) matching instead of O(N×M).
+                        # Map: normalized_prompt → list of result dicts (handle dupes).
+                        result_by_prompt: dict[str, list[dict]] = {}
+                        for r in onesearch_results:
+                            key = _normalize_prompt(r.get("prompt") or r.get("query") or "")
+                            result_by_prompt.setdefault(key, []).append(r)
+
+                        first_mismatch_logged = False
                         for resp in responses:
                             prompt_text = prompts_map.get(str(resp["prompt_id"]), "")
-                            matched = next(
-                                (r for r in onesearch_results if r.get("prompt") == prompt_text),
-                                None,
-                            )
-                            if matched:
+                            norm_key = _normalize_prompt(prompt_text)
+                            candidates = result_by_prompt.get(norm_key)
+                            if candidates:
+                                matched = candidates.pop(0)  # consume to avoid double-matching
+                                if not candidates:
+                                    del result_by_prompt[norm_key]
                                 matched_count += 1
                                 results.append({
                                     "success": True, "response": resp, "result": matched,
@@ -557,13 +574,26 @@ async def handle_polling(audit_id: str, worker_id: str) -> None:
                                     },
                                 })
                             else:
+                                # Log the first mismatch for diagnostics
+                                if not first_mismatch_logged:
+                                    first_mismatch_logged = True
+                                    sample_keys = list(result_by_prompt.keys())[:3]
+                                    logger.warning(
+                                        f"[polling] {audit_id}: prompt match MISS on job {job_id}. "
+                                        f"DB prompt (norm, first 80): {norm_key[:80]!r} | "
+                                        f"Provider keys sample (first 80 each): "
+                                        f"{[k[:80] for k in sample_keys]} | "
+                                        f"Total unmatched provider results: {sum(len(v) for v in result_by_prompt.values())} | "
+                                        f"Provider result fields sample: {list((onesearch_results[0] or {}).keys())[:10] if onesearch_results else 'empty'}"
+                                    )
                                 # Provider returned the snapshot but dropped this prompt → terminal.
                                 dropped_terminal_ids.append(str(resp["id"]))
                         if matched_count < len(responses):
                             logger.warning(
                                 f"[polling] {audit_id}: provider drop on job {job_id}: "
                                 f"submitted={len(responses)}, returned={matched_count}, "
-                                f"dropped={len(responses) - matched_count}"
+                                f"dropped={len(responses) - matched_count}, "
+                                f"onesearch_returned={len(onesearch_results)} results total"
                             )
                     else:
                         # not_ready for the whole job

@@ -37,12 +37,15 @@ async def _call_openai(messages: list[dict], max_tokens: int = 2048,
                         response_format: Optional[dict] = None,
                         _ctx: Optional[dict] = None,
                         _operation: Optional[str] = None,
-                        model: Optional[str] = None) -> Optional[str]:
+                        model: Optional[str] = None,
+                        reasoning_effort: Optional[str] = None) -> Optional[str]:
     """Call OpenAI chat completions API with concurrency control.
 
     `_ctx` carries audit_id/project_id/user_id from the caller so the cost
     tracker can attribute the spend. `_operation` is the high-level operation
     name ('competitors_extract' or 'sentiment_analyze') stored on the event.
+    `reasoning_effort` can be "low", "medium", or "high" to control how many
+    tokens the model spends on chain-of-thought reasoning (gpt-5 family).
     """
     effective_model = model or MODEL
     async with _semaphore:
@@ -53,6 +56,8 @@ async def _call_openai(messages: list[dict], max_tokens: int = 2048,
         }
         if response_format:
             kwargs["response_format"] = response_format
+        if reasoning_effort:
+            kwargs["reasoning"] = {"effort": reasoning_effort}
 
         try:
             # Hard per-call timeout (60s). The SDK default is ~10 minutes,
@@ -212,10 +217,11 @@ async def extract_competitors(
 
     for attempt in range(2):  # Retry once on empty output
         try:
-            raw = await _call_openai(messages, max_tokens=4096,
+            raw = await _call_openai(messages, max_tokens=16384,
                                       response_format={"type": "json_object"},
                                       _ctx=_ctx, _operation="competitors_extract",
-                                      model=MODEL_COMPETITORS)
+                                      model=MODEL_COMPETITORS,
+                                      reasoning_effort="low")
             if not raw:
                 if attempt == 0:
                     logger.warning("OpenAI returned empty output, retrying...")
@@ -349,12 +355,13 @@ async def analyze_response_sentiment(
                 {"role": "user", "content": user_msg},
             ],
             # gpt-5-mini reserves a large slice of this budget for invisible
-            # reasoning tokens, so allocate generously per brand.
-            max_tokens=4000,
+            # reasoning tokens, so allocate generously.
+            max_tokens=16384,
             response_format={"type": "json_schema", "json_schema": SENTIMENT_SCHEMA},
             _ctx=_ctx,
             _operation="sentiment_analyze",
             model=MODEL_SENTIMENT,
+            reasoning_effort="low",
         )
         if not raw:
             return _sentiment_fallback(brands_to_score, "empty_response")
