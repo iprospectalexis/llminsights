@@ -1226,25 +1226,60 @@ async def handle_finalize(audit_id: str, worker_id: str) -> None:
     })
     await update_progress_counters(audit_id, progress=90)
 
-    # Coverage check — surface silent extraction collapse before the user notices.
-    # If many responses have answer_text but very few have answer_competitors,
-    # something upstream skipped extraction and the dashboards will look empty.
+    # Coverage safety net — if rows have answer_text but never went through
+    # extraction (answer_competitors IS NULL), loop back to extraction before
+    # completing. This catches cases where answer_text was added after the
+    # original extraction pass (e.g., post-backfill, late webhook delivery).
+    #
+    # Self-terminating: extraction always writes to answer_competitors (brands
+    # or error sentinel with _retry), so the second finalize pass will see 0
+    # never_attempted rows and proceed to completion.
     try:
         from app.database import AsyncSessionLocal
         from sqlalchemy import text
         async with AsyncSessionLocal() as s:
             row = (await s.execute(text("""
                 SELECT COUNT(*) FILTER (WHERE answer_text IS NOT NULL) AS with_text,
-                       COUNT(*) FILTER (WHERE answer_competitors IS NOT NULL) AS with_comp
+                       COUNT(*) FILTER (WHERE answer_competitors IS NOT NULL) AS with_comp,
+                       COUNT(*) FILTER (WHERE answer_text IS NOT NULL
+                                          AND answer_competitors IS NULL) AS never_attempted
                 FROM llm_responses WHERE audit_id = :aid
             """), {"aid": audit_id})).mappings().first()
         with_text = (row or {}).get("with_text") or 0
         with_comp = (row or {}).get("with_comp") or 0
+        never_attempted = (row or {}).get("never_attempted") or 0
+
+        if never_attempted > 0:
+            logger.warning(
+                f"[pipeline] {audit_id}: {never_attempted} rows with answer_text but "
+                f"no answer_competitors — looping back to extraction "
+                f"(coverage: {with_comp}/{with_text})"
+            )
+            # Reset counters to disarm the force-skip guards in
+            # handle_competitors (line 795) and handle_sentiment (line 1016).
+            await update_progress_counters(
+                audit_id,
+                competitors_processed=0,
+                competitors_total=0,
+                sentiment_processed=0,
+                sentiment_total=0,
+            )
+            transitioned = await transition_state(
+                audit_id, "finalizing", "extracting_competitors", worker_id,
+            )
+            if transitioned:
+                logger.info(
+                    f"[pipeline] {audit_id}: finalizing → extracting_competitors "
+                    f"(coverage recovery for {never_attempted} rows)"
+                )
+                return
+            # CAS failed — fall through and complete anyway
+
         if with_text >= 5 and with_comp < with_text * 0.8:
             logger.error(
                 f"[pipeline] {audit_id}: LOW competitor extraction coverage "
-                f"({with_comp}/{with_text}) — Brand Leadership will look empty. "
-                "Investigate handle_competitors / extract_competitors path."
+                f"({with_comp}/{with_text}) — Brand Leadership may look empty. "
+                "Rows have error sentinels after max retries."
             )
     except Exception as e:
         logger.warning(f"[pipeline] {audit_id}: coverage check failed: {e}")
