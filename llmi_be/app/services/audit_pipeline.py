@@ -785,34 +785,41 @@ async def handle_competitors(audit_id: str, worker_id: str) -> None:
 
     pending_count = len(pending)
 
-    # ── Force-skip guard ───────────────────────────────────────────────
-    # `competitors_processed` counts *attempts* (including failures), not
-    # successes. After one full pass, _proc >= _total even if all rows
-    # failed with _retry: 1. Those rows are still eligible for retry
-    # (_retry < 3 in the SQL filter). The guard must allow 3 full passes
-    # (matching the SQL retry cap) before force-skipping. Only truly stuck
-    # rows — DB write failures where answer_competitors stays NULL — will
-    # still be pending after 3 passes.
+    # ── Force-skip guard (NULL-only) ─────────────────────────────────
+    # Only force-skip rows where answer_competitors is still NULL after a
+    # full processing pass — these are DB write failures (extraction ran
+    # but the UPDATE never landed). Rows with error dicts (_retry < 3) are
+    # legitimate retry candidates and must NOT be force-skipped — the SQL
+    # filter in get_responses_for_competitors caps retries at 3 naturally.
     audit_row_check = await db.get_audit(audit_id) or {}
     _proc = audit_row_check.get("competitors_processed") or 0
     _total = audit_row_check.get("competitors_total") or 0
-    if pending_count > 0 and _total > 0 and _proc >= _total * 3:
-        logger.warning(
-            f"[pipeline] {audit_id}: all {_total} competitors processed but "
-            f"{pending_count} rows still pending — force-skipping stuck rows"
-        )
-        try:
-            force_updates = [{
-                "id": r["id"],
-                "competitors": json.dumps({
-                    "brands": [], "error": "force_skipped_stuck", "_retry": 999,
-                }),
-            } for r in pending]
-            await db.update_competitors_batch(force_updates)
-        except Exception as e:
-            logger.error(f"[pipeline] {audit_id}: force-skip write failed: {e}")
-        # Re-check pending — should now be empty, transition fires on next tick
-        return
+    if _total > 0 and _proc >= _total:
+        null_stuck = [r for r in pending if r.get("answer_competitors") is None]
+        if null_stuck:
+            logger.warning(
+                f"[pipeline] {audit_id}: {len(null_stuck)} rows still NULL after "
+                f"full pass ({_proc}/{_total}) — force-skipping (DB write failures)"
+            )
+            try:
+                force_updates = [{
+                    "id": r["id"],
+                    "competitors": json.dumps({
+                        "brands": [], "error": "force_skipped_stuck", "_retry": 999,
+                    }),
+                } for r in null_stuck]
+                await db.update_competitors_batch(force_updates)
+            except Exception as e:
+                logger.error(f"[pipeline] {audit_id}: force-skip write failed: {e}")
+
+        # Remove force-skipped rows from this invocation's pending list.
+        # Error-retry rows (not NULL) fall through to normal processing.
+        if null_stuck:
+            null_ids = {str(r["id"]) for r in null_stuck}
+            pending = [r for r in pending if str(r["id"]) not in null_ids]
+            pending_count = len(pending)
+        if not pending:
+            return  # All stuck rows handled, transition fires next tick
 
     # Discover total once and cache it on the audit row so the modal can show
     # cumulative X/Y progress across multiple invocations. We re-derive total
@@ -1012,40 +1019,12 @@ async def handle_sentiment(audit_id: str, worker_id: str) -> None:
 
     pending_count = len(pending)
 
-    # ── Force-skip guard ───────────────────────────────────────────────
-    # Same pattern as handle_competitors: allow 3 full passes before
-    # force-skipping. Sentiment rows that fail get retry chances via the
-    # NOT EXISTS filter in get_responses_for_sentiment_v2.
-    _s_proc = audit.get("sentiment_processed") or 0
-    _s_total = audit.get("sentiment_total") or 0
-    if pending_count > 0 and _s_total > 0 and _s_proc >= _s_total * 3:
-        logger.warning(
-            f"[pipeline] {audit_id}: all {_s_total} sentiment processed but "
-            f"{pending_count} rows still pending — force-skipping stuck rows"
-        )
-        try:
-            sentinel_rows = [{
-                "response_id": str(r["id"]),
-                "audit_id": audit_id,
-                "brand": "__stuck__",
-                # CHECK constraint requires IN ('own','competitor'); the sentinel
-                # is filtered downstream by brand='__stuck__' / is_fallback=True,
-                # so the kind value is arbitrary — pick 'own' to satisfy the check.
-                "brand_kind": "own",
-                "label": "mention_only",
-                "score": 0.0,
-                "confidence": 0.0,
-                "reasoning": "Force-skipped: stuck in retry loop",
-                "is_fallback": True,
-                "model": openai_client.MODEL_SENTIMENT,
-                "prompt_version": openai_client.SENTIMENT_PROMPT_VERSION,
-            } for r in pending]
-            await db.upsert_response_brand_sentiment(sentinel_rows)
-            legacy = [{"id": str(r["id"]), "score": 0.0, "label": "neutral"} for r in pending]
-            await db.update_sentiment_batch(legacy)
-        except Exception as e:
-            logger.error(f"[pipeline] {audit_id}: sentiment force-skip write failed: {e}")
-        return
+    # No force-skip guard for sentiment. Each row gets an __error__ or
+    # __none__ sentinel on failure, which satisfies the NOT EXISTS filter.
+    # If DB writes fail entirely, the 60-min auto-fail sweep handles it.
+    # The competitors guard targeted NULL rows (write failures) specifically,
+    # but sentiment has no equivalent distinction — removing the guard
+    # eliminates the risk of premature force-skipping.
 
     project_name = await db.get_project_name(audit_id) or ""
     _, project_id, _ = await db.get_own_brands(audit_id)
@@ -1255,30 +1234,45 @@ async def handle_finalize(audit_id: str, worker_id: str) -> None:
         never_attempted = (row or {}).get("never_attempted") or 0
 
         if never_attempted > 0:
-            logger.warning(
-                f"[pipeline] {audit_id}: {never_attempted} rows with answer_text but "
-                f"no answer_competitors — looping back to extraction "
-                f"(coverage: {with_comp}/{with_text})"
-            )
-            # Reset counters to disarm the force-skip guards in
-            # handle_competitors (line 795) and handle_sentiment (line 1016).
-            await update_progress_counters(
-                audit_id,
-                competitors_processed=0,
-                competitors_total=0,
-                sentiment_processed=0,
-                sentiment_total=0,
-            )
-            transitioned = await transition_state(
-                audit_id, "finalizing", "extracting_competitors", worker_id,
-            )
-            if transitioned:
-                logger.info(
-                    f"[pipeline] {audit_id}: finalizing → extracting_competitors "
-                    f"(coverage recovery for {never_attempted} rows)"
+            # One-time limit: if competitors_total > 0, extraction already ran
+            # at least once since the last counter reset. NULL rows at this point
+            # are permanent DB write failures — don't loop back again.
+            audit_row = await db.get_audit(audit_id) or {}
+            _comp_total = audit_row.get("competitors_total") or 0
+
+            if _comp_total == 0:
+                # First time: extraction hasn't run yet (or counters were reset
+                # by reprocess/backfill). Loop back to give it a chance.
+                logger.warning(
+                    f"[pipeline] {audit_id}: {never_attempted} rows with answer_text "
+                    f"but no answer_competitors — looping back to extraction "
+                    f"(coverage: {with_comp}/{with_text})"
                 )
-                return
-            # CAS failed — fall through and complete anyway
+                await update_progress_counters(
+                    audit_id,
+                    competitors_processed=0,
+                    competitors_total=0,
+                    sentiment_processed=0,
+                    sentiment_total=0,
+                )
+                transitioned = await transition_state(
+                    audit_id, "finalizing", "extracting_competitors", worker_id,
+                )
+                if transitioned:
+                    logger.info(
+                        f"[pipeline] {audit_id}: finalizing → extracting_competitors "
+                        f"(coverage recovery for {never_attempted} rows)"
+                    )
+                    return
+                # CAS failed — fall through and complete anyway
+            else:
+                # Extraction already ran (competitors_total > 0) but rows are
+                # still NULL — permanent write failures. Proceed to completion.
+                logger.error(
+                    f"[pipeline] {audit_id}: {never_attempted} rows still NULL "
+                    f"after extraction pass (competitors_total={_comp_total}) — "
+                    f"permanent write failures, completing anyway"
+                )
 
         if with_text >= 5 and with_comp < with_text * 0.8:
             logger.error(
