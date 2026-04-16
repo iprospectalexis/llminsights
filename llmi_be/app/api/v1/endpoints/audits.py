@@ -527,6 +527,90 @@ async def resume_audit(audit_id: str):
     }
 
 
+# ── POST /audits/{audit_id}/reprocess ──────────────────────────────
+
+REPROCESS_STAGES = {"extracting_competitors", "analyzing_sentiment", "finalizing"}
+
+# Legacy step names for backward-compat with the frontend status modal.
+_LEGACY_STEP = {
+    "extracting_competitors": "processing_results",
+    "analyzing_sentiment": "sentiment_analysis",
+    "finalizing": "completing",
+}
+
+# Starting progress values that match what each handler expects.
+_STAGE_PROGRESS = {
+    "extracting_competitors": 60,
+    "analyzing_sentiment": 75,
+    "finalizing": 90,
+}
+
+
+@router.post("/{audit_id}/reprocess")
+async def reprocess_audit(audit_id: str, from_stage: str = "extracting_competitors"):
+    """Re-enter the pipeline for a completed or failed audit.
+
+    Use after a backfill that restored ``answer_text`` for rows that missed
+    competitor extraction or sentiment analysis in the original pipeline run.
+
+    Resets the relevant progress counters to 0 so the force-skip guards in
+    ``handle_competitors`` / ``handle_sentiment`` don't poison the new rows.
+    The scheduler picks the audit up within 15 seconds.
+    """
+    if from_stage not in REPROCESS_STAGES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid from_stage '{from_stage}'. "
+                   f"Must be one of: {', '.join(sorted(REPROCESS_STAGES))}",
+        )
+
+    audit = await db.get_audit(audit_id)
+    if not audit:
+        raise HTTPException(status_code=404, detail="Audit not found")
+
+    status = audit.get("status", "")
+    if status not in ("completed", "failed"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot reprocess audit with status '{status}' — "
+                   f"only completed or failed audits",
+        )
+
+    update: dict = {
+        "pipeline_state": from_stage,
+        "status": "running",
+        "progress": _STAGE_PROGRESS[from_stage],
+        "current_step": _LEGACY_STEP[from_stage],
+        "locked_by": None,
+        "locked_at": None,
+        "last_activity_at": datetime.now(timezone.utc).isoformat(),
+        "finished_at": None,
+        "error_message": None,
+    }
+
+    # Reset counters that the re-entered stages will recalculate.
+    if from_stage in ("extracting_competitors", "analyzing_sentiment"):
+        update["sentiment_processed"] = 0
+        update["sentiment_total"] = 0
+    if from_stage == "extracting_competitors":
+        update["competitors_processed"] = 0
+        update["competitors_total"] = 0
+
+    await db.update_audit(audit_id, update)
+
+    logger.info(
+        f"[reprocess] Audit {audit_id} re-entered pipeline at '{from_stage}' "
+        f"(was status={status})"
+    )
+    return {
+        "success": True,
+        "message": f"Audit pipeline reset to '{from_stage}' — "
+                   f"scheduler will pick it up within 15s",
+        "audit_id": audit_id,
+        "pipeline_state": from_stage,
+    }
+
+
 # ── BrightData legacy fetch ──────────────────────────────────────────
 
 async def _fetch_brightdata_result(llm: str, snapshot_id: str, api_key: str) -> Optional[dict]:
