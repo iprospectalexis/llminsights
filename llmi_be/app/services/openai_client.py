@@ -220,8 +220,7 @@ async def extract_competitors(
             raw = await _call_openai(messages, max_tokens=16384,
                                       response_format={"type": "json_object"},
                                       _ctx=_ctx, _operation="competitors_extract",
-                                      model=MODEL_COMPETITORS,
-                                      reasoning_effort="low")
+                                      model=MODEL_COMPETITORS)
             if not raw:
                 if attempt == 0:
                     logger.warning("OpenAI returned empty output, retrying...")
