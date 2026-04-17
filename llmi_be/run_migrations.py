@@ -38,11 +38,102 @@ async def list_applied(conn) -> set[str]:
     return set(rows)
 
 
+def _split_sql_statements(sql: str) -> list[str]:
+    """Split a migration file into individual statements.
+
+    asyncpg uses prepared statements by default, and prepared statements
+    cannot contain multiple commands. So we split on `;` at statement
+    boundaries. Handles:
+      - line comments starting with `--` (anywhere on the line)
+      - `$$...$$` dollar-quoted blocks (PL/pgSQL function bodies etc.)
+      - single-quoted string literals
+
+    Does NOT handle C-style block comments (/* */). Add if ever needed.
+    """
+    stmts: list[str] = []
+    buf: list[str] = []
+    i = 0
+    in_single_quote = False
+    dollar_tag: str | None = None  # e.g. '' or 'body' for $body$
+    n = len(sql)
+
+    while i < n:
+        ch = sql[i]
+        nxt = sql[i + 1] if i + 1 < n else ""
+
+        if dollar_tag is not None:
+            # Inside a dollar-quoted block — consume until matching $tag$
+            end = sql.find(f"${dollar_tag}$", i)
+            if end == -1:
+                buf.append(sql[i:])
+                i = n
+            else:
+                buf.append(sql[i:end + len(dollar_tag) + 2])
+                i = end + len(dollar_tag) + 2
+                dollar_tag = None
+            continue
+
+        if in_single_quote:
+            buf.append(ch)
+            i += 1
+            if ch == "'":
+                # Escaped quote '' stays inside the string
+                if nxt == "'":
+                    buf.append("'")
+                    i += 1
+                else:
+                    in_single_quote = False
+            continue
+
+        # Line comment — skip to newline
+        if ch == "-" and nxt == "-":
+            newline = sql.find("\n", i)
+            if newline == -1:
+                i = n
+            else:
+                i = newline  # keep the \n for readable errors
+            continue
+
+        # Start of dollar-quoted block: $tag$
+        if ch == "$":
+            end = sql.find("$", i + 1)
+            if end != -1:
+                tag = sql[i + 1:end]
+                if tag == "" or tag.replace("_", "").isalnum():
+                    dollar_tag = tag
+                    buf.append(sql[i:end + 1])
+                    i = end + 1
+                    continue
+
+        if ch == "'":
+            in_single_quote = True
+            buf.append(ch)
+            i += 1
+            continue
+
+        if ch == ";":
+            stmt = "".join(buf).strip()
+            if stmt:
+                stmts.append(stmt)
+            buf = []
+            i += 1
+            continue
+
+        buf.append(ch)
+        i += 1
+
+    tail = "".join(buf).strip()
+    if tail:
+        stmts.append(tail)
+    return stmts
+
+
 async def apply_migration(conn, path: Path) -> None:
     sql = path.read_text(encoding="utf-8")
-    # Execute the file as one script — statements separated by semicolons are
-    # handled by the driver. Most migrations are a handful of DDL statements.
-    await conn.execute(text(sql))
+    # asyncpg can't put multiple commands in one prepared statement, so we
+    # must split the file into individual statements and execute each.
+    for stmt in _split_sql_statements(sql):
+        await conn.execute(text(stmt))
     await conn.execute(
         text("INSERT INTO _schema_migrations (filename) VALUES (:f)"),
         {"f": path.name},
