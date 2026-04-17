@@ -19,14 +19,13 @@ from app.services import cost_tracker
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-# Concurrency control — max 30 parallel OpenAI calls.
-# Rationale: pipeline handlers use batch_size=20 and the scheduler runs up to
-# 3 audits concurrently → up to ~60 potential in-flight calls at once. A
-# semaphore below batch_size forces wait-states inside every gather (tasks
-# queued even when the network / provider could serve them). 30 matches
-# the hot-path demand without exceeding OpenAI TPM limits for gpt-5-nano /
-# gpt-5-mini at our current audit throughput.
-_semaphore = asyncio.Semaphore(30)
+# Concurrency control — max 60 parallel OpenAI calls.
+# Rationale: gpt-5-nano has very generous RPM/TPM limits (thousands RPM, millions
+# TPM). With 3 concurrent audits × 200-row invocations via asyncio.as_completed,
+# peak demand is ~60 in-flight calls. Higher semaphore = OpenAI stays saturated,
+# no waiting inside gather. If rate limits ever bite we'll see 429s in the logs
+# and can dial it back.
+_semaphore = asyncio.Semaphore(60)
 
 # Official async OpenAI client
 _client = AsyncOpenAI(api_key=settings.openai_api_key)
@@ -35,6 +34,40 @@ MODEL = "gpt-5-mini"                   # default / legacy fallback
 MODEL_COMPETITORS = "gpt-5-nano"       # competitor extraction (structured JSON, simpler task)
 MODEL_SENTIMENT = "gpt-5-mini"         # sentiment analysis (needs nuanced scoring + reasoning)
 SENTIMENT_PROMPT_VERSION = "v2.1-2026-04-07"
+
+# Strict JSON schema for brand extraction. Using response_format=json_schema
+# with strict=true makes the model skip "think about JSON format" overhead
+# and guarantees valid, parseable output — faster and more reliable than
+# {"type": "json_object"} which is free-form.
+COMPETITORS_SCHEMA = {
+    "name": "brand_extraction",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "brands": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "name": {"type": "string"},
+                        "strengths": {"type": "array", "items": {"type": "string"}},
+                        "weaknesses": {"type": "array", "items": {"type": "string"}},
+                        "mention_type": {
+                            "type": "string",
+                            "enum": ["recommended", "compared", "mentioned"],
+                        },
+                        "rank": {"type": ["integer", "null"]},
+                    },
+                    "required": ["name", "strengths", "weaknesses", "mention_type", "rank"],
+                },
+            },
+        },
+        "required": ["brands"],
+    },
+}
 
 
 async def _call_openai(messages: list[dict], max_tokens: int = 2048,
@@ -171,62 +204,45 @@ async def extract_competitors(
         context_lines.append(f"- Known competitors: {', '.join(known_competitors)}")
     context_block = "\n".join(context_lines)
 
+    # Concise system prompt — every token here costs latency on every call.
+    # Rules kept only where they change model behaviour (not decorative).
+    system_content = (
+        "Extract brand/company/product names from the text. "
+        "Include named products and model names (e.g. Kangoo=Renault, Transit=Ford). "
+        "Exclude regulatory terms (DPE, RE2020), certifications, generic categories, "
+        "government agencies. Normalize names (NIKE → Nike). Merge duplicates. "
+        "strengths/weaknesses = attributes actually stated in the text (empty if none). "
+        "mention_type: 'recommended' if suggested, 'compared' if in comparison, else 'mentioned'. "
+        "rank: integer if text ranks the brand, else null. "
+        "Respond in the text's language. Empty array if no brands."
+    )
+    if context_block:
+        system_content += f"\n\nContext:\n{context_block}"
+
     messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are a brand intelligence analyst. Your task is to extract all brand/company names "
-                "mentioned in LLM-generated text, along with their context.\n\n"
-                + (f"Project context:\n{context_block}\n\n" if context_block else "")
-                + "Rules:\n"
-                "- Extract ALL real brand names, company names, named products, named services, "
-                "and named platforms mentioned in the text\n"
-                "- Product model names ARE brand mentions (e.g., 'Kangoo' = Renault, 'Transit' = Ford, "
-                "'Sprinter' = Mercedes, 'e-Expert' = brand mention)\n"
-                "- Include brands from the 'known competitors' list if they appear in the text\n"
-                "- Also extract brands NOT in the known lists — they are new/unknown competitors\n"
-                "- DO NOT extract: regulatory standards (DPE, RE2020), certifications, legal terms "
-                "(GFA, GPA), generic categories ('online insurers'), or government agencies\n"
-                "- Normalize brand names to their most common form (e.g., 'NIKE' → 'Nike')\n"
-                "- If the same brand appears multiple times, merge into one entry with combined strengths/weaknesses\n"
-                "- Strengths = positive attributes, recommendations, advantages mentioned\n"
-                "- Weaknesses = negative attributes, limitations, criticisms mentioned\n"
-                "- If a brand is ranked or positioned (e.g., '#1', 'top 3', 'best'), capture the rank\n"
-                "- Mention type: 'recommended' if explicitly suggested, 'compared' if part of a comparison, "
-                "'mentioned' if just referenced\n"
-                "- Respond in the SAME LANGUAGE as the analyzed text\n"
-                "- If no brands/companies are mentioned, return {\"brands\": []}\n"
-                "- Return valid JSON only"
-            ),
-        },
+        {"role": "system", "content": system_content},
         {
             "role": "user",
             "content": (
-                f"Extract all brands/companies mentioned in this LLM response.\n\n"
-                f"Context prompt that generated this response: \"{prompt_text}\"\n\n"
-                f"LLM response text:\n\"\"\"\n{answer_text}\n\"\"\"\n\n"
-                "Return JSON:\n"
-                "{\n"
-                '  "brands": [\n'
-                "    {\n"
-                '      "name": "Brand Name",\n'
-                '      "strengths": ["strength 1", "strength 2"],\n'
-                '      "weaknesses": ["weakness 1"],\n'
-                '      "mention_type": "recommended" | "compared" | "mentioned",\n'
-                '      "rank": null or number (if ranked in text)\n'
-                "    }\n"
-                "  ]\n"
-                "}"
+                f'Prompt: "{prompt_text}"\n\n'
+                f'Response:\n"""\n{answer_text}\n"""'
             ),
         },
     ]
 
     for attempt in range(2):  # Retry once on empty output
         try:
-            raw = await _call_openai(messages, max_tokens=16384,
-                                      response_format={"type": "json_object"},
-                                      _ctx=_ctx, _operation="competitors_extract",
-                                      model=MODEL_COMPETITORS)
+            # max_tokens=2048 is plenty for brand extraction (output is typically
+            # 200-1500 tokens). Previous 16384 gave gpt-5-nano a huge reasoning-
+            # token budget that it spent "thinking" → 3-10s latency per call.
+            # Combined with strict JSON schema, calls now return in ~1-3s.
+            raw = await _call_openai(
+                messages,
+                max_tokens=2048,
+                response_format={"type": "json_schema", "json_schema": COMPETITORS_SCHEMA},
+                _ctx=_ctx, _operation="competitors_extract",
+                model=MODEL_COMPETITORS,
+            )
             if not raw:
                 if attempt == 0:
                     logger.warning("OpenAI returned empty output, retrying...")
