@@ -229,19 +229,18 @@ MAX_POLL_ATTEMPTS_PER_ROW = 8
 # provider when the scheduler tick interval drops or warm-starts overlap.
 MIN_POLL_INTERVAL_SECONDS = 5
 
-# Hard ceiling on a single handler invocation. If a handler hangs (slow OpenAI
-# response, network stall, etc.) `process_step` aborts via `asyncio.wait_for`
-# so the scheduler slot is freed and other audits keep moving. Must be longer
-# than the slowest healthy step. With the bounded-batch handlers below, a
-# single invocation processes at most ~50 responses, so 600s is generous.
-PER_STEP_TIMEOUT_SECONDS = 1800  # 30 min — 600s was too tight for 200+ response audits
-
 # Maximum number of outer batches a single handler invocation will process
 # before yielding back to the scheduler. Keeps `extracting_competitors` and
 # `analyzing_sentiment` forward-progress safe: each tick makes a measurable,
-# checkpointed amount of progress and writes a heartbeat, instead of trying
-# to do hundreds of responses inside a single wait_for budget.
-MAX_BATCHES_PER_INVOCATION = 40  # = 800 responses with batch_size=20 (fits in 1800s timeout)
+# checkpointed amount of progress and writes a heartbeat.
+#
+# Sizing: with the OpenAI per-call timeout at 30s and semaphore at 30, a batch
+# of 20 tasks runs ~1 round × 30s worst case. 10 batches × 30s = 300s per
+# invocation. Comfortably under the 45-min zombie watchdog. If a handler did
+# somehow take longer, it would still return cleanly — we no longer use
+# asyncio.wait_for to guillotine in-flight OpenAI calls (that only wasted
+# work and polluted the pipeline_log with fake "timeout" errors).
+MAX_BATCHES_PER_INVOCATION = 10  # = 200 responses with batch_size=20
 
 
 async def handle_fetching(audit_id: str, worker_id: str) -> None:
@@ -902,76 +901,88 @@ async def handle_competitors(audit_id: str, worker_id: str) -> None:
     user_id = await _get_audit_run_by(audit_id)
     cost_ctx = {"audit_id": audit_id, "project_id": project_id, "user_id": user_id}
 
-    # Bounded slice — make some progress, then yield. The next scheduler tick
-    # picks the audit up again because the SQL filter still finds remaining work.
-    batch_size = 20  # up from 10 — 20 concurrent OpenAI calls per batch via gather
-    work = pending[: MAX_BATCHES_PER_INVOCATION * batch_size]
+    # Pipelined extraction: submit all tasks up-front, write + heartbeat as
+    # results arrive via asyncio.as_completed. The OpenAI semaphore
+    # (openai_client._semaphore) caps real concurrency. Compared to the old
+    # sequential batch loop, OpenAI stays saturated (no idle time during DB
+    # writes) and progress updates land every WRITE_CHUNK completions.
+    WRITE_CHUNK = 20   # how many completions to buffer before a DB flush
+    work = pending[: MAX_BATCHES_PER_INVOCATION * WRITE_CHUNK]
     logger.info(
         f"[pipeline] {audit_id}: competitors invocation — {len(work)}/{pending_count} "
         f"this tick (cumulative {processed_so_far}/{total})"
     )
 
-    processed_this_invocation = 0
-    for i in range(0, len(work), batch_size):
-        batch = work[i:i + batch_size]
+    async def _call_one(r: dict) -> dict:
+        """Per-row extract. Always returns an update dict (never raises)."""
         try:
-            batch_updates = await openai_client.extract_competitors_batch(
-                batch, batch_size=batch_size, delay=0.2,
+            result = await openai_client.extract_competitors(
+                r.get("prompt_text") or "",
+                r.get("answer_text") or "",
                 industry=project_name or "",
                 known_brands=own_brands,
                 known_competitors=competitor_brands,
                 _ctx=cost_ctx,
             )
-            if batch_updates:
-                await db.update_competitors_batch(batch_updates)
+            # extract_competitors returns {"brands": [...]} on success or
+            # {"brands": [], "error": "...", "_retry": N} on recoverable error.
+            # If it didn't already include _retry on an error path, add one
+            # so the SQL filter can cap retries.
+            if result.get("error") and "_retry" not in result:
+                prev = r.get("answer_competitors")
+                prev_retry = 0
+                if isinstance(prev, dict):
+                    prev_retry = prev.get("_retry", 0)
+                elif isinstance(prev, str):
+                    try:
+                        prev_retry = json.loads(prev).get("_retry", 0)
+                    except Exception:
+                        pass
+                result["_retry"] = prev_retry + 1
+            return {"id": r["id"], "competitors": json.dumps(result)}
+        except Exception as exc:
+            # Unexpected exception from extract_competitors. Mirror the old
+            # batch-exception handler: write an error sentinel with _retry+1.
+            prev = r.get("answer_competitors")
+            prev_retry = 0
+            if isinstance(prev, dict):
+                prev_retry = prev.get("_retry", 0)
+            elif isinstance(prev, str):
+                try:
+                    prev_retry = json.loads(prev).get("_retry", 0)
+                except Exception:
+                    pass
+            return {
+                "id": r["id"],
+                "competitors": json.dumps({
+                    "brands": [], "error": str(exc)[:200],
+                    "_retry": prev_retry + 1,
+                }),
+            }
+
+    async def _flush(buf: list[dict], processed: int) -> None:
+        """Write buffered updates + heartbeat/progress. Handles write errors."""
+        try:
+            await db.update_competitors_batch(buf)
             await _reset_batch_failure_counter(audit_id)
-        except Exception as e:
-            # Don't let one poison batch lock the whole audit. Mark every row
-            # in this batch with an error sentinel — the SQL filter
-            # `answer_competitors ? 'error'` keeps them eligible for retry on
-            # the next tick, but they no longer block forward progress.
+        except Exception as write_err:
+            # DB write failure — rare (connection loss / schema drift).
+            # Trip the consecutive-failure counter; if it fires, fail the audit.
             logger.error(
-                f"[pipeline] {audit_id}: competitors batch failed: {e}",
+                f"[pipeline] {audit_id}: competitors write failed: {write_err}",
                 exc_info=True,
             )
-            if await _record_batch_failure(audit_id, "competitors", e):
-                await fail_audit(
-                    audit_id,
+            if await _record_batch_failure(audit_id, "competitors", write_err):
+                raise RuntimeError(
                     f"Competitors handler failed {MAX_CONSECUTIVE_BATCH_FAILURES} "
-                    f"consecutive batches: {str(e)[:200]}",
+                    f"consecutive batches: {str(write_err)[:200]}"
                 )
-                return
-            try:
-                error_updates = []
-                for r in batch:
-                    prev = r.get("answer_competitors")
-                    prev_retry = 0
-                    if isinstance(prev, dict):
-                        prev_retry = prev.get("_retry", 0)
-                    elif isinstance(prev, str):
-                        try:
-                            prev_retry = json.loads(prev).get("_retry", 0)
-                        except Exception:
-                            pass
-                    error_updates.append({
-                        "id": r["id"],
-                        "competitors": json.dumps({
-                            "brands": [], "error": str(e)[:200],
-                            "_retry": prev_retry + 1,
-                        }),
-                    })
-                await db.update_competitors_batch(error_updates)
-            except Exception as save_err:
-                logger.error(
-                    f"[pipeline] {audit_id}: failed to write error sentinels: {save_err}"
-                )
+            # Non-fatal — rows stay with answer_competitors IS NULL, next
+            # invocation will retry them (picked up by get_responses_for_competitors).
+            return
 
-        processed_this_invocation = min(i + batch_size, len(work))
-        cumulative = min(processed_so_far + processed_this_invocation, total)
+        cumulative = min(processed_so_far + processed, total)
         progress = 60 + (round((cumulative / total) * 15) if total else 0)
-
-        # Combined heartbeat + progress + step in ONE db session (was 3 separate).
-        # Reduces connection pool pressure from 3 sessions to 1 per batch.
         await db.heartbeat_progress_step(
             audit_id,
             progress_data={"competitors_processed": cumulative, "progress": progress},
@@ -983,6 +994,36 @@ async def handle_competitors(audit_id: str, worker_id: str) -> None:
                 "total_count": total,
             },
         )
+
+    tasks = [asyncio.create_task(_call_one(r)) for r in work]
+    buffered: list[dict] = []
+    completed = 0
+    try:
+        for coro in asyncio.as_completed(tasks):
+            update = await coro
+            buffered.append(update)
+            completed += 1
+            if len(buffered) >= WRITE_CHUNK:
+                try:
+                    await _flush(buffered, completed)
+                except RuntimeError as fatal:
+                    for t in tasks:
+                        if not t.done():
+                            t.cancel()
+                    await fail_audit(audit_id, str(fatal))
+                    return
+                buffered = []
+        if buffered:
+            try:
+                await _flush(buffered, completed)
+            except RuntimeError as fatal:
+                await fail_audit(audit_id, str(fatal))
+                return
+    except asyncio.CancelledError:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        raise
 
     # NB: no transition_state here. The next scheduler tick will call us again;
     # if `get_responses_for_competitors` is now empty we hit the early-return
@@ -1427,26 +1468,13 @@ async def process_step(audit: dict, worker_id: str) -> None:
         logger.warning(f"[pipeline] {audit_id}: no handler for state '{state}'")
         return
 
+    # NB: no asyncio.wait_for wrapper. With MAX_BATCHES_PER_INVOCATION bounded
+    # and OpenAI per-call timeout at 30s, handlers return in ≤ ~5 min even in
+    # the worst case. The real watchdog is the scheduler's 45-min
+    # `pipeline_state_entered_at` check (state-duration based), which catches
+    # genuine zombies without wasting in-flight OpenAI work.
     try:
-        await asyncio.wait_for(handler(audit_id, worker_id), timeout=PER_STEP_TIMEOUT_SECONDS)
-    except asyncio.TimeoutError:
-        logger.error(
-            f"[pipeline] {audit_id} step '{state}' timed out after "
-            f"{PER_STEP_TIMEOUT_SECONDS}s — releasing slot, will retry next tick"
-        )
-        # Don't fail the audit — the next tick will retry. The 60-min auto-fail
-        # sweep in the scheduler will eventually catch genuinely dead audits.
-        await db.insert_pipeline_log(
-            audit_id, state or "unknown", "process_step_timeout",
-            f"Step timed out after {PER_STEP_TIMEOUT_SECONDS}s",
-            level="warning",
-        )
-        try:
-            await db.update_audit(audit_id, {
-                "error_message": f"Step '{state}' timed out after {PER_STEP_TIMEOUT_SECONDS}s (retrying)"
-            })
-        except Exception:
-            pass
+        await handler(audit_id, worker_id)
     except Exception as e:
         logger.error(f"[pipeline] {audit_id} error in {state}: {e}", exc_info=True)
         # Don't fail immediately — allow retries on next tick. Permanent

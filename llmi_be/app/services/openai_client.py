@@ -19,10 +19,14 @@ from app.services import cost_tracker
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-# Concurrency control — max 15 parallel OpenAI calls
-# OpenAI rate limits are TPM-based; 5 was too low and caused 600s step
-# timeouts when processing 200+ responses for competitor extraction.
-_semaphore = asyncio.Semaphore(15)
+# Concurrency control — max 30 parallel OpenAI calls.
+# Rationale: pipeline handlers use batch_size=20 and the scheduler runs up to
+# 3 audits concurrently → up to ~60 potential in-flight calls at once. A
+# semaphore below batch_size forces wait-states inside every gather (tasks
+# queued even when the network / provider could serve them). 30 matches
+# the hot-path demand without exceeding OpenAI TPM limits for gpt-5-nano /
+# gpt-5-mini at our current audit throughput.
+_semaphore = asyncio.Semaphore(30)
 
 # Official async OpenAI client
 _client = AsyncOpenAI(api_key=settings.openai_api_key)
@@ -60,10 +64,12 @@ async def _call_openai(messages: list[dict], max_tokens: int = 2048,
             kwargs["response_format"] = response_format
 
         try:
-            # Hard per-call timeout (60s). The SDK default is ~10 minutes,
-            # so without this a single hung connection blocks the surrounding
-            # asyncio.gather, the batch loop, and the per-step wait_for budget.
-            resp = await _client.chat.completions.create(timeout=60.0, **kwargs)
+            # Hard per-call timeout (30s). gpt-5-nano / gpt-5-mini at our
+            # max_tokens budget respond well under 10s for healthy calls;
+            # anything beyond 30s is almost always a hung connection. Fail
+            # fast so the row gets a retry (up to _retry < 3) on the next
+            # scheduler tick instead of tying up a semaphore slot for 60s.
+            resp = await _client.chat.completions.create(timeout=30.0, **kwargs)
             choice = resp.choices[0]
             content = choice.message.content
             if not content:
