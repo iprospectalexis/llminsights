@@ -302,11 +302,21 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
       }
     });
 
+    // availableDates drives the Custom Date Range picker. Sourced from the
+    // UNION of (a) all audits for this project and (b) any date where at
+    // least one citation or llm_response with answer_text exists. This
+    // guarantees the picker is populated on projects that have audits but
+    // zero citations (brand-mention-only dashboards), which used to leave
+    // the picker empty because it was previously gated on processedCitations.
+    const allAvailable = new Set<string>();
+    auditDatesFromAudits.forEach(d => allAvailable.add(d));
+    datesWithData.forEach(d => allAvailable.add(d));
+    processedCitations.forEach(c => {
+      if (c.checked_at) allAvailable.add(c.checked_at.split('T')[0]);
+    });
+    setAvailableDates(Array.from(allAvailable).sort());
+
     if (processedCitations.length > 0) {
-      // Extract available dates from citations
-      const dates = processedCitations.map(c => c.checked_at.split('T')[0]);
-      const uniqueDates = [...new Set(dates)].sort();
-      setAvailableDates(uniqueDates);
 
       // Get audit dates and group citations by audit date
       const auditDatesSet = new Set<string>(auditDatesFromAudits);
