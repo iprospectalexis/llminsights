@@ -1,6 +1,7 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import { useParams, useNavigate } from 'react-router-dom';
-import { ArrowLeft, Download, CircleCheck as CheckCircle2, Circle as XCircle } from 'lucide-react';
+import { ArrowLeft, Download, Brain, ChevronDown, Check, CircleCheck as CheckCircle2, Circle as XCircle } from 'lucide-react';
 import { supabase } from '../lib/supabase';
 import { LoadingSpinner } from '../components/ui/LoadingSpinner';
 import { Button } from '../components/ui/Button';
@@ -74,6 +75,41 @@ export const ProjectPromptsPage: React.FC = () => {
   const [allAudits, setAllAudits] = useState<{ id: string; created_at: string }[]>([]);
   const [allAuditsData, setAllAuditsData] = useState<AllAuditsData[]>([]);
   const [allAuditsLlmList, setAllAuditsLlmList] = useState<string[]>([]);
+
+  // LLM visibility filter — shared between Last audit and All audits tabs.
+  // `null` = all LLMs visible; otherwise a set of LLM keys to show.
+  // Multi-select via checkboxes in the dropdown.
+  const [selectedLlms, setSelectedLlms] = useState<Set<string> | null>(null);
+  const [showLlmDropdown, setShowLlmDropdown] = useState(false);
+  const [llmDropdownPos, setLlmDropdownPos] = useState<{ top: number; left: number; minWidth: number } | null>(null);
+  const llmButtonRef = useRef<HTMLButtonElement | null>(null);
+
+  // Union of LLMs across both tabs' data — drives the filter dropdown options.
+  const availableLlms = Array.from(new Set([...llmList, ...allAuditsLlmList])).sort();
+
+  const toggleLlm = (llm: string) => {
+    setSelectedLlms(prev => {
+      // Starting from "all visible" → first click creates set of all except
+      // the clicked one (feels natural: "hide this LLM")
+      const base = prev ?? new Set(availableLlms);
+      const next = new Set(base);
+      if (next.has(llm)) next.delete(llm);
+      else next.add(llm);
+      // If user toggled back to full set, drop back to null ("all")
+      if (availableLlms.every(l => next.has(l))) return null;
+      return next;
+    });
+  };
+
+  const isLlmVisible = (llm: string): boolean => {
+    if (selectedLlms === null) return true;
+    return selectedLlms.has(llm);
+  };
+
+  const clearLlmFilter = () => {
+    setSelectedLlms(null);
+    setShowLlmDropdown(false);
+  };
 
   useEffect(() => {
     if (id && activeTab === 'visibility') {
@@ -459,7 +495,7 @@ export const ProjectPromptsPage: React.FC = () => {
         .select('brand_name')
         .eq('project_id', id)
         .eq('is_competitor', false);
-      const brandNames = (brandsData || []).map(b => b.brand_name.toLowerCase());
+      const brandNames = (brandsData || []).map((b: any) => b.brand_name.toLowerCase());
       setOwnBrandNames(brandNames);
 
       // Fetch all completed audits within the selected timeframe (oldest first
@@ -474,10 +510,11 @@ export const ProjectPromptsPage: React.FC = () => {
       if (startDate) {
         auditsQuery = auditsQuery.gte('created_at', startDate);
       }
-      const { data: auditsList, error: auditsError } = await auditsQuery;
+      const { data: auditsListRaw, error: auditsError } = await auditsQuery;
       if (auditsError) throw auditsError;
 
-      if (!auditsList || auditsList.length === 0) {
+      const auditsList = (auditsListRaw as { id: string; created_at: string }[] | null) ?? [];
+      if (auditsList.length === 0) {
         setAllAudits([]);
         setAllAuditsData([]);
         setAllAuditsLlmList([]);
@@ -674,15 +711,143 @@ export const ProjectPromptsPage: React.FC = () => {
     return nameMap[llm] || llm;
   };
 
+  // Multi-select LLM filter dropdown — same visual style as the Overview
+  // page (Brain + ChevronDown + LLM icons), but with checkboxes to support
+  // multi-select. Rendered inside toolbars on both tabs.
+  const renderLlmFilter = () => {
+    const selectedCount = selectedLlms === null ? availableLlms.length : selectedLlms.size;
+    const totalCount = availableLlms.length;
+    const label =
+      selectedLlms === null || selectedCount === totalCount
+        ? 'All LLMs'
+        : selectedCount === 0
+          ? 'No LLM selected'
+          : selectedCount === 1
+            ? getLlmDisplayName(Array.from(selectedLlms!)[0])
+            : `${selectedCount} LLMs`;
+
+    return (
+      <div className="relative flex items-center space-x-2">
+        <Brain className="w-4 h-4 text-gray-500" />
+        <div className="relative">
+          <button
+            ref={llmButtonRef}
+            type="button"
+            onClick={() => {
+              if (!showLlmDropdown) {
+                const rect = llmButtonRef.current?.getBoundingClientRect();
+                if (rect) {
+                  setLlmDropdownPos({
+                    top: rect.bottom + 4,
+                    left: rect.left,
+                    minWidth: Math.max(rect.width, 220),
+                  });
+                }
+              }
+              setShowLlmDropdown(!showLlmDropdown);
+            }}
+            className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-xl bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 text-sm flex items-center space-x-2"
+          >
+            <span>{label}</span>
+            <ChevronDown className="w-4 h-4" />
+          </button>
+          {showLlmDropdown && createPortal(
+            <>
+              <div
+                className="fixed inset-0 z-[9998]"
+                onClick={() => setShowLlmDropdown(false)}
+              />
+              <div
+                className="fixed bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded-xl shadow-lg z-[9999] max-h-[400px] overflow-y-auto py-1"
+                style={llmDropdownPos || {}}
+              >
+                {/* Select all / clear */}
+                <button
+                  onClick={clearLlmFilter}
+                  className="w-full flex items-center justify-between px-3 py-2 text-sm hover:bg-gray-100 dark:hover:bg-gray-600 text-gray-700 dark:text-gray-200"
+                >
+                  <span className="font-medium">All LLMs</span>
+                  {selectedLlms === null && <Check className="w-4 h-4 text-[rgb(126,34,206)] dark:text-purple-400" />}
+                </button>
+                <div className="border-t border-gray-200 dark:border-gray-600 my-1" />
+                {availableLlms.length === 0 ? (
+                  <div className="px-3 py-2 text-xs text-gray-500 dark:text-gray-400">
+                    No LLMs in the current data.
+                  </div>
+                ) : (
+                  availableLlms.map((llm) => {
+                    const checked = isLlmVisible(llm);
+                    return (
+                      <button
+                        key={llm}
+                        onClick={() => toggleLlm(llm)}
+                        className="w-full flex items-center justify-between px-3 py-2 text-sm hover:bg-gray-100 dark:hover:bg-gray-600 text-gray-700 dark:text-gray-200"
+                      >
+                        <span className="flex items-center space-x-2">
+                          {LLM_ICONS[llm as keyof typeof LLM_ICONS] && (
+                            <img
+                              src={LLM_ICONS[llm as keyof typeof LLM_ICONS]}
+                              alt=""
+                              className="w-4 h-4 rounded"
+                            />
+                          )}
+                          <span>{getLlmDisplayName(llm)}</span>
+                        </span>
+                        {checked && <Check className="w-4 h-4 text-[rgb(126,34,206)] dark:text-purple-400" />}
+                      </button>
+                    );
+                  })
+                )}
+              </div>
+            </>,
+            document.body
+          )}
+        </div>
+      </div>
+    );
+  };
+
+  const exportAllAuditsToExcel = () => {
+    // Long format — one row per (prompt × LLM × audit). Much easier to
+    // pivot in Excel than a wide 200-column table.
+    const rows: any[] = [];
+    for (const prompt of allAuditsData) {
+      for (const llm of allAuditsLlmList) {
+        if (!isLlmVisible(llm)) continue;
+        const cells = prompt.cells[llm] || [];
+        cells.forEach((cell, idx) => {
+          const audit = allAudits[idx];
+          rows.push({
+            'Prompt': prompt.prompt_text,
+            'Group': prompt.prompt_group,
+            'LLM': getLlmDisplayName(llm),
+            'Audit Date': audit ? new Date(audit.created_at).toISOString().split('T')[0] : '',
+            'Mentioned': cell === null ? '-' : cell.mentioned ? 'Yes' : 'No',
+            'Cited': cell === null ? '-' : cell.cited ? 'Yes' : 'No',
+            'Citation URLs': cell?.urls.join(', ') || '',
+          });
+        });
+      }
+    }
+
+    const worksheet = XLSX.utils.json_to_sheet(rows);
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, 'All Audits');
+    const rangeLabel =
+      dateRange === 'all' ? 'all_time' : dateRange === '7d' ? 'last_7d' : dateRange === '30d' ? 'last_30d' : 'last_90d';
+    XLSX.writeFile(workbook, `${project?.name || 'project'}_all_audits_${rangeLabel}.xlsx`);
+  };
+
   const exportToExcel = () => {
-    // Create data for Excel export
+    // Honour the LLM filter on export — skip hidden columns.
+    const llmsToExport = llmList.filter(isLlmVisible);
     const excelData = visibilityData.map((row) => {
       const rowData: any = {
         'Prompt': row.prompt_text,
         'Group': row.prompt_group
       };
 
-      llmList.forEach((llm) => {
+      llmsToExport.forEach((llm) => {
         const response = row.llm_responses.find((r) => r.llm_name === llm);
         const llmDisplayName = getLlmDisplayName(llm);
 
@@ -1053,26 +1218,37 @@ export const ProjectPromptsPage: React.FC = () => {
         {/* All Audits Tab Content */}
         {activeTab === 'all-audits' && (
           <>
-            {/* Date range + summary */}
+            {/* Toolbar: timeframe, LLM filter, export */}
             <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
-              <div className="flex items-center gap-2">
-                <label className="text-sm text-gray-600 dark:text-gray-400">Timeframe:</label>
-                <select
-                  value={dateRange}
-                  onChange={(e) => setDateRange(e.target.value as DateRange)}
-                  className="text-sm bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-1.5 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-purple-500"
-                >
-                  <option value="7d">Last 7 days</option>
-                  <option value="30d">Last 30 days</option>
-                  <option value="90d">Last 90 days</option>
-                  <option value="all">All time</option>
-                </select>
+              <div className="flex flex-wrap items-center gap-3">
+                <div className="flex items-center gap-2">
+                  <label className="text-sm text-gray-600 dark:text-gray-400">Timeframe:</label>
+                  <select
+                    value={dateRange}
+                    onChange={(e) => setDateRange(e.target.value as DateRange)}
+                    className="text-sm bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-1.5 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                  >
+                    <option value="7d">Last 7 days</option>
+                    <option value="30d">Last 30 days</option>
+                    <option value="90d">Last 90 days</option>
+                    <option value="all">All time</option>
+                  </select>
+                </div>
+                {renderLlmFilter()}
                 {!loading && allAudits.length > 0 && (
-                  <span className="text-xs text-gray-500 dark:text-gray-400 ml-2">
-                    {allAudits.length} audit{allAudits.length === 1 ? '' : 's'} · oldest {new Date(allAudits[0].created_at).toLocaleDateString()} → newest {new Date(allAudits[allAudits.length - 1].created_at).toLocaleDateString()}
+                  <span className="text-xs text-gray-500 dark:text-gray-400">
+                    {allAudits.length} audit{allAudits.length === 1 ? '' : 's'} · {new Date(allAudits[0].created_at).toLocaleDateString()} → {new Date(allAudits[allAudits.length - 1].created_at).toLocaleDateString()}
                   </span>
                 )}
               </div>
+              <Button
+                onClick={exportAllAuditsToExcel}
+                variant="outline"
+                disabled={loading || allAudits.length === 0}
+              >
+                <Download className="w-4 h-4 mr-2" />
+                Export to Excel
+              </Button>
             </div>
 
             {loading ? (
@@ -1096,7 +1272,7 @@ export const ProjectPromptsPage: React.FC = () => {
                           <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 dark:text-gray-400 uppercase tracking-wider bg-gray-50 dark:bg-gray-900">
                             Group
                           </th>
-                          {allAuditsLlmList.map((llm) => (
+                          {allAuditsLlmList.filter(isLlmVisible).map((llm) => (
                             <th
                               key={llm}
                               className="px-4 py-4 text-center border-l border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900"
@@ -1130,7 +1306,7 @@ export const ProjectPromptsPage: React.FC = () => {
                         {allAuditsData.length === 0 ? (
                           <tr>
                             <td
-                              colSpan={allAuditsLlmList.length * 2 + 2}
+                              colSpan={allAuditsLlmList.filter(isLlmVisible).length * 2 + 2}
                               className="px-6 py-12 text-center text-gray-500 dark:text-gray-400"
                             >
                               No response data across audits in this timeframe.
@@ -1155,7 +1331,7 @@ export const ProjectPromptsPage: React.FC = () => {
                                   {row.prompt_group}
                                 </span>
                               </td>
-                              {allAuditsLlmList.map((llm) => {
+                              {allAuditsLlmList.filter(isLlmVisible).map((llm) => {
                                 const cells = row.cells[llm] || [];
                                 return (
                                   <React.Fragment key={llm}>
@@ -1175,18 +1351,12 @@ export const ProjectPromptsPage: React.FC = () => {
                                               </span>
                                             );
                                           }
-                                          return cell.mentioned ? (
-                                            <CheckCircle2
-                                              key={idx}
-                                              title={`${auditDate} — mentioned`}
-                                              className="w-4 h-4 text-green-500"
-                                            />
-                                          ) : (
-                                            <XCircle
-                                              key={idx}
-                                              title={`${auditDate} — not mentioned`}
-                                              className="w-4 h-4 text-red-400"
-                                            />
+                                          return (
+                                            <span key={idx} title={`${auditDate} — ${cell.mentioned ? 'mentioned' : 'not mentioned'}`} className="inline-flex">
+                                              {cell.mentioned
+                                                ? <CheckCircle2 className="w-4 h-4 text-green-500" />
+                                                : <XCircle className="w-4 h-4 text-red-400" />}
+                                            </span>
                                           );
                                         })}
                                       </div>
@@ -1207,18 +1377,12 @@ export const ProjectPromptsPage: React.FC = () => {
                                               </span>
                                             );
                                           }
-                                          return cell.cited ? (
-                                            <CheckCircle2
-                                              key={idx}
-                                              title={`${auditDate} — cited`}
-                                              className="w-4 h-4 text-green-500"
-                                            />
-                                          ) : (
-                                            <XCircle
-                                              key={idx}
-                                              title={`${auditDate} — not cited`}
-                                              className="w-4 h-4 text-red-400"
-                                            />
+                                          return (
+                                            <span key={idx} title={`${auditDate} — ${cell.cited ? 'cited' : 'not cited'}`} className="inline-flex">
+                                              {cell.cited
+                                                ? <CheckCircle2 className="w-4 h-4 text-green-500" />
+                                                : <XCircle className="w-4 h-4 text-red-400" />}
+                                            </span>
                                           );
                                         })}
                                       </div>
@@ -1277,13 +1441,14 @@ export const ProjectPromptsPage: React.FC = () => {
               </div>
             ) : (
               <>
-                {/* Export Button */}
-            <div className="flex justify-end mb-4">
-              <Button onClick={exportToExcel} variant="outline">
-                <Download className="w-4 h-4 mr-2" />
-                Export to Excel
-              </Button>
-            </div>
+                {/* Toolbar: LLM filter + export */}
+                <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+                  {renderLlmFilter()}
+                  <Button onClick={exportToExcel} variant="outline">
+                    <Download className="w-4 h-4 mr-2" />
+                    Export to Excel
+                  </Button>
+                </div>
 
             {/* Visibility Table */}
             <div className="bg-white dark:bg-gray-800 rounded-xl shadow-sm overflow-hidden">
@@ -1297,7 +1462,7 @@ export const ProjectPromptsPage: React.FC = () => {
                       <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 dark:text-gray-400 uppercase tracking-wider bg-gray-50 dark:bg-gray-900">
                         Group
                       </th>
-                      {llmList.map((llm) => (
+                      {llmList.filter(isLlmVisible).map((llm) => (
                         <th
                           key={llm}
                           className="px-6 py-4 text-center border-l border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900"
@@ -1331,7 +1496,7 @@ export const ProjectPromptsPage: React.FC = () => {
                     {visibilityData.length === 0 ? (
                       <tr>
                         <td
-                          colSpan={llmList.length * 2 + 2}
+                          colSpan={llmList.filter(isLlmVisible).length * 2 + 2}
                           className="px-6 py-12 text-center text-gray-500 dark:text-gray-400"
                         >
                           No audit data available. Run an audit to see visibility data.
@@ -1356,7 +1521,7 @@ export const ProjectPromptsPage: React.FC = () => {
                               {row.prompt_group}
                             </span>
                           </td>
-                          {llmList.map((llm) => {
+                          {llmList.filter(isLlmVisible).map((llm) => {
                             const response = row.llm_responses.find((r) => r.llm_name === llm);
 
                             if (!response) {
