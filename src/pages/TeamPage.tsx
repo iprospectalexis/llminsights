@@ -430,27 +430,37 @@ export const TeamPage: React.FC = () => {
   const handleEditUser = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!selectedUser) return;
-    
+
     setSubmitting(true);
 
     try {
-      const { error } = await supabase
-        .from('users')
-        .update({
-          full_name: editForm.fullName,
+      // Role changes MUST go through the update-user-role Edge Function so
+      // auth.users.app_metadata.role and refresh tokens are kept in sync.
+      // Updating public.users directly would silently desync the JWT and
+      // produce empty widgets for the edited user (the Valentine bug).
+      const { data: sessionData } = await supabase.auth.getSession();
+      const token = sessionData.session?.access_token;
+
+      const { data, error } = await supabase.functions.invoke('update-user-role', {
+        body: {
+          userId: selectedUser.id,
           role: editForm.role,
-          updated_at: new Date().toISOString()
-        })
-        .eq('id', selectedUser.id);
+          fullName: editForm.fullName,
+        },
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      });
 
       if (error) throw error;
+      if (!data?.success) throw new Error(data?.error || 'Failed to update user');
 
       setShowEditModal(false);
       setSelectedUser(null);
       fetchUsers();
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error updating user:', error);
-      alert('Failed to update user. Please try again.');
+      alert(`Failed to update user: ${error?.message || 'Please try again.'}`);
     }
     setSubmitting(false);
   };

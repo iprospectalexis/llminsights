@@ -14,6 +14,10 @@ export const AppLayout: React.FC = () => {
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
+  // Set when the JWT's app_metadata.role disagrees with public.users.role
+  // AND a refreshSession() didn't heal it. The banner tells the user to
+  // sign in again so their server-side role propagates into a fresh JWT.
+  const [staleSessionBanner, setStaleSessionBanner] = useState<string | null>(null);
   const navigate = useNavigate();
   const location = useLocation();
 
@@ -32,7 +36,7 @@ export const AppLayout: React.FC = () => {
 
   const checkAuth = async () => {
     try {
-      const { data: { session } } = await supabase.auth.getSession();
+      let { data: { session } } = await supabase.auth.getSession();
 
       if (!session?.user) {
         navigate('/signin');
@@ -61,6 +65,33 @@ export const AppLayout: React.FC = () => {
         });
       } else {
         setUserProfile(profile);
+      }
+
+      // ── Stale-JWT self-heal ────────────────────────────────────────
+      // If the session's JWT role disagrees with the role in public.users,
+      // the user's browser is carrying an outdated claim set (typical cause:
+      // their role was changed while they were signed in). refreshSession()
+      // re-issues a JWT from the latest auth.users.raw_app_meta_data; if
+      // that still doesn't match, auth.users itself is stale and only a
+      // fresh sign-in will fix it (Layer 2 now handles this on write, but
+      // pre-existing sessions from before the fix shipped need this).
+      if (profile?.role) {
+        const currentJwtRole = (session.user as any).app_metadata?.role ?? null;
+        if (currentJwtRole !== profile.role) {
+          const { data: refreshed } = await supabase.auth.refreshSession();
+          session = refreshed?.session ?? session;
+          const newJwtRole = (refreshed?.session?.user as any)?.app_metadata?.role ?? null;
+          if (newJwtRole !== profile.role) {
+            setStaleSessionBanner(
+              `Your session is out of date (role in token: ${newJwtRole ?? 'none'}, expected: ${profile.role}). ` +
+              `Sign out and back in to refresh your access.`
+            );
+          } else if (refreshed?.session?.user) {
+            // Refresh picked up the right claims — update the in-page user
+            // so the sidebar / navbar reflect the new role immediately.
+            setUser(refreshed.session.user);
+          }
+        }
       }
     } catch (error) {
       console.error('Auth check error:', error);
@@ -129,6 +160,20 @@ export const AppLayout: React.FC = () => {
             onMobileMenuToggle={() => setIsMobileMenuOpen(!isMobileMenuOpen)}
           />
           <main className="flex-1 overflow-auto">
+            {staleSessionBanner && (
+              <div className="bg-amber-50 dark:bg-amber-900/30 border-b border-amber-200 dark:border-amber-700/50 text-amber-900 dark:text-amber-200 px-4 py-3 flex items-center justify-between gap-3">
+                <div className="text-sm">{staleSessionBanner}</div>
+                <button
+                  onClick={async () => {
+                    await supabase.auth.signOut();
+                    navigate('/signin');
+                  }}
+                  className="text-xs font-medium px-3 py-1 rounded-lg bg-amber-600 text-white hover:bg-amber-700 flex-shrink-0"
+                >
+                  Sign out
+                </button>
+              </div>
+            )}
             <div className="p-3 md:p-6">
               <Outlet />
             </div>
