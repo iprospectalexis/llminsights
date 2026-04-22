@@ -135,10 +135,12 @@ async def main():
                 citations = json.dumps(result["citations"]) if result.get("citations") else None
                 all_sources = json.dumps(result["all_sources"]) if result.get("all_sources") else None
                 links = json.dumps(result["links_attached"]) if result.get("links_attached") else None
-                # web_search_query can be a list from the provider — stringify it
+                # web_search_query can be a list from the provider — stringify it.
+                # ensure_ascii=False preserves non-ASCII chars so the frontend
+                # doesn't see "durabilit\u00e9" instead of "durabilité".
                 ws_query = result.get("web_search_query")
                 if isinstance(ws_query, list):
-                    ws_query = json.dumps(ws_query)
+                    ws_query = json.dumps(ws_query, ensure_ascii=False)
 
                 await conn.execute(text("""
                     UPDATE llm_responses SET

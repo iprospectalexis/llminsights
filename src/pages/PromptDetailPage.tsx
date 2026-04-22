@@ -10,7 +10,7 @@ import { supabase } from '../lib/supabase';
 import {
   Calendar, FileText, BarChart3, Globe, ArrowLeft, Brain,
   Filter, Download, ExternalLink, MessageSquare, Clock, Eye, X,
-  Award, TrendingUp, ThumbsUp, ThumbsDown, Minus, Users
+  Award, TrendingUp, ThumbsUp, ThumbsDown, Minus, Users, Search
 } from 'lucide-react';
 import { format } from 'date-fns';
 
@@ -937,35 +937,72 @@ export const PromptDetailPage: React.FC = () => {
 
               {/* Web Search Queries */}
               {(() => {
-                const queries = filteredResponses
-                  .map(r => r.web_search_query)
-                  .filter(q => q && q.trim() !== '');
+                // Normalise `web_search_query` — historically stored inconsistently:
+                //   • raw string            → "durabilité sacs"
+                //   • JSON array (unicode)  → '["qualité...", "durabilité..."]'
+                //   • JSON array (escaped)  → '["qualit\\u00e9...", "durabilit\\u00e9..."]'
+                // Parse JSON when it looks like an array, fall back to the raw string.
+                const normalise = (raw: unknown): string[] => {
+                  if (!raw) return [];
+                  if (Array.isArray(raw)) return raw.map(String).filter(Boolean);
+                  if (typeof raw !== 'string') return [];
+                  const trimmed = raw.trim();
+                  if (!trimmed) return [];
+                  if (trimmed.startsWith('[')) {
+                    try {
+                      const parsed = JSON.parse(trimmed);
+                      if (Array.isArray(parsed)) {
+                        return parsed.map(String).map(s => s.trim()).filter(Boolean);
+                      }
+                    } catch {
+                      // fall through — treat as plain string
+                    }
+                  }
+                  return [trimmed];
+                };
 
+                const queries = filteredResponses.flatMap(r => normalise(r.web_search_query));
                 if (queries.length === 0) return null;
 
-                // Count query frequencies
-                const queryCounts = queries.reduce((acc, query) => {
-                  acc[query] = (acc[query] || 0) + 1;
-                  return acc;
-                }, {} as Record<string, number>);
-
-                // Sort by frequency (most frequent first)
-                const sortedQueries = Object.entries(queryCounts)
+                // Count query frequencies (case-insensitive, trimmed)
+                const queryCounts = new Map<string, number>();
+                for (const q of queries) {
+                  const key = q.toLowerCase();
+                  queryCounts.set(key, (queryCounts.get(key) || 0) + 1);
+                }
+                // Keep one canonical display form per lowercase key (first seen).
+                const displayByKey = new Map<string, string>();
+                for (const q of queries) {
+                  const key = q.toLowerCase();
+                  if (!displayByKey.has(key)) displayByKey.set(key, q);
+                }
+                const sortedQueries = Array.from(queryCounts.entries())
                   .sort(([, a], [, b]) => b - a);
 
                 return (
                   <div className="bg-gray-50 dark:bg-gray-700 rounded-2xl p-4">
-                    <h3 className="font-medium text-gray-900 dark:text-gray-100 mb-3">Web Search Queries</h3>
-                    <div className="space-y-2">
-                      {sortedQueries.map(([query, count]) => (
-                        <div key={query} className="flex items-center justify-between p-2 bg-white dark:bg-gray-600 rounded-lg">
-                          <span className="text-sm text-gray-700 dark:text-gray-300 flex-1">{query}</span>
+                    <h3 className="font-medium text-gray-900 dark:text-gray-100 mb-3 flex items-center gap-2">
+                      <Search className="w-4 h-4 text-gray-500 dark:text-gray-400" />
+                      Web Search Queries
+                      <span className="text-xs font-normal text-gray-500 dark:text-gray-400">
+                        ({sortedQueries.length} unique)
+                      </span>
+                    </h3>
+                    <div className="flex flex-wrap gap-2">
+                      {sortedQueries.map(([key, count]) => (
+                        <span
+                          key={key}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-white dark:bg-gray-600 border border-gray-200 dark:border-gray-500 rounded-full text-sm text-gray-700 dark:text-gray-200 shadow-sm"
+                          title={displayByKey.get(key)}
+                        >
+                          <Search className="w-3 h-3 text-gray-400 dark:text-gray-400 flex-shrink-0" />
+                          <span>{displayByKey.get(key)}</span>
                           {count > 1 && (
-                            <span className="ml-3 px-2 py-1 text-xs font-medium bg-brand-primary/10 text-brand-primary rounded-full">
+                            <span className="ml-1 px-1.5 py-0.5 text-xs font-medium bg-brand-primary/10 text-brand-primary rounded-full">
                               {count}×
                             </span>
                           )}
-                        </div>
+                        </span>
                       ))}
                     </div>
                   </div>
