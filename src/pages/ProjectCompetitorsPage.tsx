@@ -63,6 +63,12 @@ export const ProjectCompetitorsPage: React.FC = () => {
 
   const [dateRange, setDateRange] = useState<DateRange>('30d');
 
+  // Positioning matrix: limit how many brands are rendered so the chart stays
+  // readable when a project has a long tail of low-SOV brands. The own brand
+  // is always included on top of the top-N cap. "all" disables the cap.
+  type MatrixTopN = 10 | 20 | 50 | 'all';
+  const [matrixTopN, setMatrixTopN] = useState<MatrixTopN>(20);
+
   // LLM multi-select filter — same pattern as ProjectPromptsPage
   const [selectedLlms, setSelectedLlms] = useState<Set<string> | null>(null);
   const [showLlmDropdown, setShowLlmDropdown] = useState(false);
@@ -310,18 +316,35 @@ export const ProjectCompetitorsPage: React.FC = () => {
   }, [competitors, audits]);
 
   // ────── positioning matrix data ────────────────────────────────────
-  const matrixData = useMemo(() => {
-    return stats
-      .filter(s => s.mentions > 0)
-      .map(s => ({
-        name: s.name,
-        isOwn: s.isOwn,
-        sov: +(s.sov * 100).toFixed(1),
-        sentiment: +s.sentimentAvg.toFixed(2),
-        mentions: s.mentions,
-        key: s.key,
-      }));
-  }, [stats]);
+  // `withMentions`: everything eligible for the chart (mentions > 0), sorted
+  // by mentions desc so slicing top-N is straightforward.
+  const withMentions = useMemo(
+    () => stats.filter(s => s.mentions > 0).sort((a, b) => b.mentions - a.mentions),
+    [stats]
+  );
+
+  // Which brands make the cut: top-N by mentions, but the own brand is always
+  // included so the user always sees their own position on the matrix.
+  const { visibleStats, overflowStats } = useMemo(() => {
+    if (matrixTopN === 'all') {
+      return { visibleStats: withMentions, overflowStats: [] as CompetitorStats[] };
+    }
+    const top = withMentions.slice(0, matrixTopN);
+    const ownOutside = withMentions.find(s => s.isOwn && !top.includes(s));
+    const visible = ownOutside ? [...top, ownOutside] : top;
+    const overflow = withMentions.filter(s => !visible.includes(s));
+    return { visibleStats: visible, overflowStats: overflow };
+  }, [withMentions, matrixTopN]);
+
+  const matrixData = useMemo(() => visibleStats.map(s => ({
+    name: s.name,
+    isOwn: s.isOwn,
+    sov: +(s.sov * 100).toFixed(1),
+    sentiment: +s.sentimentAvg.toFixed(2),
+    mentions: s.mentions,
+    key: s.key,
+    hasSentiment: s.hasSentiment,
+  })), [visibleStats]);
   const allBrandNames = useMemo(() => stats.map(s => s.name), [stats]);
 
   // ────── excel export ────────────────────────────────────────────────
@@ -502,7 +525,7 @@ export const ProjectCompetitorsPage: React.FC = () => {
 
             {/* Positioning matrix */}
             <div className="bg-white dark:bg-gray-800 rounded-2xl border border-gray-100 dark:border-gray-700 shadow-sm p-6 mb-8">
-              <div className="flex items-start justify-between mb-4">
+              <div className="flex items-start justify-between gap-4 flex-wrap mb-4">
                 <div>
                   <h2 className="text-lg font-semibold text-gray-900 dark:text-white flex items-center gap-2">
                     <Award className="w-5 h-5 text-[rgb(126,34,206)] dark:text-purple-400" />
@@ -512,13 +535,37 @@ export const ProjectCompetitorsPage: React.FC = () => {
                     X: Share of Voice · Y: avg sentiment · bubble size: total mentions. Top-right = dominant + positively framed.
                   </p>
                 </div>
-                <div className="flex items-center gap-3 text-xs">
-                  <span className="flex items-center gap-1.5">
-                    <span className="inline-block w-3 h-3 rounded-full" style={{ background: OWN_BRAND_COLOR }} /> Own brand
-                  </span>
-                  <span className="flex items-center gap-1.5 text-gray-500 dark:text-gray-400">
-                    <span className="inline-block w-3 h-3 rounded-full bg-gray-400" /> Competitor
-                  </span>
+                <div className="flex items-center gap-4 flex-wrap">
+                  <div className="flex items-center gap-2 text-xs">
+                    <label className="text-gray-500 dark:text-gray-400">Show top:</label>
+                    <select
+                      value={matrixTopN}
+                      onChange={(e) => {
+                        const v = e.target.value;
+                        setMatrixTopN(v === 'all' ? 'all' : (Number(v) as MatrixTopN));
+                      }}
+                      className="bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded-lg px-2 py-1 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                    >
+                      <option value="10">10</option>
+                      <option value="20">20</option>
+                      <option value="50">50</option>
+                      <option value="all">All</option>
+                    </select>
+                    <span className="text-gray-400 dark:text-gray-500">
+                      {visibleStats.length} / {withMentions.length}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-3 text-xs">
+                    <span className="flex items-center gap-1.5">
+                      <span className="inline-block w-3 h-3 rounded-full" style={{ background: OWN_BRAND_COLOR }} /> Own brand
+                    </span>
+                    <span className="flex items-center gap-1.5 text-gray-500 dark:text-gray-400">
+                      <span className="inline-block w-3 h-3 rounded-full bg-gray-400" /> Competitor
+                    </span>
+                    <span className="flex items-center gap-1.5 text-gray-500 dark:text-gray-400">
+                      <span className="inline-block w-3 h-3 rounded-full border-2 border-gray-400 bg-transparent" /> No sentiment
+                    </span>
+                  </div>
                 </div>
               </div>
               <div className="h-[420px]">
@@ -572,24 +619,86 @@ export const ProjectCompetitorsPage: React.FC = () => {
                       }}
                     />
                     <Scatter name="Brands" data={matrixData} shape="circle" isAnimationActive animationDuration={800}>
-                      {matrixData.map((d) => (
-                        <Cell
-                          key={d.key}
-                          fill={bubbleColour(d)}
-                          stroke={d.isOwn ? '#92400e' : '#ffffff'}
-                          strokeWidth={d.isOwn ? 2 : 1}
-                          fillOpacity={0.82}
-                        />
-                      ))}
+                      {matrixData.map((d) => {
+                        const color = bubbleColour(d);
+                        return (
+                          <Cell
+                            key={d.key}
+                            // Hollow bubble for brands with no sentiment data —
+                            // visually distinguishes "unknown" from "neutral".
+                            fill={d.hasSentiment ? color : 'transparent'}
+                            stroke={d.isOwn ? '#92400e' : color}
+                            strokeWidth={d.isOwn ? 2.5 : d.hasSentiment ? 1 : 2}
+                            fillOpacity={d.hasSentiment ? 0.82 : 0}
+                          />
+                        );
+                      })}
                       <LabelList
                         dataKey="name"
                         position="top"
                         style={{ fontSize: 11, fill: '#374151' }}
+                        content={(props: any) => {
+                          const { x, y, value, index } = props;
+                          if (x === undefined || y === undefined || value === undefined) return null;
+                          const d = matrixData[index];
+                          if (!d) return null;
+                          const suffix = d.hasSentiment ? '' : ' (no data)';
+                          return (
+                            <text
+                              x={x}
+                              y={y - 8}
+                              textAnchor="middle"
+                              fontSize={11}
+                              fill="#374151"
+                              className="recharts-text"
+                            >
+                              {value}{suffix}
+                            </text>
+                          );
+                        }}
                       />
                     </Scatter>
                   </ScatterChart>
                 </ResponsiveContainer>
               </div>
+
+              {overflowStats.length > 0 && (
+                <details className="mt-4 group">
+                  <summary className="cursor-pointer text-xs text-gray-600 dark:text-gray-300 hover:text-gray-900 dark:hover:text-gray-100 select-none flex items-center gap-1.5">
+                    <ChevronDown className="w-3.5 h-3.5 group-open:rotate-180 transition-transform" />
+                    <span>
+                      + {overflowStats.length} more brand{overflowStats.length === 1 ? '' : 's'} not shown on the matrix
+                    </span>
+                  </summary>
+                  <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-x-4 gap-y-1.5 text-xs">
+                    {overflowStats.map((s) => (
+                      <div
+                        key={s.key}
+                        className="flex items-center justify-between px-2 py-1 rounded hover:bg-gray-50 dark:hover:bg-gray-700/40"
+                      >
+                        <span className="flex items-center gap-2 truncate min-w-0">
+                          <span
+                            className="inline-block w-2 h-2 rounded-full flex-shrink-0"
+                            style={{ background: bubbleColour(s) }}
+                          />
+                          <span className="truncate text-gray-700 dark:text-gray-200" title={s.name}>
+                            {s.name}
+                          </span>
+                        </span>
+                        <span className="flex items-center gap-2 text-gray-500 dark:text-gray-400 flex-shrink-0 tabular-nums">
+                          <span>{s.mentions} mention{s.mentions === 1 ? '' : 's'}</span>
+                          <span className="text-gray-400 dark:text-gray-500">·</span>
+                          <span>
+                            {s.hasSentiment
+                              ? `${s.sentimentAvg >= 0 ? '+' : ''}${s.sentimentAvg.toFixed(2)}`
+                              : '—'}
+                          </span>
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </details>
+              )}
             </div>
 
             {/* Leaderboard */}

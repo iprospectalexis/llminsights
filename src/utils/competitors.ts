@@ -62,6 +62,10 @@ export interface CompetitorStats {
   mentions: number;
   sov: number; // 0..1 — share of total mentions across all brands
   sentimentAvg: number; // mean score, 0 if no sentiment rows
+  // True if we have at least one sentiment row for this brand (any label,
+  // any score). Distinguishes genuine "neutral" from "no data" — critical
+  // for the Competitors matrix which plots sentiment on Y.
+  hasSentiment: boolean;
   sentimentCounts: {
     positive: number;
     neutral: number;
@@ -298,6 +302,13 @@ export function aggregateCompetitors(params: {
       };
     });
 
+    const sentimentRowCount =
+      a.sentimentCounts.positive +
+      a.sentimentCounts.neutral +
+      a.sentimentCounts.negative +
+      a.sentimentCounts.mention_only;
+    const hasSentiment = sentimentRowCount > 0 || a.sentimentScores.length > 0;
+
     return {
       name: a.name,
       key: a.key,
@@ -305,6 +316,7 @@ export function aggregateCompetitors(params: {
       mentions: a.mentions,
       sov: totalMentions > 0 ? a.mentions / totalMentions : 0,
       sentimentAvg,
+      hasSentiment,
       sentimentCounts: a.sentimentCounts,
       mentionTypeCounts: a.mentionTypeCounts,
       avgRank,
