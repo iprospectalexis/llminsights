@@ -37,6 +37,43 @@ MODEL_SENTIMENT = "gpt-5-mini"         # sentiment analysis (needs nuanced scori
 SENTIMENT_PROMPT_VERSION = "v2.1-2026-04-07"
 
 
+# Strict schema for competitor extraction. Using json_schema instead of
+# json_object lets OpenAI constrain the output shape without the model
+# spending reasoning tokens planning the JSON structure — big latency win
+# on gpt-5-nano. Shape mirrors what the prompt has always asked for.
+COMPETITORS_SCHEMA = {
+    "name": "competitor_brands",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "brands": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "name": {"type": "string"},
+                        "strengths": {"type": "array", "items": {"type": "string"}},
+                        "weaknesses": {"type": "array", "items": {"type": "string"}},
+                        "mention_type": {
+                            "type": "string",
+                            "enum": ["recommended", "compared", "mentioned"],
+                        },
+                        "rank": {"type": ["integer", "null"]},
+                    },
+                    "required": [
+                        "name", "strengths", "weaknesses", "mention_type", "rank",
+                    ],
+                },
+            },
+        },
+        "required": ["brands"],
+    },
+}
+
+
 async def _call_openai(messages: list[dict], max_tokens: int = 2048,
                         response_format: Optional[dict] = None,
                         _ctx: Optional[dict] = None,
@@ -64,12 +101,15 @@ async def _call_openai(messages: list[dict], max_tokens: int = 2048,
             kwargs["response_format"] = response_format
 
         try:
-            # Hard per-call timeout (30s). gpt-5-nano / gpt-5-mini at our
-            # max_tokens budget respond well under 10s for healthy calls;
-            # anything beyond 30s is almost always a hung connection. Fail
-            # fast so the row gets a retry (up to _retry < 3) on the next
-            # scheduler tick instead of tying up a semaphore slot for 60s.
-            resp = await _client.chat.completions.create(timeout=30.0, **kwargs)
+            # Hard per-call timeout (60s). Healthy gpt-5-nano / gpt-5-mini
+            # calls complete in 3-8s once max_tokens is correctly sized.
+            # 60s is enough headroom for the slow-but-working tail (long
+            # Perplexity / Gemini inputs, slow pods) while still bounding
+            # how long a single call can hold a semaphore slot. The
+            # extract_competitors retry-loop also retries on timeout, so a
+            # one-off 60s stall triggers a 2s-backoff retry inside the
+            # same call instead of waiting 15s for the next scheduler tick.
+            resp = await _client.chat.completions.create(timeout=60.0, **kwargs)
             choice = resp.choices[0]
             content = choice.message.content
             if not content:
@@ -221,12 +261,23 @@ async def extract_competitors(
         },
     ]
 
-    for attempt in range(2):  # Retry once on empty output
+    for attempt in range(2):  # Retry once on empty output / transient errors
         try:
-            raw = await _call_openai(messages, max_tokens=16384,
-                                      response_format={"type": "json_object"},
-                                      _ctx=_ctx, _operation="competitors_extract",
-                                      model=MODEL_COMPETITORS)
+            # max_tokens: 4096 is ample for brand extraction (successful outputs
+            # are <500 tokens in practice) and avoids the gpt-5-nano "think-a-lot"
+            # behaviour triggered by 16384. If we ever see finish_reason=length in
+            # the warning log (see _call_openai line ~81), bump back up to 8192.
+            # response_format: strict json_schema skips JSON-shape planning inside
+            # the model and guarantees valid output — also removes the need for
+            # the defensive "Invalid structure" branch below.
+            raw = await _call_openai(
+                messages,
+                max_tokens=4096,
+                response_format={"type": "json_schema", "json_schema": COMPETITORS_SCHEMA},
+                _ctx=_ctx,
+                _operation="competitors_extract",
+                model=MODEL_COMPETITORS,
+            )
             if not raw:
                 if attempt == 0:
                     logger.warning("OpenAI returned empty output, retrying...")
@@ -240,7 +291,19 @@ async def extract_competitors(
             return data
 
         except Exception as e:
-            if attempt == 0 and "rate" in str(e).lower():
+            # Retry once on transient provider failures. Previously only "rate"
+            # matched, which missed the dominant failure mode: request timeouts
+            # and connection resets on slow OpenAI pods. Catching those here
+            # recovers in ~2s instead of waiting a full 15s scheduler tick.
+            msg = str(e).lower()
+            transient = (
+                "rate" in msg
+                or "timeout" in msg
+                or "timed out" in msg
+                or "connection" in msg
+                or " 502" in msg or " 503" in msg or " 504" in msg
+            )
+            if attempt == 0 and transient:
                 await asyncio.sleep(2)
                 continue
             logger.error(f"Competitor extraction failed: {e}")
