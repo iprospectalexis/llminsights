@@ -289,12 +289,28 @@ async def run_audit(req: RunAuditRequest, background_tasks: BackgroundTasks):
     enable_sentiment = req.enableSentiment if req.enableSentiment is not None else True
     force_web_search = req.forceWebSearch if req.forceWebSearch is not None else True
 
-    # Get project
+    # Get project. We split three distinct failure modes that the previous
+    # blanket handler conflated into a misleading "Invalid project ID" 400:
+    #   - Bad UUID syntax           → 400 with the real driver error
+    #   - DB/transport failure      → 500 with the real exception
+    #   - Project missing or no RLS access → 404 "Project not found"
+    import uuid as _uuid_mod
+    try:
+        _uuid_mod.UUID(str(req.projectId))
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(status_code=400, detail=f"projectId is not a valid UUID: {req.projectId!r}")
+
     try:
         project = await db.get_project_with_prompts(req.projectId)
     except Exception as e:
-        logger.error(f"[run-audit] Error fetching project {req.projectId}: {e}")
-        raise HTTPException(status_code=400, detail=f"Invalid project ID: {req.projectId}")
+        logger.error(
+            f"[run-audit] DB error fetching project {req.projectId}: {type(e).__name__}: {e}",
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Database error while loading project: {type(e).__name__}: {str(e)[:300]}",
+        )
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
