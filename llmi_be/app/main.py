@@ -121,6 +121,72 @@ app.add_middleware(
 )
 
 
+# ── Supavisor transient-drop retry middleware ─────────────────────────
+# Background: Supavisor (Supabase's transaction-mode pooler) periodically
+# drops client-side connections silently. With NullPool we open a fresh
+# connection per session, but Supavisor can kill it between connect and
+# _start_transaction → asyncpg.ConnectionDoesNotExistError → SQLAlchemy
+# DBAPIError → 500 to the user.
+#
+# The SupabaseDB class is already wrapped with _retry_transient. This
+# middleware catches the SAME class of error for endpoints that talk to
+# the DB via ORM sessions (Depends(get_db)) — primarily the OneSearch
+# /api/v1/jobs* surface and the /dashboard UI which polls it.
+#
+# Safety: we only retry when the error message matches a transient-drop
+# token AND only up to 2 extra attempts. For mutating methods this is
+# safe in practice because the drop happens at `_start_transaction` —
+# the transaction never began, so no write has been committed.
+@app.middleware("http")
+async def retry_transient_db_drops(request, call_next):
+    from sqlalchemy.exc import DBAPIError, OperationalError
+
+    _TRANSIENT_TOKENS = (
+        "connectiondoesnotexisterror",
+        "connection was closed",
+        "server closed the connection",
+        "ssl connection has been closed",
+        "connection reset",
+        "connection refused",
+    )
+
+    def _is_transient(e: BaseException) -> bool:
+        msg = str(e).lower()
+        return any(tok in msg for tok in _TRANSIENT_TOKENS)
+
+    attempts = 3
+    last_exc: BaseException | None = None
+    for i in range(attempts):
+        try:
+            return await call_next(request)
+        except (DBAPIError, OperationalError) as e:
+            if not _is_transient(e):
+                raise
+            last_exc = e
+            if i == attempts - 1:
+                break
+            backoff = 0.2 if i == 0 else 0.5
+            logger.warning(
+                f"[http-retry] {request.method} {request.url.path} hit "
+                f"transient DB drop (attempt {i + 1}/{attempts}, sleeping {backoff}s): "
+                f"{type(e).__name__}"
+            )
+            await asyncio.sleep(backoff)
+    # Exhausted — surface a clean 503 instead of a raw stack trace.
+    logger.error(
+        f"[http-retry] {request.method} {request.url.path} exhausted "
+        f"{attempts} attempts: {type(last_exc).__name__}: {str(last_exc)[:200]}"
+    )
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": "Database temporarily unavailable (Supavisor connection drop). "
+                      "Please retry in a moment.",
+            "error_type": type(last_exc).__name__ if last_exc else "Unknown",
+        },
+    )
+
+
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     errors = []
