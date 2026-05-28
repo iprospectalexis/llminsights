@@ -1,6 +1,5 @@
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
-from sqlalchemy.pool import NullPool
 
 from app.config import get_settings
 
@@ -14,34 +13,39 @@ engine_kwargs = {
 if settings.is_postgres:
     # PostgreSQL via Supabase Supavisor in transaction-mode (port 6543).
     #
-    # Why NullPool: Supavisor already pools server connections at the pooler
-    # layer. Layering SQLAlchemy's QueuePool on top causes a known stale-
-    # connection problem — client-side connections sit idle past Supavisor's
-    # client_idle_timeout, Supavisor silently drops them, and the next reuse
-    # surfaces as `ConnectionDoesNotExistError: connection was closed in the
-    # middle of operation`. pool_pre_ping helps but isn't atomic with the
-    # subsequent query, so the race still happens under load.
+    # History of this config (read before touching):
+    #   v1: pool_size=5, overflow=7  → QueuePool exhaustion under load
+    #   v2: pool_size=15, overflow=25 → QueuePool fixed, but stale
+    #                                    connections after Supavisor's
+    #                                    idle-timeout sweep killed them
+    #   v3: NullPool                 → no stale-connection bug BUT every
+    #                                    session opened a fresh TCP+TLS
+    #                                    handshake → /dashboard took ~1min
+    #                                    to list jobs because every small
+    #                                    query paid 200ms of TLS overhead
     #
-    # With NullPool, each AsyncSessionLocal() call opens a fresh TCP/TLS
-    # connection to Supavisor, which is cheap because the heavy Postgres
-    # backend connection is already pooled at Supavisor's layer. This is
-    # the configuration Supabase officially recommends for transaction-mode
-    # pooled access from SQLAlchemy.
+    # Current: QueuePool with **aggressive recycle** to avoid the stale
+    # connection problem. With pool_recycle=60, every connection is
+    # rotated every 60s — well before Supavisor's client_idle_timeout
+    # (typically several minutes) gets a chance to drop it underneath us.
+    # The rare race that still leaks through is caught by the
+    # _retry_transient helper on SupabaseDB methods + the HTTP middleware
+    # on ORM endpoints (commit 535e99a).
     #
-    # statement_cache_size=0 stays — required because PgBouncer/Supavisor
-    # doesn't preserve prepared statements across transactions.
-    engine_kwargs["poolclass"] = NullPool
+    # Sizing: 10 base + 30 overflow = 40 max. Same as v2 — enough for
+    # 3 concurrent audits × ~10 parallel DB ops + scheduler + endpoint
+    # traffic — without using NullPool's per-session handshake cost.
+    engine_kwargs["pool_size"] = 10
+    engine_kwargs["max_overflow"] = 30
+    engine_kwargs["pool_timeout"] = 10        # fail fast instead of default 30s hang
+    engine_kwargs["pool_pre_ping"] = True     # detect dropped connections before use
+    engine_kwargs["pool_recycle"] = 60        # rotate every 60s, beats Supavisor's idle timeout
     engine_kwargs["connect_args"] = {
         "statement_cache_size": 0,
-        # Fail fast on connection setup. asyncpg default is 60s, which makes
-        # every Supavisor-killed-connection retry take 60s before our retry
-        # helper even gets a chance — 3 retries × 60s = 3 min user-visible
-        # latency on a single bad path. 10s is enough for a healthy
-        # Supavisor handshake (typically <500ms) but cuts the worst case to
-        # ~10s per attempt.
+        # Fail fast on the rare case a connection setup hangs. Healthy
+        # Supavisor handshake is <500ms; anything beyond 10s is dead.
         "timeout": 10,
-        # Cap a single query at 30s. Protects against a Supavisor that
-        # accepts the connection but stalls mid-query.
+        # Cap a single query at 30s to protect against a stalled Supavisor.
         "command_timeout": 30,
     }
 else:
