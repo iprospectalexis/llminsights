@@ -60,8 +60,14 @@ if settings.is_postgres:
         # Fail fast on the rare case a connection setup hangs. Healthy
         # Supavisor handshake is <500ms; anything beyond 10s is dead.
         "timeout": 10,
-        # Cap a single query at 30s to protect against a stalled Supavisor.
-        "command_timeout": 30,
+        # Cap a single query at 10s (was 30s). A stalled Supavisor that
+        # accepts the connection but never responds was holding sessions
+        # in the pool for up to 30s × 3 retries = 90s per failed call.
+        # Under sustained Supavisor flakiness this accumulated to pool
+        # exhaustion within ~12 minutes despite an 80-session budget.
+        # 10s is plenty for any normal query (we have no analytical
+        # workload on the hot path).
+        "command_timeout": 10,
     }
 else:
     # SQLite with aiosqlite: allow multi-thread access

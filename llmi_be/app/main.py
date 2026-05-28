@@ -62,8 +62,46 @@ async def lifespan(app: FastAPI):
 
         scheduler_task = asyncio.create_task(start_scheduler())
         logger.info("Audit scheduler started (Supabase PostgreSQL detected)")
+
+        # Pool monitor — logs a one-line snapshot of pool state every 30s
+        # AND a loud warning if utilization stays above 75% for 2 minutes
+        # (early signal of a session leak before exhaustion turns into
+        # cascading 500s).
+        async def _pool_monitor():
+            from app.database import async_engine
+            high_water_streak = 0
+            while True:
+                try:
+                    p = async_engine.pool
+                    size = p.size()
+                    checked_out = p.checkedout()
+                    overflow = p.overflow()
+                    total_max = size + max(0, overflow)
+                    util_pct = (checked_out / max(1, total_max)) * 100
+                    msg = (
+                        f"[db-pool] size={size} checked_out={checked_out} "
+                        f"overflow={overflow} util={util_pct:.0f}%"
+                    )
+                    if util_pct > 75:
+                        high_water_streak += 1
+                        logger.warning(
+                            f"{msg} HIGH (streak={high_water_streak}, threshold=4)"
+                        )
+                        if high_water_streak >= 4:
+                            logger.error(
+                                f"[db-pool] sustained >75% for 2min — likely session leak"
+                            )
+                    else:
+                        high_water_streak = 0
+                        logger.info(msg)
+                except Exception as e:
+                    logger.warning(f"[db-pool] monitor error: {e}")
+                await asyncio.sleep(30)
+
+        pool_monitor_task = asyncio.create_task(_pool_monitor())
     else:
         logger.info("Audit scheduler skipped (SQLite mode — no Supabase tables)")
+        pool_monitor_task = None
 
     yield
 
@@ -71,6 +109,8 @@ async def lifespan(app: FastAPI):
     if scheduler_task:
         stop_scheduler()
         scheduler_task.cancel()
+    if pool_monitor_task:
+        pool_monitor_task.cancel()
     
     # Shutdown
     logger.info("Shutting down SERP SaaS API...")
