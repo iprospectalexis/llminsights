@@ -1,22 +1,72 @@
 """
 Direct async PostgreSQL access to Supabase tables.
 
-Uses the same SQLAlchemy async engine from database.py (connection-pooled).
-All queries use raw SQL via sqlalchemy.text() — no ORM models needed for
-Supabase tables (audits, llm_responses, citations, etc.).
+Uses the same SQLAlchemy async engine from database.py (NullPool — Supavisor
+manages pooling). All queries use raw SQL via sqlalchemy.text() — no ORM
+models needed for Supabase tables (audits, llm_responses, citations, etc.).
 """
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional, TypeVar
 
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import AsyncSessionLocal
 
 logger = logging.getLogger(__name__)
+
+
+_T = TypeVar("_T")
+
+
+def _is_transient_db_error(exc: BaseException) -> bool:
+    """Identify pool/connection drops that we can safely retry.
+
+    Catches the Supavisor-class failure mode where a Supavisor-pooled
+    connection is killed underneath us mid-statement and asyncpg surfaces
+    `ConnectionDoesNotExistError`, plus the broader family of transient
+    transport errors (server closed, TCP reset, DNS hiccup).
+    """
+    msg = str(exc).lower()
+    return any(token in msg for token in (
+        "connectiondoesnotexisterror",
+        "connection was closed",
+        "server closed the connection",
+        "ssl connection has been closed",
+        "connection reset",
+        "connection refused",
+    ))
+
+
+async def _retry_transient(fn: Callable[[], Awaitable[_T]], op: str, attempts: int = 3) -> _T:
+    """Run `fn` up to `attempts` times, retrying transient connection drops.
+
+    Sleeps 0.2s, 0.5s between tries. A real bug (bad SQL, missing column)
+    is not in the transient set and will raise on the first attempt.
+    """
+    last: BaseException | None = None
+    for i in range(attempts):
+        try:
+            return await fn()
+        except (DBAPIError, OperationalError) as e:
+            if not _is_transient_db_error(e):
+                raise
+            last = e
+            if i == attempts - 1:
+                break
+            backoff = 0.2 if i == 0 else 0.5
+            logger.warning(
+                f"[db-retry] {op} hit transient connection drop "
+                f"(attempt {i + 1}/{attempts}, sleeping {backoff}s): {type(e).__name__}"
+            )
+            await asyncio.sleep(backoff)
+    assert last is not None
+    raise last
 
 
 # Columns known to be jsonb (not text[])
@@ -194,20 +244,26 @@ class SupabaseDB:
     # ── Projects & prompts ────────────────────────────────────────────
 
     async def get_project_with_prompts(self, project_id: str) -> Optional[dict]:
-        async with AsyncSessionLocal() as s:
-            proj = (await s.execute(
-                text("SELECT * FROM projects WHERE id = :id"),
-                {"id": project_id},
-            )).mappings().first()
-            if not proj:
-                return None
-            project = dict(proj)
-            prompts = (await s.execute(
-                text("SELECT * FROM prompts WHERE project_id = :pid"),
-                {"pid": project_id},
-            )).mappings().all()
-            project["prompts"] = [dict(p) for p in prompts]
-            return project
+        # Wrapped in transient-retry because this is on the synchronous
+        # run-audit critical path — a Supavisor-killed connection here
+        # surfaces to the user as a 500 instead of just retrying silently.
+        async def _do() -> Optional[dict]:
+            async with AsyncSessionLocal() as s:
+                proj = (await s.execute(
+                    text("SELECT * FROM projects WHERE id = :id"),
+                    {"id": project_id},
+                )).mappings().first()
+                if not proj:
+                    return None
+                project = dict(proj)
+                prompts = (await s.execute(
+                    text("SELECT * FROM prompts WHERE project_id = :pid"),
+                    {"pid": project_id},
+                )).mappings().all()
+                project["prompts"] = [dict(p) for p in prompts]
+                return project
+
+        return await _retry_transient(_do, op=f"get_project_with_prompts({project_id})")
 
     async def get_prompt_texts(self, prompt_ids: list[str]) -> dict[str, str]:
         if not prompt_ids:

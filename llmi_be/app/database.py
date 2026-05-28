@@ -1,5 +1,6 @@
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.pool import NullPool
 
 from app.config import get_settings
 
@@ -11,24 +12,25 @@ engine_kwargs = {
 }
 
 if settings.is_postgres:
-    # PostgreSQL with asyncpg via Supabase Supavisor in transaction-mode (port 6543).
-    # Transaction mode releases the underlying server connection after each TX,
-    # so the client-side pool size is bounded only by Supavisor's max_client_conn
-    # (200+ on Pro plan), NOT by direct Postgres connection limits.
+    # PostgreSQL via Supabase Supavisor in transaction-mode (port 6543).
     #
-    # The previous "max 12, leaves 3 for PostgREST" comment referenced PgBouncer
-    # session-mode limits, which Supavisor doesn't share. With 3 concurrent audits,
-    # the scheduler, the run-audit endpoint, and background heartbeats all
-    # competing, 12 was too tight — we hit QueuePool timeouts during normal load.
+    # Why NullPool: Supavisor already pools server connections at the pooler
+    # layer. Layering SQLAlchemy's QueuePool on top causes a known stale-
+    # connection problem — client-side connections sit idle past Supavisor's
+    # client_idle_timeout, Supavisor silently drops them, and the next reuse
+    # surfaces as `ConnectionDoesNotExistError: connection was closed in the
+    # middle of operation`. pool_pre_ping helps but isn't atomic with the
+    # subsequent query, so the race still happens under load.
     #
-    # 15 base + 25 overflow = 40 max. Comfortably under Supavisor's pool budget
-    # but enough headroom for 3 concurrent audits × ~10 parallel DB writes each
-    # plus endpoint traffic.
-    engine_kwargs["pool_size"] = 15
-    engine_kwargs["max_overflow"] = 25
-    engine_kwargs["pool_timeout"] = 10      # fail fast instead of default 30s hang
-    engine_kwargs["pool_pre_ping"] = True
-    engine_kwargs["pool_recycle"] = 300     # recycle connections every 5 min
+    # With NullPool, each AsyncSessionLocal() call opens a fresh TCP/TLS
+    # connection to Supavisor, which is cheap because the heavy Postgres
+    # backend connection is already pooled at Supavisor's layer. This is
+    # the configuration Supabase officially recommends for transaction-mode
+    # pooled access from SQLAlchemy.
+    #
+    # statement_cache_size=0 stays — required because PgBouncer/Supavisor
+    # doesn't preserve prepared statements across transactions.
+    engine_kwargs["poolclass"] = NullPool
     engine_kwargs["connect_args"] = {"statement_cache_size": 0}
 else:
     # SQLite with aiosqlite: allow multi-thread access
