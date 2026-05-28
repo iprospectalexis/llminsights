@@ -115,8 +115,56 @@ def _build_insert(table: str, data: dict, returning: bool = True) -> tuple[str, 
     return sql, params
 
 
+def _wrap_with_retry(cls: type) -> type:
+    """Class decorator: wrap every public async method with _retry_transient.
+
+    Rationale: with Supavisor in transaction mode, ANY connection from
+    our process can be killed by the pooler underneath us at any time
+    (idle-timeout sweep, restart, scaling event). Wrapping
+    get_project_with_prompts alone was not enough — the same drop can
+    hit insert_audit, get_running_audits, update_competitors_batch, and
+    so on. Rather than decorating 30+ methods individually we replace
+    them all here in one pass.
+
+    Skipped:
+      - Names starting with `_` (private / helpers like _session)
+      - Non-coroutine methods (the retry helper is async-only)
+
+    Inheriting classes pick up the wrap automatically because we walk
+    the resolved attribute table at decoration time.
+    """
+    import functools
+    import inspect
+
+    for name in list(vars(cls).keys()):
+        if name.startswith("_"):
+            continue
+        attr = vars(cls)[name]
+        if not inspect.iscoroutinefunction(attr):
+            continue
+
+        def make_wrapper(fn, name):
+            @functools.wraps(fn)
+            async def wrapper(self, *args, **kwargs):
+                return await _retry_transient(
+                    lambda: fn(self, *args, **kwargs),
+                    op=f"{cls.__name__}.{name}",
+                )
+            return wrapper
+
+        setattr(cls, name, make_wrapper(attr, name))
+    return cls
+
+
+@_wrap_with_retry
 class SupabaseDB:
-    """Thin wrapper for async queries against Supabase PostgreSQL tables."""
+    """Thin wrapper for async queries against Supabase PostgreSQL tables.
+
+    Every public async method on this class is auto-wrapped in a
+    transient-retry helper (see _wrap_with_retry above) so that a
+    Supavisor-killed connection produces a one-line warning + an
+    automatic retry, not a 500 to the user.
+    """
 
     async def _session(self) -> AsyncSession:
         return AsyncSessionLocal()
@@ -244,26 +292,20 @@ class SupabaseDB:
     # ── Projects & prompts ────────────────────────────────────────────
 
     async def get_project_with_prompts(self, project_id: str) -> Optional[dict]:
-        # Wrapped in transient-retry because this is on the synchronous
-        # run-audit critical path — a Supavisor-killed connection here
-        # surfaces to the user as a 500 instead of just retrying silently.
-        async def _do() -> Optional[dict]:
-            async with AsyncSessionLocal() as s:
-                proj = (await s.execute(
-                    text("SELECT * FROM projects WHERE id = :id"),
-                    {"id": project_id},
-                )).mappings().first()
-                if not proj:
-                    return None
-                project = dict(proj)
-                prompts = (await s.execute(
-                    text("SELECT * FROM prompts WHERE project_id = :pid"),
-                    {"pid": project_id},
-                )).mappings().all()
-                project["prompts"] = [dict(p) for p in prompts]
-                return project
-
-        return await _retry_transient(_do, op=f"get_project_with_prompts({project_id})")
+        async with AsyncSessionLocal() as s:
+            proj = (await s.execute(
+                text("SELECT * FROM projects WHERE id = :id"),
+                {"id": project_id},
+            )).mappings().first()
+            if not proj:
+                return None
+            project = dict(proj)
+            prompts = (await s.execute(
+                text("SELECT * FROM prompts WHERE project_id = :pid"),
+                {"pid": project_id},
+            )).mappings().all()
+            project["prompts"] = [dict(p) for p in prompts]
+            return project
 
     async def get_prompt_texts(self, prompt_ids: list[str]) -> dict[str, str]:
         if not prompt_ids:
