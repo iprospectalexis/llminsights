@@ -31,7 +31,19 @@ if settings.is_postgres:
     # statement_cache_size=0 stays — required because PgBouncer/Supavisor
     # doesn't preserve prepared statements across transactions.
     engine_kwargs["poolclass"] = NullPool
-    engine_kwargs["connect_args"] = {"statement_cache_size": 0}
+    engine_kwargs["connect_args"] = {
+        "statement_cache_size": 0,
+        # Fail fast on connection setup. asyncpg default is 60s, which makes
+        # every Supavisor-killed-connection retry take 60s before our retry
+        # helper even gets a chance — 3 retries × 60s = 3 min user-visible
+        # latency on a single bad path. 10s is enough for a healthy
+        # Supavisor handshake (typically <500ms) but cuts the worst case to
+        # ~10s per attempt.
+        "timeout": 10,
+        # Cap a single query at 30s. Protects against a Supavisor that
+        # accepts the connection but stalls mid-query.
+        "command_timeout": 30,
+    }
 else:
     # SQLite with aiosqlite: allow multi-thread access
     engine_kwargs["connect_args"] = {"check_same_thread": False}
