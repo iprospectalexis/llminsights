@@ -32,13 +32,28 @@ if settings.is_postgres:
     # _retry_transient helper on SupabaseDB methods + the HTTP middleware
     # on ORM endpoints (commit 535e99a).
     #
-    # Sizing: 10 base + 30 overflow = 40 max. Same as v2 — enough for
-    # 3 concurrent audits × ~10 parallel DB ops + scheduler + endpoint
-    # traffic — without using NullPool's per-session handshake cost.
-    engine_kwargs["pool_size"] = 10
-    engine_kwargs["max_overflow"] = 30
+    # Sizing rationale (production-observed):
+    #   - 3 concurrent audits × ~10 parallel DB ops/each at peak     = 30
+    #   - Scheduler tick (auto-fail sweep, dispatch, recover stale)  =  5
+    #   - run_audit endpoint                                         =  1
+    #   - /dashboard polling + /api/v1/jobs polling                  =  4
+    #   - Retry storm multiplier (each transient drop spawns new
+    #     session for next attempt; with K concurrent retrying calls
+    #     this can double session demand for a few seconds)          = ×2
+    #
+    # Worst-case peak ≈ 80 sessions. Supavisor Pro supports 200+
+    # client connections per project so we have plenty of headroom.
+    #
+    # Removed pool_pre_ping=True: it adds a SELECT 1 round-trip on
+    # every checkout (~10-30ms holding time = ~30% capacity penalty)
+    # and the dropped-connection case is already covered by:
+    #   - _retry_transient on SupabaseDB methods
+    #   - HTTP middleware on ORM endpoints
+    # Pre-ping was a belt-and-suspenders that turned out to amplify
+    # the pool-exhaustion failure mode.
+    engine_kwargs["pool_size"] = 20
+    engine_kwargs["max_overflow"] = 60
     engine_kwargs["pool_timeout"] = 10        # fail fast instead of default 30s hang
-    engine_kwargs["pool_pre_ping"] = True     # detect dropped connections before use
     engine_kwargs["pool_recycle"] = 60        # rotate every 60s, beats Supavisor's idle timeout
     engine_kwargs["connect_args"] = {
         "statement_cache_size": 0,

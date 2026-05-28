@@ -43,7 +43,7 @@ def _is_transient_db_error(exc: BaseException) -> bool:
     ))
 
 
-async def _retry_transient(fn: Callable[[], Awaitable[_T]], op: str, attempts: int = 5) -> _T:
+async def _retry_transient(fn: Callable[[], Awaitable[_T]], op: str, attempts: int = 3) -> _T:
     """Run `fn` up to `attempts` times, retrying transient connection drops.
 
     Backoff schedule: 0.2s, 0.5s, 1.0s, 2.0s between tries. Real bugs
@@ -53,7 +53,10 @@ async def _retry_transient(fn: Callable[[], Awaitable[_T]], op: str, attempts: i
     Sized for the Supavisor failure mode: a freshly-routed connection
     can be dropped immediately, so retrying with a tiny pause usually
     lands on a healthy Supavisor instance. With asyncpg's connect timeout
-    capped at 10s, even worst-case all-5-attempts-fail takes ~50s.
+    capped at 10s, even worst-case all-3-attempts-fail takes ~12s.
+    Capped at 3 (was 5) because each retry attempt holds a fresh pool
+    session; during a wide Supavisor outage, 5+ concurrent retrying
+    calls amplified session demand enough to exhaust the pool.
     """
     last: BaseException | None = None
     backoffs = [0.2, 0.5, 1.0, 2.0]
