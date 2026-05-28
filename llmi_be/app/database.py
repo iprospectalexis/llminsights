@@ -11,12 +11,21 @@ engine_kwargs = {
 }
 
 if settings.is_postgres:
-    # PostgreSQL with asyncpg via Supabase transaction-mode pooler (port 6543).
-    # Transaction mode returns connections after each TX, allowing ~200 concurrent
-    # clients vs ~15 in session mode. Requires statement_cache_size=0 because
-    # PgBouncer doesn't support prepared statements.
-    engine_kwargs["pool_size"] = 5
-    engine_kwargs["max_overflow"] = 7       # max 12 conn (< PgBouncer limit 15, leaves 3 for PostgREST/admin)
+    # PostgreSQL with asyncpg via Supabase Supavisor in transaction-mode (port 6543).
+    # Transaction mode releases the underlying server connection after each TX,
+    # so the client-side pool size is bounded only by Supavisor's max_client_conn
+    # (200+ on Pro plan), NOT by direct Postgres connection limits.
+    #
+    # The previous "max 12, leaves 3 for PostgREST" comment referenced PgBouncer
+    # session-mode limits, which Supavisor doesn't share. With 3 concurrent audits,
+    # the scheduler, the run-audit endpoint, and background heartbeats all
+    # competing, 12 was too tight — we hit QueuePool timeouts during normal load.
+    #
+    # 15 base + 25 overflow = 40 max. Comfortably under Supavisor's pool budget
+    # but enough headroom for 3 concurrent audits × ~10 parallel DB writes each
+    # plus endpoint traffic.
+    engine_kwargs["pool_size"] = 15
+    engine_kwargs["max_overflow"] = 25
     engine_kwargs["pool_timeout"] = 10      # fail fast instead of default 30s hang
     engine_kwargs["pool_pre_ping"] = True
     engine_kwargs["pool_recycle"] = 300     # recycle connections every 5 min
