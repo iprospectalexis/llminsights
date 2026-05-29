@@ -19,7 +19,14 @@ services:
     env_file:
       - .env.production
     environment:
-      - UVICORN_WORKERS=${UVICORN_WORKERS:-2}
+      # MUST stay at 1: the audit scheduler and pool monitor run as
+      # in-process asyncio tasks. Multiple workers spawn duplicate
+      # schedulers that race on CAS-claims of the same audit rows AND
+      # each holds its own SQLAlchemy pool, doubling Supavisor client
+      # connections — which is what caused the May 2026 pool-exhaustion
+      # deadlock. If you need more HTTP throughput, scale horizontally
+      # (more containers) with a shared external scheduler, not workers.
+      - UVICORN_WORKERS=${UVICORN_WORKERS:-1}
       - LOG_LEVEL=${LOG_LEVEL:-info}
     volumes:
       # Persist job results (optional)
