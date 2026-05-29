@@ -54,7 +54,17 @@ if settings.is_postgres:
     engine_kwargs["pool_size"] = 20
     engine_kwargs["max_overflow"] = 60
     engine_kwargs["pool_timeout"] = 10        # fail fast instead of default 30s hang
-    engine_kwargs["pool_recycle"] = 60        # rotate every 60s, beats Supavisor's idle timeout
+    # pool_recycle was 60s to dodge a Supavisor drop-storm caused by
+    # UVICORN_WORKERS=2 (two workers × their own pool exceeded Supavisor's
+    # client budget). With workers=1 that pressure is gone, so we can keep
+    # connections warm for 10 minutes — this kills the 1.5s cold-handshake
+    # latency that hit /dashboard on every idle return.
+    engine_kwargs["pool_recycle"] = 600
+    # pool_pre_ping was removed when the pool was exhausting and the extra
+    # SELECT 1 hurt capacity. Now that's fixed it's worth keeping again to
+    # silently handle the rare case where Supavisor still drops a stale
+    # connection. ~5-15ms per checkout, negligible at our load.
+    engine_kwargs["pool_pre_ping"] = True
     engine_kwargs["connect_args"] = {
         "statement_cache_size": 0,
         # Fail fast on the rare case a connection setup hangs. Healthy
