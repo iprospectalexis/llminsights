@@ -63,13 +63,17 @@ async def lifespan(app: FastAPI):
         scheduler_task = asyncio.create_task(start_scheduler())
         logger.info("Audit scheduler started (Supabase PostgreSQL detected)")
 
-        # Pool monitor — logs a one-line snapshot of pool state every 30s
-        # AND a loud warning if utilization stays above 75% for 2 minutes
-        # (early signal of a session leak before exhaustion turns into
-        # cascading 500s).
+        # Pool monitor — logs a one-line snapshot of pool state every 30s,
+        # warns if util stays >75% for 2 minutes, and DUMPS ALL ACTIVE
+        # asyncio tasks with their current stack when util hits >=90%
+        # (this is how we find which coroutines are leaking sessions —
+        # the dump shows exactly which file:line each stuck task is at).
         async def _pool_monitor():
             from app.database import async_engine
+            import io
+            import traceback
             high_water_streak = 0
+            task_dump_done = False
             while True:
                 try:
                     p = async_engine.pool
@@ -91,8 +95,62 @@ async def lifespan(app: FastAPI):
                             logger.error(
                                 f"[db-pool] sustained >75% for 2min — likely session leak"
                             )
+
+                        # Once per high-water episode, dump all live asyncio
+                        # tasks with their current stack. This is the *only*
+                        # reliable way to find what's holding the sessions —
+                        # the leaker shows up here with a non-trivial frame
+                        # count and we can see exactly where it's stuck.
+                        if util_pct >= 90 and not task_dump_done:
+                            task_dump_done = True
+                            try:
+                                tasks = asyncio.all_tasks()
+                                buf = io.StringIO()
+                                buf.write(
+                                    f"\n[db-pool-dump] {len(tasks)} live "
+                                    f"asyncio tasks at util={util_pct:.0f}%:\n"
+                                )
+                                # Group by coroutine name so the report stays
+                                # readable when there are 50+ tasks.
+                                from collections import Counter
+                                names = Counter()
+                                for t in tasks:
+                                    try:
+                                        names[t.get_coro().__qualname__] += 1
+                                    except Exception:
+                                        names["<unknown>"] += 1
+                                buf.write("=== task counts by coro name ===\n")
+                                for name, n in names.most_common(20):
+                                    buf.write(f"  {n:>4} × {name}\n")
+                                # Then dump the first non-trivial stack of
+                                # each unique coro — usually enough to spot
+                                # the leak. Cap at 30 frames each.
+                                buf.write("\n=== one stack per unique coro ===\n")
+                                seen_names: set[str] = set()
+                                for t in tasks:
+                                    try:
+                                        name = t.get_coro().__qualname__
+                                    except Exception:
+                                        name = "<unknown>"
+                                    if name in seen_names or name == "_pool_monitor":
+                                        continue
+                                    seen_names.add(name)
+                                    buf.write(f"\n--- task: {name} ---\n")
+                                    try:
+                                        stack = t.get_stack(limit=15)
+                                        for frame in stack:
+                                            buf.write(
+                                                f"  {frame.f_code.co_filename}:"
+                                                f"{frame.f_lineno} in {frame.f_code.co_name}\n"
+                                            )
+                                    except Exception as ee:
+                                        buf.write(f"  <stack error: {ee}>\n")
+                                logger.error(buf.getvalue())
+                            except Exception as e:
+                                logger.error(f"[db-pool-dump] failed: {e}", exc_info=True)
                     else:
                         high_water_streak = 0
+                        task_dump_done = False  # re-arm dump for next episode
                         logger.info(msg)
                 except Exception as e:
                     logger.warning(f"[db-pool] monitor error: {e}")
