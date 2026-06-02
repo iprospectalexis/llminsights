@@ -221,9 +221,19 @@ async def _reset_batch_failure_counter(audit_id: str) -> None:
 POLLING_MAX_MINUTES = 90
 
 # Per-row exhaustion. After this many polling attempts on a single row, mark
-# it `provider_no_response` so it stops blocking the audit. With a 15s tick,
-# 8 attempts ≈ 2 min of provider unresponsiveness before we give up on a row.
-MAX_POLL_ATTEMPTS_PER_ROW = 8
+# it `provider_no_response` so it stops blocking the audit.
+#
+# 2026-06-02: bumped from 8 → 60 after 4 consecutive audits (2 projects) all
+# failed with "Polling finished but 0/60 responses contain data" while
+# OneSearch had the data ready. The previous 8-attempts-at-15s = 2 min
+# budget was inconsistent with POLLING_MAX_MINUTES=90 above: the global
+# watchdog gave the audit 90 min, but every individual row was killed at
+# 2 min — so an audit could lose all rows long before the 90 min sweep.
+# SearchGPT in particular can take 30-60 min to deliver results for a
+# 60-prompt batch; perplexity is usually faster but still sometimes >5 min.
+# 60 attempts at 15s tick = 15 min per row, which fits comfortably inside
+# the 90-min global window and matches realistic provider latency.
+MAX_POLL_ATTEMPTS_PER_ROW = 60
 
 # Don't re-poll the same row faster than this. Prevents hammering the
 # provider when the scheduler tick interval drops or warm-starts overlap.
