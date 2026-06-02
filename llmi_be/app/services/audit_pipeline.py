@@ -591,9 +591,17 @@ async def handle_polling(audit_id: str, worker_id: str) -> None:
             def _normalize_prompt(text: str) -> str:
                 """Normalize prompt text for robust matching.
                 Strips whitespace, normalizes Unicode, collapses internal
-                whitespace runs — handles provider-side reformatting."""
+                whitespace runs — handles provider-side reformatting.
+                Also peels off any provider-targeted suffix we may have
+                appended on send (see prompt_augmentation) so the DB
+                original and the provider echo collapse to the same key.
+                """
                 import unicodedata
-                text = unicodedata.normalize("NFC", text.strip())
+                from app.services.prompt_augmentation import (
+                    strip_known_provider_suffixes,
+                )
+                text = strip_known_provider_suffixes(text.strip())
+                text = unicodedata.normalize("NFC", text)
                 return " ".join(text.split())
 
             for job_id, responses in job_groups.items():

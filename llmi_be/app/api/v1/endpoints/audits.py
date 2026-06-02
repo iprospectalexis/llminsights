@@ -149,8 +149,14 @@ async def trigger_onesearch_job(
     to handle transient network / OneSearch outages.
     """
     provider = (provider_config or {}).get("provider", "brightdata")
+    # Per-LLM prompt augmentation: today SearchGPT with force_web_search
+    # gets a trailing hint pushing ChatGPT to actually call its web tool.
+    # The DB-stored prompt text stays original — see prompt_augmentation
+    # module for the symmetric strip helper used by the polling matcher.
+    from app.services.prompt_augmentation import augmented_prompt
+    outgoing_prompts = [augmented_prompt(llm, p, force_web_search) for p in prompts]
     payload = {
-        "prompts": prompts,
+        "prompts": outgoing_prompts,
         "provider": provider,
         "geo_targeting": country or "FR",
         "source": SOURCE_MAP.get(llm, "chatgpt"),
