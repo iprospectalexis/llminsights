@@ -134,6 +134,23 @@ export function getAuditStatus(auditId: string) {
   return request<AuditStatusResponse>(`/v1/audits/${auditId}/status`);
 }
 
+export interface RecoverPollingResponse {
+  success: boolean;
+  audit_id: string;
+  rows_reset: number;
+  message: string;
+}
+
+// Re-enter polling for a failed audit where the provider still has the
+// data (error_message must start with "Polling finished but ..."). The
+// backend resets the per-row exhaustion flags and flips the audit back
+// to polling — scheduler picks it up within 15s and re-polls OneSearch.
+export function recoverPollingAudit(auditId: string) {
+  return request<RecoverPollingResponse>(`/v1/audits/${auditId}/recover-polling`, {
+    method: 'POST',
+  });
+}
+
 // ── Health ────────────────────────────────────────────────────
 
 export function checkHealth() {
@@ -150,5 +167,6 @@ export default {
   runAudit,
   pollAudit,
   getAuditStatus,
+  recoverPollingAudit,
   checkHealth,
 };

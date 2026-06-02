@@ -19,11 +19,19 @@ import {
   Users,
   Brain,
   Flag,
-  ScrollText
+  ScrollText,
+  LifeBuoy
 } from 'lucide-react';
 import { Button } from '../components/ui/Button';
 import { Modal } from '../components/ui/Modal';
 import { LoadingSpinner } from '../components/ui/LoadingSpinner';
+import { recoverPollingAudit } from '../lib/backendApi';
+
+// Prefix used by the backend when an audit fails because the polling stage
+// gave up before the provider returned any data. The Recover button is
+// shown only for audits whose `error_message` starts with this string —
+// these are the ones the /recover-polling endpoint can actually rescue.
+const RECOVERABLE_POLLING_PREFIX = 'Polling finished but';
 
 interface Audit {
   id: string;
@@ -78,6 +86,7 @@ export function StatusPage() {
   const [statusFilter, setStatusFilter] = useState<string>('all');
   const [reprocessingAudit, setReprocessingAudit] = useState<string | null>(null);
   const [retryingAudit, setRetryingAudit] = useState<string | null>(null);
+  const [recoveringAudit, setRecoveringAudit] = useState<string | null>(null);
   const [oneSearchHealth, setOneSearchHealth] = useState<{
     status: 'checking' | 'healthy' | 'unhealthy' | 'unreachable';
     error?: string;
@@ -310,6 +319,35 @@ export function StatusPage() {
       setResultModalOpen(true);
     } finally {
       setReprocessingAudit(null);
+    }
+  };
+
+  const handleRecoverPolling = async (auditId: string) => {
+    setRecoveringAudit(auditId);
+    try {
+      // Hits backend /api/v1/audits/{id}/recover-polling. Backend itself
+      // refuses to act unless the audit failed at the polling stage, so
+      // this is safe to call — worst case the user gets a 400 and the
+      // modal explains why.
+      const result = await recoverPollingAudit(auditId);
+      await fetchAudits();
+      setResultMessage({
+        type: result.rows_reset > 0 ? 'success' : 'error',
+        message:
+          result.rows_reset > 0
+            ? `Reset ${result.rows_reset} response(s) — scheduler will re-poll OneSearch within 15s. Check Status again in a minute.`
+            : 'No responses needed reset. The audit may have already been recovered.',
+      });
+      setResultModalOpen(true);
+    } catch (error) {
+      console.error('Error recovering polling audit:', error);
+      setResultMessage({
+        type: 'error',
+        message: error instanceof Error ? error.message : 'Failed to recover audit.',
+      });
+      setResultModalOpen(true);
+    } finally {
+      setRecoveringAudit(null);
     }
   };
 
@@ -765,6 +803,27 @@ export function StatusPage() {
                         </td>
                         <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium" onClick={(e) => e.stopPropagation()}>
                           <div className="flex items-center justify-end gap-2">
+                            {/* Recover: only for audits that failed at polling stage
+                                (provider was slow, data is still on OneSearch).
+                                Hits backend /recover-polling which resets poll
+                                state and lets the scheduler re-fetch the answers. */}
+                            {audit.status === 'failed' &&
+                              audit.error_message?.startsWith(RECOVERABLE_POLLING_PREFIX) && (
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  onClick={() => handleRecoverPolling(audit.id)}
+                                  disabled={recoveringAudit === audit.id}
+                                  className="text-amber-600 hover:text-amber-700 hover:border-amber-600"
+                                  title="Recover this audit — re-poll OneSearch for the answers that were taking too long the first time"
+                                >
+                                  {recoveringAudit === audit.id ? (
+                                    <LoadingSpinner size="sm" />
+                                  ) : (
+                                    <LifeBuoy className="w-4 h-4" />
+                                  )}
+                                </Button>
+                              )}
                             {(audit.responses_sent || 0) > 0 && (
                               <Button
                                 variant="outline"

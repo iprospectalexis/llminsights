@@ -627,6 +627,102 @@ async def reprocess_audit(audit_id: str, from_stage: str = "extracting_competito
     }
 
 
+# ── POST /audits/{audit_id}/recover-polling ────────────────────────
+
+# Error-message prefix that marks an audit as recoverable via this endpoint.
+# Set by handle_polling when it gives up because no row received an answer
+# from the provider in the polling window. The data is typically still on
+# the OneSearch backend; reverting to polling state lets the scheduler
+# re-poll and pick it up.
+_RECOVERABLE_POLLING_PREFIX = "Polling finished but"
+
+
+@router.post("/{audit_id}/recover-polling")
+async def recover_polling_audit(audit_id: str):
+    """Re-enter polling for a failed audit where the provider has the data.
+
+    Mirrors recover_polling_audits.py (CLI script). Resets the
+    llm_responses rows that hit the per-row exhaustion (poll_terminal_reason
+    set) but still have a job_id and no answer_text, then puts the audit
+    back into pipeline_state='polling'. The scheduler picks it up within
+    15s and re-polls OneSearch, which by now has the data ready.
+
+    Refuses to act unless the audit's error_message starts with the
+    well-known prefix, so this endpoint can only revive audits that
+    genuinely failed at the polling stage — never unrelated failed audits.
+    """
+    audit = await db.get_audit(audit_id)
+    if not audit:
+        raise HTTPException(status_code=404, detail="Audit not found")
+
+    status = audit.get("status", "")
+    if status != "failed":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot recover audit with status '{status}' — only failed audits",
+        )
+
+    err_msg = (audit.get("error_message") or "")
+    if not err_msg.startswith(_RECOVERABLE_POLLING_PREFIX):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "This audit isn't a polling-stage failure — refusing to "
+                f"re-enter polling. error_message: {err_msg[:120]!r}"
+            ),
+        )
+
+    from app.database import AsyncSessionLocal
+    from sqlalchemy import text as sql_text
+
+    async with AsyncSessionLocal() as s:
+        # Reset llm_responses rows that have a job_id but no answer_text and
+        # were marked terminal — these are the rows the scheduler should
+        # re-poll.
+        reset_rows = (await s.execute(sql_text("""
+            UPDATE llm_responses
+            SET poll_terminal_reason = NULL,
+                poll_attempts = 0,
+                last_polled_at = NULL
+            WHERE audit_id = :aid
+              AND job_id IS NOT NULL
+              AND (answer_text IS NULL OR answer_text = '')
+              AND poll_terminal_reason IS NOT NULL
+            RETURNING id
+        """), {"aid": audit_id})).fetchall()
+        rows_reset = len(reset_rows)
+
+        await s.execute(sql_text("""
+            UPDATE audits
+            SET status = 'running',
+                pipeline_state = 'polling',
+                progress = 10,
+                current_step = 'getting_results',
+                finished_at = NULL,
+                error_message = NULL,
+                locked_by = NULL,
+                locked_at = NULL,
+                last_activity_at = now(),
+                pipeline_state_entered_at = now()
+            WHERE id = :aid
+        """), {"aid": audit_id})
+        await s.commit()
+
+    logger.info(
+        f"[recover-polling] Audit {audit_id} reset to polling state, "
+        f"{rows_reset} rows re-queued"
+    )
+    return {
+        "success": True,
+        "audit_id": audit_id,
+        "rows_reset": rows_reset,
+        "message": (
+            f"Reset {rows_reset} response(s) to polling — the scheduler "
+            f"will re-poll within 15s"
+        ),
+    }
+
+
 # ── BrightData legacy fetch ──────────────────────────────────────────
 
 async def _fetch_brightdata_result(llm: str, snapshot_id: str, api_key: str) -> Optional[dict]:
