@@ -6445,10 +6445,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
 
       <RunAuditModal
         isOpen={showRunAuditModal}
-        onClose={() => {
-          setShowRunAuditModal(false);
-          setShowLlmDropdown(false);
-        }}
+        onClose={() => setShowRunAuditModal(false)}
         projectId={project.id}
         onAuditStarted={handleAuditStartedWithId}
       />
