@@ -90,11 +90,20 @@ class DataForSeoClient:
         password: str = None,
         base_url: str = None,
         batch_size: int = None,
+        max_concurrent: int = None,
     ):
         self.login = login or settings.dataforseo_login
         self.password = password or settings.dataforseo_password
         self.base_url = (base_url or settings.dataforseo_base_url).rstrip("/")
-        self.batch_size = batch_size or getattr(settings, "dataforseo_batch_size", 100)
+        # NOTE: with load_async_ai_overview the synchronous live/advanced
+        # endpoint processes keywords serially server-side (~12-20s each).
+        # Batching many keywords into one request blows past DataForSEO's
+        # live-request window and the server drops the connection
+        # ("Server disconnected without sending a response"). So we send a
+        # SMALL number of keywords per request (default 1) and parallelise
+        # with bounded concurrency instead.
+        self.batch_size = batch_size or getattr(settings, "dataforseo_batch_size", 1)
+        self.max_concurrent = max_concurrent or getattr(settings, "dataforseo_max_concurrent", 10)
         token = base64.b64encode(f"{self.login}:{self.password}".encode()).decode()
         self.headers = {
             "Authorization": f"Basic {token}",
@@ -263,59 +272,85 @@ class DataForSeoClient:
         search: bool = True,          # accepted for interface parity (unused)
         **_kwargs,
     ) -> tuple[list[dict], list[str]]:
-        """Process all prompts in batches of ≤100. Returns
-        (converted_results, failed_keywords)."""
+        """Process all prompts using small per-request batches sent with
+        bounded concurrency. Returns (converted_results, failed_keywords).
+
+        Why not one big batch: the live/advanced endpoint with
+        load_async_ai_overview is slow per keyword, and large batches make
+        the server drop the connection before responding. Small batches
+        (default 1 keyword) + concurrency keep each request fast and the
+        whole job reliable.
+        """
         location_code, language_code = self._resolve_location(geo_targeting)
         country = (geo_targeting or "").strip().upper()[:2] or "US"
         logger.info(
             f"DataForSEO: {len(prompts)} prompts, location_code={location_code}, "
-            f"language_code={language_code}, batch_size={self.batch_size}"
+            f"language_code={language_code}, batch_size={self.batch_size}, "
+            f"max_concurrent={self.max_concurrent}"
         )
 
         results: list[dict] = []
         failed: list[str] = []
         total = len(prompts)
         processed = 0
-        # live/advanced can take ~20-40s per request; give generous timeout.
-        timeout = httpx.Timeout(180.0, connect=30.0)
+        sem = asyncio.Semaphore(self.max_concurrent)
+        lock = asyncio.Lock()
+        # Per single-keyword request: ~20-40s. 120s gives generous headroom
+        # while staying under the server's connection window.
+        timeout = httpx.Timeout(120.0, connect=30.0)
+
+        batches = [prompts[i:i + self.batch_size] for i in range(0, len(prompts), self.batch_size)]
 
         async with httpx.AsyncClient(timeout=timeout) as client:
-            for i in range(0, len(prompts), self.batch_size):
-                batch = prompts[i:i + self.batch_size]
-                try:
-                    data = await self._post_batch(
-                        client, batch, location_code, language_code, max_retries
-                    )
-                except Exception as e:
-                    logger.error(f"DataForSEO batch {i // self.batch_size} failed: {e}")
-                    failed.extend(batch)
-                    processed += len(batch)
-                    if progress_callback:
-                        await progress_callback(processed, total, results)
-                    continue
+            async def run_batch(batch: list[str]) -> None:
+                nonlocal processed
+                async with sem:
+                    batch_results: list[dict] = []
+                    batch_failed: list[str] = []
+                    try:
+                        data = await self._post_batch(
+                            client, batch, location_code, language_code, max_retries
+                        )
+                        tasks = data.get("tasks") or []
+                        seen = set()
+                        for task in tasks:
+                            self.total_cost += float(task.get("cost") or 0)
+                            record = self._convert_task(task, country)
+                            if record and (record.get("answer_text") or record.get("organic")):
+                                batch_results.append(record)
+                                seen.add(record["prompt"])
+                            else:
+                                kw = ((task.get("data") or {}).get("keyword")) or ""
+                                # Surface the real reason instead of swallowing it.
+                                logger.warning(
+                                    f"DataForSEO task not usable for '{kw[:60]}': "
+                                    f"status={task.get('status_code')} "
+                                    f"msg={task.get('status_message')!r}"
+                                )
+                                if kw:
+                                    batch_failed.append(kw)
+                                    seen.add(kw)
+                        for kw in batch:
+                            if kw not in seen:
+                                batch_failed.append(kw)
+                    except Exception as e:
+                        logger.error(
+                            f"DataForSEO request failed for {batch[:1]}"
+                            f"{'…' if len(batch) > 1 else ''}: {type(e).__name__}: {e}"
+                        )
+                        batch_failed.extend(batch)
 
-                tasks = data.get("tasks") or []
-                # Map returned tasks back to keywords by position/keyword.
-                seen_keywords = set()
-                for task in tasks:
-                    self.total_cost += float(task.get("cost") or 0)
-                    record = self._convert_task(task, country)
-                    if record and (record.get("answer_text") or record.get("organic")):
-                        results.append(record)
-                        seen_keywords.add(record["prompt"])
-                    else:
-                        kw = ((task.get("data") or {}).get("keyword")) or ""
-                        if kw:
-                            failed.append(kw)
-                            seen_keywords.add(kw)
-                # Any batch keyword with no corresponding task → failed.
-                for kw in batch:
-                    if kw not in seen_keywords:
-                        failed.append(kw)
+                    async with lock:
+                        results.extend(batch_results)
+                        failed.extend(batch_failed)
+                        processed += len(batch)
+                        if progress_callback:
+                            try:
+                                await progress_callback(processed, total, results)
+                            except Exception:
+                                pass
 
-                processed += len(batch)
-                if progress_callback:
-                    await progress_callback(processed, total, results)
+            await asyncio.gather(*[run_batch(b) for b in batches])
 
         logger.info(
             f"DataForSEO: done — {len(results)} ok, {len(failed)} failed, "

@@ -67,8 +67,12 @@ class Settings(BaseSettings):
     dataforseo_login: str = ""
     dataforseo_password: str = ""
     dataforseo_base_url: str = "https://api.dataforseo.com"
-    # Max keywords per live/advanced request (DataForSEO allows up to 100).
-    dataforseo_batch_size: int = 100
+    # Keywords per live/advanced request. With load_async_ai_overview the
+    # live endpoint is slow per keyword and large batches make the server
+    # drop the connection, so we keep this at 1 and parallelise instead.
+    dataforseo_batch_size: int = 1
+    # Concurrent live/advanced requests (bounded fan-out).
+    dataforseo_max_concurrent: int = 10
 
     # Security
     api_key: Optional[str] = None
