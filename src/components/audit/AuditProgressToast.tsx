@@ -264,10 +264,15 @@ export const AuditProgressToast: React.FC<AuditProgressToastProps> = ({
       </motion.div>
 
       {showModal && (
+        // Pass the already-subscribed audit + steps down so the modal
+        // doesn't open its own realtime channel + 15s poll. Same data,
+        // half the Supabase load per active audit.
         <AuditProgressModal
           isOpen={showModal}
           onClose={() => setShowModal(false)}
           auditId={auditId}
+          externalAudit={audit}
+          externalSteps={steps}
         />
       )}
     </AnimatePresence>

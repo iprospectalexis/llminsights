@@ -16,6 +16,7 @@ class JobStatusEnum(str, Enum):
 class ProviderEnum(str, Enum):
     SERP = "serp"
     BRIGHTDATA = "brightdata"
+    DATAFORSEO = "dataforseo"
 
 
 # Request Schemas

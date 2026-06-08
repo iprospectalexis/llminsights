@@ -1,9 +1,8 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { createPortal } from 'react-dom';
+import React, { useState, useEffect, useMemo } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import {
-  ArrowLeft, Download, Brain, ChevronDown, Check,
+  ArrowLeft, Download, ChevronDown,
   Swords, TrendingUp, TrendingDown, Target, Trophy, Award, Users,
 } from 'lucide-react';
 import {
@@ -18,40 +17,27 @@ import {
   aggregateCompetitors, aggregateTags,
   BrandRow, ResponseRow, SentimentRow, PromptMeta, AuditMeta, CompetitorStats,
 } from '../utils/competitors';
+import { useDashboardFilters } from '../contexts/DashboardFiltersContext';
+import { resolveDateWindow } from '../lib/dashboard-filter-utils';
 import * as XLSX from 'xlsx';
 
-const LLM_ICONS: Record<string, string> = {
-  searchgpt: 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/SearchGPT.PNG',
-  perplexity: 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/Perplexity.png',
-  gemini: 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/Gemini.png',
-  'google-ai-overview': 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/Google.png',
-  'google-ai-mode': 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/Google.png',
-  'bing-copilot': 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/bing_copilot.png',
-  'grok': 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/Grok-icon.png',
-};
-
-const LLM_DISPLAY_NAME: Record<string, string> = {
-  'searchgpt': 'SearchGPT',
-  'perplexity': 'Perplexity',
-  'gemini': 'Gemini',
-  'google-ai-overview': 'Google AI',
-  'google-ai-mode': 'Google AI Mode',
-  'bing-copilot': 'Bing Copilot',
-  'grok': 'Grok',
-};
-const getLlmDisplayName = (llm: string) => LLM_DISPLAY_NAME[llm] || llm;
-
-type DateRange = '7d' | '30d' | '90d' | 'all';
-
-const getStartDateForRange = (range: DateRange): string | null => {
-  if (range === 'all') return null;
-  const days = range === '7d' ? 7 : range === '30d' ? 30 : 90;
-  return new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
-};
+// LLM icon / display-name tables moved to src/lib/llm-display.ts and
+// are consumed by the global filter bar. The local LLM dropdown that
+// used them was removed from this page.
 
 export const ProjectCompetitorsPage: React.FC = () => {
   const { id } = useParams();
   const navigate = useNavigate();
+
+  // Global filters (date range / LLMs / prompt groups). The filter UI
+  // lives in the shared DashboardFilterBar; this page reads + applies
+  // them client-side. Sentiment isn't applied here — competitor
+  // responses don't carry a per-row sentiment label.
+  const {
+    filters: globalFilters,
+    registerProjectMeta,
+    setLastAuditDate: setLastAuditDateInCtx,
+  } = useDashboardFilters();
 
   const [loading, setLoading] = useState(true);
   const [project, setProject] = useState<any>(null);
@@ -61,19 +47,11 @@ export const ProjectCompetitorsPage: React.FC = () => {
   const [sentimentRows, setSentimentRows] = useState<SentimentRow[]>([]);
   const [prompts, setPrompts] = useState<PromptMeta[]>([]);
 
-  const [dateRange, setDateRange] = useState<DateRange>('30d');
-
   // Positioning matrix: limit how many brands are rendered so the chart stays
   // readable when a project has a long tail of low-SOV brands. The own brand
   // is always included on top of the top-N cap. "all" disables the cap.
   type MatrixTopN = 10 | 20 | 50 | 'all';
   const [matrixTopN, setMatrixTopN] = useState<MatrixTopN>(20);
-
-  // LLM multi-select filter — same pattern as ProjectPromptsPage
-  const [selectedLlms, setSelectedLlms] = useState<Set<string> | null>(null);
-  const [showLlmDropdown, setShowLlmDropdown] = useState(false);
-  const [llmDropdownPos, setLlmDropdownPos] = useState<{ top: number; left: number; minWidth: number } | null>(null);
-  const llmButtonRef = useRef<HTMLButtonElement | null>(null);
 
   // Click-a-chip-to-filter state for the strengths/weaknesses explorer
   const [highlightTag, setHighlightTag] = useState<{ kind: 'strengths' | 'weaknesses'; text: string } | null>(null);
@@ -81,7 +59,14 @@ export const ProjectCompetitorsPage: React.FC = () => {
   useEffect(() => {
     if (id) loadData();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [id, dateRange]);
+  }, [id]);
+
+  // Most recent audit date (YYYY-MM-DD) for the "Last audit" preset.
+  const lastAuditDate = useMemo(() => {
+    if (audits.length === 0) return null;
+    const sorted = audits.map(a => a.created_at.split('T')[0]).sort();
+    return sorted[sorted.length - 1];
+  }, [audits]);
 
   const loadData = async () => {
     setLoading(true);
@@ -99,15 +84,16 @@ export const ProjectCompetitorsPage: React.FC = () => {
         .eq('project_id', id);
       setBrands((brandsData as BrandRow[]) || []);
 
-      const startDate = getStartDateForRange(dateRange);
-      let auditsQuery = supabase
+      // Fetch ALL completed audits — date filtering is applied
+      // client-side (below, in the `filtered` useMemo) so the global
+      // bar's "Last audit" / "Custom" presets work without a server
+      // round-trip per filter change.
+      const { data: auditsData } = await supabase
         .from('audits')
         .select('id, created_at')
         .eq('project_id', id)
         .eq('status', 'completed')
         .order('created_at', { ascending: true });
-      if (startDate) auditsQuery = auditsQuery.gte('created_at', startDate);
-      const { data: auditsData } = await auditsQuery;
 
       const auditsList = (auditsData as AuditMeta[] | null) ?? [];
       setAudits(auditsList);
@@ -145,43 +131,73 @@ export const ProjectCompetitorsPage: React.FC = () => {
     }
   };
 
-  // Available LLMs — union of every response.llm we received
+  // Available LLMs — union of every response.llm we received.
   const availableLlms = useMemo(() => {
     return Array.from(new Set(responses.map(r => r.llm))).sort();
   }, [responses]);
 
-  const isLlmVisible = (llm: string): boolean => {
-    if (selectedLlms === null) return true;
-    return selectedLlms.has(llm);
-  };
-  const toggleLlm = (llm: string) => {
-    setSelectedLlms(prev => {
-      const base = prev ?? new Set(availableLlms);
-      const next = new Set(base);
-      if (next.has(llm)) next.delete(llm);
-      else next.add(llm);
-      if (availableLlms.every(l => next.has(l))) return null;
-      return next;
+  // Register meta with the global filter bar (LLMs + prompt groups +
+  // audit dates) and mirror the last audit date for the "Last audit"
+  // preset.
+  useEffect(() => {
+    const availablePromptGroups = Array.from(
+      new Set(prompts.map(p => p.prompt_group).filter(Boolean) as string[]),
+    ).sort();
+    const availableDates = Array.from(
+      new Set(audits.map(a => a.created_at.split('T')[0])),
+    ).sort();
+    registerProjectMeta({
+      availableLlms,
+      availablePromptGroups,
+      availableDates,
+      hasAudits: audits.length > 0,
     });
-  };
-  const clearLlmFilter = () => {
-    setSelectedLlms(null);
-    setShowLlmDropdown(false);
-  };
+    setLastAuditDateInCtx(lastAuditDate);
+  }, [availableLlms, prompts, audits, lastAuditDate, registerProjectMeta, setLastAuditDateInCtx]);
 
-  // Re-aggregate whenever raw data or filters change.
+  // Apply the global filters (LLM + date window + prompt group) to the
+  // raw rows before aggregation. Date window resolves against each
+  // response's parent audit date.
+  const { filteredResponses, filteredSentiment, filteredAudits } = useMemo(() => {
+    const llmSet = globalFilters.llms.length > 0 ? new Set(globalFilters.llms) : null;
+    const pgSet = globalFilters.promptGroups.length > 0 ? new Set(globalFilters.promptGroups) : null;
+    const window = resolveDateWindow(globalFilters, lastAuditDate);
+    const auditDateById = new Map(audits.map(a => [a.id, a.created_at]));
+    const promptGroupById = new Map(prompts.map(p => [p.id, p.prompt_group]));
+
+    const inWindow = (auditId: string): boolean => {
+      if (!window) return true;
+      const created = auditDateById.get(auditId);
+      if (!created) return false;
+      const d = new Date(created);
+      return d >= window.start && d <= window.end;
+    };
+
+    const fResponses = responses.filter(r => {
+      if (llmSet && !llmSet.has(r.llm)) return false;
+      if (!inWindow(r.audit_id)) return false;
+      if (pgSet) {
+        const g = promptGroupById.get(r.prompt_id);
+        if (!g || !pgSet.has(g)) return false;
+      }
+      return true;
+    });
+    const visibleResponseIds = new Set(fResponses.map(r => r.id));
+    const fSentiment = sentimentRows.filter(s => visibleResponseIds.has(s.response_id));
+    const fAudits = audits.filter(a => inWindow(a.id));
+    return { filteredResponses: fResponses, filteredSentiment: fSentiment, filteredAudits: fAudits };
+  }, [responses, sentimentRows, audits, prompts, globalFilters, lastAuditDate]);
+
+  // Re-aggregate whenever the filtered rows change.
   const stats: CompetitorStats[] = useMemo(() => {
-    const filteredResponses = responses.filter(r => isLlmVisible(r.llm));
-    const visibleResponseIds = new Set(filteredResponses.map(r => r.id));
-    const filteredSentiment = sentimentRows.filter(s => visibleResponseIds.has(s.response_id));
     return aggregateCompetitors({
       responses: filteredResponses,
       sentimentRows: filteredSentiment,
       brands,
       prompts,
-      audits,
+      audits: filteredAudits,
     });
-  }, [responses, sentimentRows, brands, prompts, audits, selectedLlms]);
+  }, [filteredResponses, filteredSentiment, brands, prompts, filteredAudits]);
 
   const competitors = useMemo(() => stats.filter(s => !s.isOwn), [stats]);
 
@@ -209,90 +225,9 @@ export const ProjectCompetitorsPage: React.FC = () => {
     return { top, groups, maxCount };
   }, [competitors]);
 
-  // ────── filter UI ──────────────────────────────────────────────────
-  const renderLlmFilter = () => {
-    const selectedCount = selectedLlms === null ? availableLlms.length : selectedLlms.size;
-    const totalCount = availableLlms.length;
-    const label =
-      selectedLlms === null || selectedCount === totalCount
-        ? 'All LLMs'
-        : selectedCount === 0
-          ? 'No LLM'
-          : selectedCount === 1
-            ? getLlmDisplayName(Array.from(selectedLlms!)[0])
-            : `${selectedCount} LLMs`;
-    return (
-      <div className="relative flex items-center space-x-2">
-        <Brain className="w-4 h-4 text-gray-500" />
-        <div className="relative">
-          <button
-            ref={llmButtonRef}
-            type="button"
-            onClick={() => {
-              if (!showLlmDropdown) {
-                const rect = llmButtonRef.current?.getBoundingClientRect();
-                if (rect) {
-                  setLlmDropdownPos({
-                    top: rect.bottom + 4,
-                    left: rect.left,
-                    minWidth: Math.max(rect.width, 220),
-                  });
-                }
-              }
-              setShowLlmDropdown(!showLlmDropdown);
-            }}
-            className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-xl bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 text-sm flex items-center space-x-2"
-          >
-            <span>{label}</span>
-            <ChevronDown className="w-4 h-4" />
-          </button>
-          {showLlmDropdown && createPortal(
-            <>
-              <div className="fixed inset-0 z-[9998]" onClick={() => setShowLlmDropdown(false)} />
-              <div
-                className="fixed bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded-xl shadow-lg z-[9999] max-h-[400px] overflow-y-auto py-1"
-                style={llmDropdownPos || {}}
-              >
-                <button
-                  onClick={clearLlmFilter}
-                  className="w-full flex items-center justify-between px-3 py-2 text-sm hover:bg-gray-100 dark:hover:bg-gray-600 text-gray-700 dark:text-gray-200"
-                >
-                  <span className="font-medium">All LLMs</span>
-                  {selectedLlms === null && <Check className="w-4 h-4 text-[rgb(126,34,206)] dark:text-purple-400" />}
-                </button>
-                <div className="border-t border-gray-200 dark:border-gray-600 my-1" />
-                {availableLlms.length === 0 ? (
-                  <div className="px-3 py-2 text-xs text-gray-500 dark:text-gray-400">
-                    No LLMs in the current data.
-                  </div>
-                ) : (
-                  availableLlms.map(llm => {
-                    const checked = isLlmVisible(llm);
-                    return (
-                      <button
-                        key={llm}
-                        onClick={() => toggleLlm(llm)}
-                        className="w-full flex items-center justify-between px-3 py-2 text-sm hover:bg-gray-100 dark:hover:bg-gray-600 text-gray-700 dark:text-gray-200"
-                      >
-                        <span className="flex items-center space-x-2">
-                          {LLM_ICONS[llm] && (
-                            <img src={LLM_ICONS[llm]} alt="" className="w-4 h-4 rounded" />
-                          )}
-                          <span>{getLlmDisplayName(llm)}</span>
-                        </span>
-                        {checked && <Check className="w-4 h-4 text-[rgb(126,34,206)] dark:text-purple-400" />}
-                      </button>
-                    );
-                  })
-                )}
-              </div>
-            </>,
-            document.body
-          )}
-        </div>
-      </div>
-    );
-  };
+  // LLM / date / prompt-group filter UI now lives in the global
+  // DashboardFilterBar (AppLayout). This page just consumes the values
+  // from the context (see the `filtered` useMemo above).
 
   // ────── summary cards content ──────────────────────────────────────
   const topCompetitor = competitors[0] || null;
@@ -398,7 +333,7 @@ export const ProjectCompetitorsPage: React.FC = () => {
     XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(summaryRows), 'Summary');
     XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(tagRows), 'Strengths & Weaknesses');
     XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(trendRows), 'Trend');
-    const rangeLabel = dateRange === 'all' ? 'all_time' : dateRange;
+    const rangeLabel = globalFilters.dateRange === 'all' ? 'all_time' : globalFilters.dateRange;
     XLSX.writeFile(wb, `${project?.name || 'project'}_competitors_${rangeLabel}.xlsx`);
   };
 
@@ -441,30 +376,18 @@ export const ProjectCompetitorsPage: React.FC = () => {
           </div>
         </div>
 
-        {/* Toolbar */}
+        {/* Toolbar — date/LLM/group filters live in the global
+            DashboardFilterBar above; this row keeps only the page-local
+            matrix control + summary count + export. */}
         <div className="flex flex-wrap items-center justify-between gap-3 mb-6">
           <div className="flex flex-wrap items-center gap-3">
-            <div className="flex items-center gap-2">
-              <label className="text-sm text-gray-600 dark:text-gray-400">Timeframe:</label>
-              <select
-                value={dateRange}
-                onChange={(e) => setDateRange(e.target.value as DateRange)}
-                className="text-sm bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-1.5 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-purple-500"
-              >
-                <option value="7d">Last 7 days</option>
-                <option value="30d">Last 30 days</option>
-                <option value="90d">Last 90 days</option>
-                <option value="all">All time</option>
-              </select>
-            </div>
-            {renderLlmFilter()}
-            {!loading && audits.length > 0 && (
+            {!loading && filteredAudits.length > 0 && (
               <span className="text-xs text-gray-500 dark:text-gray-400">
-                {audits.length} audit{audits.length === 1 ? '' : 's'} · {competitors.length} competitor{competitors.length === 1 ? '' : 's'} tracked
+                {filteredAudits.length} audit{filteredAudits.length === 1 ? '' : 's'} · {competitors.length} competitor{competitors.length === 1 ? '' : 's'} tracked
               </span>
             )}
           </div>
-          <Button onClick={exportToExcel} variant="outline" disabled={loading || stats.length === 0}>
+          <Button onClick={exportToExcel} variant="secondary" disabled={loading || stats.length === 0}>
             <Download className="w-4 h-4 mr-2" /> Export to Excel
           </Button>
         </div>

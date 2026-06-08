@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { motion } from 'framer-motion';
@@ -19,6 +19,25 @@ import { ProjectScheduledAuditsSettings } from '../components/projects/ProjectSc
 import { utils as xlsxUtils, writeFile as xlsxWriteFile } from 'xlsx';
 import { getCountryByCode } from '../utils/countries';
 import { useProject } from '../contexts/ProjectContext';
+import { useDashboardFilters } from '../contexts/DashboardFiltersContext';
+
+// Explicit filter type. Catches keyboard slips like `promptGroup` vs
+// `promptGroups` — the latter is the real state key (a string[] of
+// active prompt-group names), the former previously slipped into
+// resetFilters() and silently broke the reset button.
+type Filters = {
+  dateRange:
+    | 'lastAudit'
+    | 'all'
+    | 'last7days'
+    | 'last14days'
+    | 'last30days'
+    | 'last90days'
+    | 'custom';
+  llms: string;
+  promptGroups: string[];
+  sentiment: 'all' | 'positive' | 'neutral' | 'negative';
+};
 
 const LLM_ICONS = {
   searchgpt: 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/SearchGPT.PNG',
@@ -80,6 +99,18 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
   const navigate = useNavigate();
   const location = useLocation();
   const { setSelectedProject } = useProject();
+  // Global filter state — replaces what used to be local `filters` /
+  // `customDateRange` useState here. The bar in AppLayout writes to
+  // this context; this page reads from it. URL + localStorage
+  // persistence lives in the context, not here.
+  const {
+    filters: globalFilters,
+    setFilter: setGlobalFilter,
+    registerProjectMeta,
+    setLastAuditDate: setLastAuditDateInCtx,
+    reset: resetGlobalFilters,
+    activeFilterCount: activeGlobalFilterCount,
+  } = useDashboardFilters();
   const [project, setProject] = useState<any>(null);
 
   // Get tab from URL search params, override, or default to 'overview'
@@ -123,21 +154,56 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
   const [runningAudits, setRunningAudits] = useState<string[]>([]);
   const [runningAuditInfo, setRunningAuditInfo] = useState<{status: string, currentStep: string} | null>(null);
   const [filteredLlmResponses, setFilteredLlmResponses] = useState<any[]>([]);
-  const [filters, setFilters] = useState({
-    dateRange: 'lastAudit',
-    llms: 'all',
-    promptGroups: [] as string[],
-    sentiment: 'all',
-  });
-  const [showPromptGroupDropdown, setShowPromptGroupDropdown] = useState(false);
-  const [showLlmDropdown, setShowLlmDropdown] = useState(false);
-  const [llmDropdownPos, setLlmDropdownPos] = useState<{ top: number; left: number; minWidth: number } | null>(null);
-  const llmButtonRef = useRef<HTMLButtonElement>(null);
-  const [showCustomDatePicker, setShowCustomDatePicker] = useState(false);
-  const [customDateRange, setCustomDateRange] = useState({
-    startDate: '',
-    endDate: '',
-  });
+  // Backwards-compat view of the global multi-select `llms` filter
+  // as a single-string value. Used by the many in-page comparison
+  // sites written for the old shape. The actual data filtering uses
+  // the full array (see the `isLlmVisible` helper just below).
+  //   - 0 selected (no filter) → 'all'
+  //   - 1 selected → that LLM
+  //   - 2+ selected → 'all' AND the filtering still constrains the
+  //     visible set via the array; the per-LLM branches just treat
+  //     the multi case as "show everything" which is the safer default.
+  const filters = useMemo<Filters>(() => ({
+    dateRange: globalFilters.dateRange,
+    llms:
+      globalFilters.llms.length === 1
+        ? (globalFilters.llms[0] as Filters['llms'])
+        : 'all',
+    promptGroups: globalFilters.promptGroups,
+    sentiment: globalFilters.sentiment,
+  }), [globalFilters]);
+  const customDateRange = globalFilters.customDateRange;
+  // Set the LLM filter through the context, accepting the old
+  // single-string shape so the rest of the page can stay as it was.
+  const setFilters = useCallback((updater: (prev: Filters) => Filters) => {
+    // The page only uses this updater shape; if we ever switch back
+    // to direct sets, add a non-fn branch here.
+    const prev: Filters = {
+      dateRange: globalFilters.dateRange,
+      llms:
+        globalFilters.llms.length === 1
+          ? (globalFilters.llms[0] as Filters['llms'])
+          : 'all',
+      promptGroups: globalFilters.promptGroups,
+      sentiment: globalFilters.sentiment,
+    };
+    const next = updater(prev);
+    if (next.dateRange !== prev.dateRange) {
+      setGlobalFilter('dateRange', next.dateRange);
+    }
+    if (next.llms !== prev.llms) {
+      setGlobalFilter('llms', next.llms === 'all' ? [] : [next.llms]);
+    }
+    if (next.promptGroups !== prev.promptGroups) {
+      setGlobalFilter('promptGroups', next.promptGroups);
+    }
+    if (next.sentiment !== prev.sentiment) {
+      setGlobalFilter('sentiment', next.sentiment);
+    }
+  }, [globalFilters, setGlobalFilter]);
+  const setCustomDateRange = useCallback((next: { startDate: string; endDate: string }) => {
+    setGlobalFilter('customDateRange', next);
+  }, [setGlobalFilter]);
   const [availableDates, setAvailableDates] = useState<string[]>([]);
   const [editFormData, setEditFormData] = useState({
     name: '',
@@ -263,8 +329,13 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
   }, [llmResponses, citations]);
 
   useEffect(() => {
+    // `customDateRange` and `lastAuditDate` are read inside applyFilters
+    // but were missing from the deps array — that caused a race on cold
+    // load (applyFilters runs before lastAuditDate is set) and made the
+    // Custom Date Range picker not re-filter when the user changed
+    // start/end dates without also touching another filter.
     applyFilters();
-  }, [processedCitations, llmResponses, filters]);
+  }, [processedCitations, llmResponses, filters, customDateRange, lastAuditDate]);
 
   useEffect(() => {
     calculateBrandLeadership();
@@ -348,11 +419,18 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
       // dropdown label still renders something when no audit has any data
       // yet (freshly created project, everything still running, etc.).
       const sortedDatesWithData = Array.from(datesWithData).sort();
+      let computedLastAuditDate: string | null = null;
       if (sortedDatesWithData.length > 0) {
-        setLastAuditDate(sortedDatesWithData[sortedDatesWithData.length - 1]);
+        computedLastAuditDate = sortedDatesWithData[sortedDatesWithData.length - 1];
+        setLastAuditDate(computedLastAuditDate);
       } else if (sortedAuditDates.length > 0) {
-        setLastAuditDate(sortedAuditDates[sortedAuditDates.length - 1]);
+        computedLastAuditDate = sortedAuditDates[sortedAuditDates.length - 1];
+        setLastAuditDate(computedLastAuditDate);
       }
+      // Mirror to the global filter context so the DateRangePicker
+      // in AppLayout can resolve the "Last audit" preset to a real
+      // date window.
+      setLastAuditDateInCtx(computedLastAuditDate);
     } else if (auditDatesFromAudits.size > 0) {
       // Even if no citations, show audit dates
       const sortedAuditDates = Array.from(auditDatesFromAudits).sort();
@@ -362,13 +440,33 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
       // Same preference as above — a date with llm_response answers beats
       // an empty force-completed audit at the top of the list.
       const sortedDatesWithData = Array.from(datesWithData).sort();
+      let computedLastAuditDate: string | null = null;
       if (sortedDatesWithData.length > 0) {
-        setLastAuditDate(sortedDatesWithData[sortedDatesWithData.length - 1]);
+        computedLastAuditDate = sortedDatesWithData[sortedDatesWithData.length - 1];
+        setLastAuditDate(computedLastAuditDate);
       } else if (sortedAuditDates.length > 0) {
-        setLastAuditDate(sortedAuditDates[sortedAuditDates.length - 1]);
+        computedLastAuditDate = sortedAuditDates[sortedAuditDates.length - 1];
+        setLastAuditDate(computedLastAuditDate);
       }
+      setLastAuditDateInCtx(computedLastAuditDate);
     }
-  }, [processedCitations, auditsData, llmResponses]);
+
+    // Register project meta with the global filter context so the
+    // DashboardFilterBar dropdowns know which LLMs / prompt groups /
+    // audit dates this project actually has.
+    const availableLlms = Array.from(
+      new Set(llmResponses.map(r => r.llm).filter(Boolean)),
+    ).sort();
+    const availableGroups = Array.from(
+      new Set(promptGroups.filter(Boolean)),
+    ).sort();
+    registerProjectMeta({
+      availableLlms,
+      availablePromptGroups: availableGroups,
+      availableDates: Array.from(allAvailable).sort(),
+      hasAudits: auditDatesFromAudits.size > 0,
+    });
+  }, [processedCitations, auditsData, llmResponses, promptGroups, registerProjectMeta, setLastAuditDateInCtx]);
 
   const calculateBrandLeadership = () => {
     try {
@@ -866,12 +964,14 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
       // First, try to use the citations field from llm_responses (this has cited info)
       if (response.citations && Array.isArray(response.citations)) {
         response.citations.forEach((citation: any, index: number) => {
-          // Check if this citation already exists in the database citations
+          // Check if this citation already exists in the database citations.
+          // Compare on normalized URL — see normalizeUrl above for why.
+          const candidateKey = normalizeUrl(citation.url);
           const existsInDb = citations.some(c =>
             c.audit_id === response.audit_id &&
             c.prompt_id === response.prompt_id &&
             c.llm === response.llm &&
-            c.page_url === citation.url
+            normalizeUrl(c.page_url) === candidateKey
           );
 
           if (!existsInDb && citation.url) {
@@ -951,12 +1051,14 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
 
       // Convert URLs to citation format (only if not already in citations table)
       urls.forEach(urlData => {
-        // Check if this citation already exists in the database citations
+        // Check if this citation already exists in the database citations.
+        // Compare on normalized URL — see normalizeUrl above.
+        const candidateKey = normalizeUrl(urlData.url);
         const existsInDb = citations.some(c =>
           c.audit_id === response.audit_id &&
           c.prompt_id === response.prompt_id &&
           c.llm === response.llm &&
-          c.page_url === urlData.url
+          normalizeUrl(c.page_url) === candidateKey
         );
 
         if (!existsInDb) {
@@ -992,6 +1094,25 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     }
   };
 
+  // Normalize URLs before dedup-comparing citations from two sources
+  // (the `citations` table and the `llm_responses.citations` JSONB).
+  // Without this, "https://Example.com/foo/" and "http://www.example.com/foo"
+  // were treated as different and the same URL got counted twice in the
+  // Citations tab vs Overview widget. Trailing slash, www., scheme, host
+  // case, and hash are all stripped; query string is preserved because
+  // it can legitimately differentiate articles (e.g. ?id=123).
+  const normalizeUrl = (url: string): string => {
+    if (!url) return '';
+    try {
+      const u = new URL(url);
+      const host = u.hostname.toLowerCase().replace(/^www\./, '');
+      const path = u.pathname.replace(/\/+$/, '') || '/';
+      return `${host}${path}${u.search}`;
+    } catch {
+      return url.toLowerCase().replace(/\/+$/, '');
+    }
+  };
+
   const extractDomain = (url: string): string => {
     try {
       const urlObj = new URL(url);
@@ -1001,39 +1122,12 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     }
   };
 
-  const handleFilterChange = (filterType: string, value: string) => {
-    if (filterType === 'dateRange' && value === 'custom') {
-      setShowCustomDatePicker(true);
-    } else if (filterType === 'dateRange' && value !== 'custom') {
-      setShowCustomDatePicker(false);
-    }
-    
-    setFilters(prev => ({
-      ...prev,
-      [filterType]: value,
-    }));
-  };
-
-  const resetFilters = () => {
-    setFilters({
-      dateRange: 'lastAudit',
-      llms: 'all',
-      promptGroup: 'all',
-      sentiment: 'all',
-    });
-    setShowCustomDatePicker(false);
-    setCustomDateRange({ startDate: '', endDate: '' });
-  };
-
-  const getActiveFiltersCount = () => {
-    let count = 0;
-    if (filters.dateRange !== 'lastAudit') count++;
-    if (filters.llms !== 'all') count++;
-    if (filters.promptGroups.length > 0) count++;
-    if (filters.sentiment !== 'all') count++;
-    if (filters.dateRange === 'custom' && (customDateRange.startDate || customDateRange.endDate)) count++;
-    return count;
-  };
+  // handleFilterChange / resetFilters / getActiveFiltersCount used to
+  // live here and were wired to the inline Filter Card UI that has now
+  // been replaced by the global DashboardFilterBar (in AppLayout). The
+  // bar reads/writes filter state via the DashboardFiltersContext, so
+  // every page just consumes `filters` from there and no longer owns
+  // its own handlers / reset / counter.
 
   const fetchGroups = async () => {
     const { data } = await supabase
@@ -1227,7 +1321,15 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
         setCitations([]);
         setAuditDates([]);
       } else {
-        // Then fetch LLM responses for only these recent audits
+        // Then fetch LLM responses for only these recent audits.
+        // Cost reduction: dropped `raw_response_data`, `all_sources`, and
+        // `links_attached` from the select. These were used by a legacy
+        // fallback path that extracted citations from the raw provider
+        // payload; the citation-rendering primary path uses the `citations`
+        // JSONB column (populated during polling for OneSearch rows) and
+        // the separate `citations` table. The fallback code below
+        // (`if (!response.raw_response_data) return`) gracefully no-ops
+        // when the column is absent.
         const { data: llmResponsesData, error: responsesError } = await supabase
           .from('llm_responses')
           .select(`
@@ -1236,10 +1338,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
             prompt_id,
             llm,
             answer_text,
-            raw_response_data,
             citations,
-            all_sources,
-            links_attached,
             web_search_query,
             sentiment_score,
             sentiment_label,
@@ -1398,8 +1497,9 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     };
   };
 
-  const handleRunAudit = (projectId: string) => {
-    setShowLlmDropdown(false);
+  const handleRunAudit = (_projectId: string) => {
+    // Local LLM dropdown was removed when the filter UI moved into
+    // the global DashboardFilterBar — no need to close it from here.
     setShowRunAuditModal(true);
   };
 
@@ -2432,17 +2532,9 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
       <ArrowDown className="w-4 h-4" />;
   };
 
-  // Normalize URL by removing query parameters for grouping
-  const normalizeUrl = (url: string): string => {
-    try {
-      const urlObj = new URL(url);
-      // Return URL without query parameters or hash
-      return `${urlObj.origin}${urlObj.pathname}`;
-    } catch (e) {
-      // If URL parsing fails, return original
-      return url;
-    }
-  };
+  // (normalizeUrl is defined once near the citation dedupe code above —
+  // the duplicate that used to live here was removed; both consumers
+  // now share the single normalizer for consistent URL grouping.)
 
   const getFilteredPageStats = () => {
     const pageStats = filteredCitations.reduce((acc, citation) => {
@@ -2747,106 +2839,56 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
   const getCitationRate = () => {
     if (!project?.domain) return { rate: 0, cited: 0, total: 0 };
 
-    // Normalize project domain (remove www and lowercase) to match recalculate-metrics logic
+    // Normalize project domain (remove www and lowercase) to match
+    // recalculate-metrics logic.
     const projectDomain = project.domain.toLowerCase().replace(/^www\./, '');
     const domainMode = project.domain_mode || 'exact';
 
+    // Single source of truth: the `citations` table. Server-side the
+    // audit pipeline extracts citations for every LLM (SearchGPT,
+    // Perplexity, Gemini, Bing, Google AI, Grok…) and writes them
+    // into this table — Domain Detail / Heatmap pages already trust
+    // it as canonical.
+    //
+    // We used to also scan `r.links_attached` (SearchGPT) and
+    // `r.all_sources` (Bing/Google/Grok) here as a "belt and braces"
+    // fallback. That fallback is being dropped because (a) it
+    // double-counts URLs the citations table already contains and
+    // (b) those columns are no longer in the page's SELECT (see the
+    // egress-reduction PR), so reading them returns undefined.
     const citedLlmResponseIds = new Set<string>();
 
-    // Check citations from citations table (for SearchGPT, Perplexity, Gemini)
     filteredCitations
       .filter(c => {
         if (!c.domain || !c.audit_id || !c.prompt_id) return false;
 
-        // Filter out citations with cited=false (SearchGPT "More" section)
+        // Filter out citations with cited=false (SearchGPT "More" section).
         if (c.cited === false) return false;
 
-        // Normalize citation domain (remove www and lowercase)
         const citationDomain = c.domain.toLowerCase().replace(/^www\./, '');
 
         if (domainMode === 'subdomains') {
-          return citationDomain === projectDomain || citationDomain.endsWith(`.${projectDomain}`);
-        } else {
-          return citationDomain === projectDomain;
+          return (
+            citationDomain === projectDomain ||
+            citationDomain.endsWith(`.${projectDomain}`)
+          );
         }
+        return citationDomain === projectDomain;
       })
-      .forEach(c => citedLlmResponseIds.add(`${c.audit_id}-${c.prompt_id}-${c.llm}`));
+      .forEach(c =>
+        citedLlmResponseIds.add(`${c.audit_id}-${c.prompt_id}-${c.llm}`)
+      );
 
-    // Check links_attached field for SearchGPT
-    filteredLlmResponses
-      .filter(r => r.audit_id && r.prompt_id && r.llm === 'searchgpt' && r.links_attached && Array.isArray(r.links_attached))
-      .forEach(response => {
-        try {
-          const hasProjectDomain = response.links_attached.some((link: any) => {
-            if (!link.url) return false;
-
-            try {
-              const urlObj = new URL(link.url);
-              const linkDomain = urlObj.hostname.toLowerCase().replace(/^www\./, '');
-
-              if (domainMode === 'subdomains') {
-                return linkDomain === projectDomain || linkDomain.endsWith(`.${projectDomain}`);
-              } else {
-                return linkDomain === projectDomain;
-              }
-            } catch {
-              return false;
-            }
-          });
-
-          if (hasProjectDomain) {
-            citedLlmResponseIds.add(`${response.audit_id}-${response.prompt_id}-${response.llm}`);
-          }
-        } catch (error) {
-          console.error('Error parsing links_attached:', error);
-        }
-      });
-
-    // Check all_sources field for LLMs that store sources there (Bing, Google AI, Grok, etc.)
-    filteredLlmResponses
-      .filter(r => r.audit_id && r.prompt_id && r.all_sources)
-      .forEach(response => {
-        try {
-          const sources = Array.isArray(response.all_sources) ? response.all_sources : JSON.parse(response.all_sources);
-
-          const hasProjectDomain = sources.some((source: any) => {
-            if (!source.domain && !source.url) return false;
-
-            // Extract and normalize domain
-            let sourceDomain = '';
-            if (source.domain) {
-              sourceDomain = source.domain.toLowerCase().replace(/^www\./, '');
-            } else if (source.url) {
-              try {
-                const urlObj = new URL(source.url);
-                sourceDomain = urlObj.hostname.toLowerCase().replace(/^www\./, '');
-              } catch {
-                return false;
-              }
-            }
-
-            if (domainMode === 'subdomains') {
-              return sourceDomain === projectDomain || sourceDomain.endsWith(`.${projectDomain}`);
-            } else {
-              return sourceDomain === projectDomain;
-            }
-          });
-
-          if (hasProjectDomain) {
-            citedLlmResponseIds.add(`${response.audit_id}-${response.prompt_id}-${response.llm}`);
-          }
-        } catch (error) {
-          console.error('Error parsing all_sources:', error);
-        }
-      });
-
-    // Count total LLM responses using filtered data
-    const totalLlmResponses = filteredLlmResponses.filter(r => r.audit_id && r.prompt_id).length;
+    // Denominator: all filtered LLM responses (one per LLM × prompt × audit).
+    const totalLlmResponses = filteredLlmResponses.filter(
+      r => r.audit_id && r.prompt_id
+    ).length;
 
     if (totalLlmResponses === 0) return { rate: 0, cited: 0, total: 0 };
 
-    // Calculate percentage of LLM responses that cite the domain
-    const rate = Math.round((citedLlmResponseIds.size / totalLlmResponses) * 100);
+    const rate = Math.round(
+      (citedLlmResponseIds.size / totalLlmResponses) * 100
+    );
     return { rate, cited: citedLlmResponseIds.size, total: totalLlmResponses };
   };
 
@@ -3096,356 +3138,6 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
         </div>
       </motion.div>
 
-      {/* Filter Bar */}
-      <Card>
-        <CardContent className="p-6 pt-8">
-          <div className="flex flex-wrap items-center justify-between gap-4">
-            <div className="flex flex-wrap items-center gap-4">
-              <div className="flex items-center space-x-2">
-                <Calendar className="w-4 h-4 text-gray-500" />
-                <select
-                  value={filters.dateRange}
-                  onChange={(e) => handleFilterChange('dateRange', e.target.value)}
-                  className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-xl bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 text-sm font-sans focus:ring-2 focus:ring-brand-primary/20 focus:border-brand-primary"
-                >
-                  <option value="lastAudit">
-                    Last Audit {lastAuditDate && `(${new Date(lastAuditDate).toLocaleDateString()})`}
-                  </option>
-                  <option value="all">All time</option>
-                  <option value="last7days">Last 7 days</option>
-                  <option value="last14days">Last 14 days</option>
-                  <option value="last30days">Last 30 days</option>
-                  <option value="last90days">Last 90 days</option>
-                  <option value="custom">Custom</option>
-                </select>
-              </div>
-              
-              <div className="relative flex items-center space-x-2 z-[30]">
-                <Brain className="w-4 h-4 text-gray-500" />
-                <div className="relative">
-                  <button
-                    ref={llmButtonRef}
-                    type="button"
-                    onClick={() => {
-                      if (!showLlmDropdown) {
-                        const rect = llmButtonRef.current?.getBoundingClientRect();
-                        if (rect) setLlmDropdownPos({ top: rect.bottom + 4, left: rect.left, minWidth: rect.width });
-                      }
-                      setShowLlmDropdown(!showLlmDropdown);
-                    }}
-                    className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-xl bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 text-sm font-sans focus:ring-2 focus:ring-brand-primary/20 focus:border-brand-primary flex items-center space-x-2 justify-between"
-                  >
-                    <div className="flex items-center space-x-2">
-                      {filters.llms !== 'all' && (
-                        <img src={LLM_ICONS[filters.llms as keyof typeof LLM_ICONS]} alt="" className="w-4 h-4" />
-                      )}
-                      <span>
-                        {filters.llms === 'all' ? 'All LLMs' :
-                         filters.llms === 'searchgpt' ? 'SearchGPT' :
-                         filters.llms === 'perplexity' ? 'Perplexity' :
-                         filters.llms === 'gemini' ? 'Gemini' :
-                         filters.llms === 'google-ai-overview' ? 'Google AI Overview' :
-                         filters.llms === 'google-ai-mode' ? 'Google AI Mode' :
-                         filters.llms === 'bing-copilot' ? 'Bing Copilot' :
-                         filters.llms === 'grok' ? 'Grok' : 'All LLMs'}
-                      </span>
-                    </div>
-                    <ChevronDown className="w-4 h-4" />
-                  </button>
-                  {showLlmDropdown && createPortal(
-                    <>
-                      <div
-                        className="fixed inset-0 z-[9998]"
-                        onClick={() => setShowLlmDropdown(false)}
-                      />
-                      <div
-                        className="fixed bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded-xl shadow-lg z-[9999] max-h-[400px] overflow-y-auto"
-                        style={llmDropdownPos || {}}
-                      >
-                        <button
-                          type="button"
-                          onClick={() => {
-                            handleFilterChange('llms', 'all');
-                            setShowLlmDropdown(false);
-                          }}
-                          className="w-full px-3 py-2 text-left text-sm text-gray-900 dark:text-gray-100 hover:bg-gray-100 dark:hover:bg-gray-600 flex items-center space-x-2"
-                        >
-                          <span>All LLMs</span>
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            handleFilterChange('llms', 'searchgpt');
-                            setShowLlmDropdown(false);
-                          }}
-                          className="w-full px-3 py-2 text-left text-sm text-gray-900 dark:text-gray-100 hover:bg-gray-100 dark:hover:bg-gray-600 flex items-center space-x-2"
-                        >
-                          <img src={LLM_ICONS.searchgpt} alt="" className="w-4 h-4" />
-                          <span>SearchGPT</span>
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            handleFilterChange('llms', 'perplexity');
-                            setShowLlmDropdown(false);
-                          }}
-                          className="w-full px-3 py-2 text-left text-sm text-gray-900 dark:text-gray-100 hover:bg-gray-100 dark:hover:bg-gray-600 flex items-center space-x-2"
-                        >
-                          <img src={LLM_ICONS.perplexity} alt="" className="w-4 h-4" />
-                          <span>Perplexity</span>
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            handleFilterChange('llms', 'gemini');
-                            setShowLlmDropdown(false);
-                          }}
-                          className="w-full px-3 py-2 text-left text-sm text-gray-900 dark:text-gray-100 hover:bg-gray-100 dark:hover:bg-gray-600 flex items-center space-x-2"
-                        >
-                          <img src={LLM_ICONS.gemini} alt="" className="w-4 h-4" />
-                          <span>Gemini</span>
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            handleFilterChange('llms', 'google-ai-overview');
-                            setShowLlmDropdown(false);
-                          }}
-                          className="w-full px-3 py-2 text-left text-sm text-gray-900 dark:text-gray-100 hover:bg-gray-100 dark:hover:bg-gray-600 flex items-center space-x-2"
-                        >
-                          <img src={LLM_ICONS['google-ai-overview']} alt="" className="w-4 h-4" />
-                          <span>Google AI Overview</span>
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            handleFilterChange('llms', 'google-ai-mode');
-                            setShowLlmDropdown(false);
-                          }}
-                          className="w-full px-3 py-2 text-left text-sm text-gray-900 dark:text-gray-100 hover:bg-gray-100 dark:hover:bg-gray-600 flex items-center space-x-2"
-                        >
-                          <img src={LLM_ICONS['google-ai-mode']} alt="" className="w-4 h-4" />
-                          <span>Google AI Mode</span>
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            handleFilterChange('llms', 'bing-copilot');
-                            setShowLlmDropdown(false);
-                          }}
-                          className="w-full px-3 py-2 text-left text-sm text-gray-900 dark:text-gray-100 hover:bg-gray-100 dark:hover:bg-gray-600 flex items-center space-x-2"
-                        >
-                          <img src={LLM_ICONS['bing-copilot']} alt="" className="w-4 h-4" />
-                          <span>Bing Copilot</span>
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            handleFilterChange('llms', 'grok');
-                            setShowLlmDropdown(false);
-                          }}
-                          className="w-full px-3 py-2 text-left text-sm text-gray-900 dark:text-gray-100 hover:bg-gray-100 dark:hover:bg-gray-600 flex items-center space-x-2"
-                        >
-                          <img src={LLM_ICONS.grok} alt="" className="w-4 h-4" />
-                          <span>Grok</span>
-                        </button>
-                      </div>
-                    </>,
-                    document.body
-                  )}
-                </div>
-              </div>
-              
-              <div className="relative flex items-center space-x-2">
-                <FileText className="w-4 h-4 text-gray-500" />
-                <div className="relative">
-                  <button
-                    type="button"
-                    onClick={() => setShowPromptGroupDropdown(!showPromptGroupDropdown)}
-                    className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-xl bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 text-sm font-sans focus:ring-2 focus:ring-brand-primary/20 focus:border-brand-primary flex items-center space-x-2 justify-between"
-                  >
-                    <span>
-                      {filters.promptGroups.length === 0
-                        ? 'All Prompt Groups'
-                        : `${filters.promptGroups.length} selected`}
-                    </span>
-                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-                    </svg>
-                  </button>
-
-                  {showPromptGroupDropdown && (
-                    <>
-                      <div
-                        className="fixed inset-0 z-10"
-                        onClick={() => setShowPromptGroupDropdown(false)}
-                      />
-                      <div className="absolute z-20 mt-1 w-64 bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-xl shadow-lg max-h-60 overflow-auto">
-                        <div className="p-2 space-y-1">
-                          {Array.from(new Set(prompts.map(p => p.prompt_group))).map(group => (
-                            <label
-                              key={group}
-                              className="flex items-center p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg cursor-pointer"
-                            >
-                              <input
-                                type="checkbox"
-                                checked={filters.promptGroups.includes(group)}
-                                onChange={(e) => {
-                                  if (e.target.checked) {
-                                    setFilters(prev => ({
-                                      ...prev,
-                                      promptGroups: [...prev.promptGroups, group]
-                                    }));
-                                  } else {
-                                    setFilters(prev => ({
-                                      ...prev,
-                                      promptGroups: prev.promptGroups.filter(g => g !== group)
-                                    }));
-                                  }
-                                }}
-                                className="w-4 h-4 text-brand-primary border-gray-300 dark:border-gray-600 rounded focus:ring-brand-primary"
-                              />
-                              <span className="ml-2 text-sm text-gray-900 dark:text-gray-100">
-                                {group}
-                              </span>
-                            </label>
-                          ))}
-                        </div>
-                        {filters.promptGroups.length > 0 && (
-                          <div className="border-t border-gray-200 dark:border-gray-700 p-2">
-                            <button
-                              onClick={() => {
-                                setFilters(prev => ({ ...prev, promptGroups: [] }));
-                                setShowPromptGroupDropdown(false);
-                              }}
-                              className="w-full text-sm text-brand-primary hover:text-brand-secondary font-medium"
-                            >
-                              Clear all
-                            </button>
-                          </div>
-                        )}
-                      </div>
-                    </>
-                  )}
-                </div>
-              </div>
-            </div>
-            
-            <div className="flex items-center space-x-2">
-              {getActiveFiltersCount() > 0 && (
-                <div className="flex items-center space-x-2">
-                  <span className="text-sm text-gray-600 dark:text-gray-400">
-                    {getActiveFiltersCount()} filter{getActiveFiltersCount() > 1 ? 's' : ''} active
-                  </span>
-                  <div className="w-2 h-2 bg-brand-primary rounded-full"></div>
-                </div>
-              )}
-              <Button variant="ghost" size="sm" onClick={resetFilters}>
-                Reset
-              </Button>
-            </div>
-          </div>
-          
-          {(filteredLlmResponses.length !== llmResponses.length || filteredCitations.length !== citations.length) && (
-            <div className="mt-6 pt-4 border-t border-gray-200 dark:border-gray-700">
-              <div className="text-sm text-gray-600 dark:text-gray-400">
-                Showing {filteredLlmResponses.length} of {llmResponses.length} responses, {filteredCitations.length} of {citations.length} citations
-              </div>
-            </div>
-          )}
-        </CardContent>
-      </Card>
-
-      {/* Custom Date Range Picker Modal */}
-      <Modal 
-        isOpen={showCustomDatePicker} 
-        onClose={() => {
-          setShowCustomDatePicker(false);
-          if (!customDateRange.startDate || !customDateRange.endDate) {
-            setFilters(prev => ({ ...prev, dateRange: 'last30days' }));
-          }
-        }} 
-        title="Select Custom Date Range"
-      >
-        <div className="p-6 space-y-4">
-          <div className="text-sm text-gray-600 dark:text-gray-400 mb-4">
-            Select from dates with available audit data
-          </div>
-          
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-                Start Date
-              </label>
-              <select
-                value={customDateRange.startDate}
-                onChange={(e) => setCustomDateRange(prev => ({ ...prev, startDate: e.target.value }))}
-                className="block w-full rounded-2xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-4 py-2.5 text-gray-900 dark:text-gray-100 focus:border-brand-primary focus:ring-2 focus:ring-brand-primary/20 font-sans"
-              >
-                <option value="">Select start date</option>
-                {availableDates.map(date => (
-                  <option key={date} value={date}>
-                    {new Date(date).toLocaleDateString()}
-                  </option>
-                ))}
-              </select>
-            </div>
-            
-            <div>
-              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-                End Date
-              </label>
-              <select
-                value={customDateRange.endDate}
-                onChange={(e) => setCustomDateRange(prev => ({ ...prev, endDate: e.target.value }))}
-                className="block w-full rounded-2xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-4 py-2.5 text-gray-900 dark:text-gray-100 focus:border-brand-primary focus:ring-2 focus:ring-brand-primary/20 font-sans"
-                disabled={!customDateRange.startDate}
-              >
-                <option value="">Select end date</option>
-                {availableDates
-                  .filter(date => !customDateRange.startDate || date >= customDateRange.startDate)
-                  .map(date => (
-                    <option key={date} value={date}>
-                      {new Date(date).toLocaleDateString()}
-                    </option>
-                  ))}
-              </select>
-            </div>
-          </div>
-          
-          {customDateRange.startDate && customDateRange.endDate && (
-            <div className="p-3 bg-blue-50 dark:bg-blue-900/20 rounded-xl">
-              <div className="text-sm text-blue-800 dark:text-blue-200">
-                Selected range: {new Date(customDateRange.startDate).toLocaleDateString()} - {new Date(customDateRange.endDate).toLocaleDateString()}
-              </div>
-            </div>
-          )}
-          
-          <div className="flex justify-end space-x-3 pt-4 border-t border-gray-200 dark:border-gray-700">
-            <Button 
-              variant="secondary" 
-              onClick={() => {
-                setShowCustomDatePicker(false);
-                setFilters(prev => ({ ...prev, dateRange: 'lastAudit' }));
-                setCustomDateRange({ startDate: '', endDate: '' });
-              }}
-            >
-              Cancel
-            </Button>
-            <Button
-              variant="gradient"
-              onClick={() => {
-                setShowCustomDatePicker(false);
-                applyFilters();
-              }}
-              disabled={!customDateRange.startDate || !customDateRange.endDate}
-            >
-              Apply Date Range
-            </Button>
-          </div>
-        </div>
-      </Modal>
-
       {/* Tabs */}
       <Card>
         {!hideTabNavigation && (
@@ -3557,6 +3249,34 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                   </div>
                 </div>
               </div>
+
+              {/* Empty-filter hint — explains the 0/0/0 case so users
+                  don't read it as a bug. Only shown when the filter
+                  combo really matched no data and the user has at
+                  least one non-default filter active. */}
+              {filteredLlmResponses.length === 0 && activeGlobalFilterCount > 0 && (
+                <div className="rounded-2xl border border-amber-200 dark:border-amber-700 bg-amber-50 dark:bg-amber-900/20 px-4 py-3 text-sm text-amber-800 dark:text-amber-200 flex items-start gap-3">
+                  <Info className="w-5 h-5 flex-shrink-0 mt-0.5" />
+                  <div className="flex-1">
+                    <div className="font-medium mb-1">
+                      No responses match the current filters
+                    </div>
+                    <div className="text-amber-700 dark:text-amber-300">
+                      Try a wider date range, clear the prompt-group or
+                      sentiment filter, or pick "All LLMs". You have{' '}
+                      {activeGlobalFilterCount} active filter
+                      {activeGlobalFilterCount === 1 ? '' : 's'}.
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={resetGlobalFilters}
+                    className="text-amber-700 dark:text-amber-300 underline hover:no-underline whitespace-nowrap"
+                  >
+                    Reset all
+                  </button>
+                </div>
+              )}
 
               {/* Visibility Heatmap */}
               <div className="bg-white dark:bg-gray-800 rounded-2xl border border-gray-200 dark:border-gray-700 p-6">
@@ -5052,10 +4772,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                     </p>
                     <Button
                       variant="gradient"
-                      onClick={() => {
-                        setShowLlmDropdown(false);
-                        setShowRunAuditModal(true);
-                      }}
+                      onClick={() => setShowRunAuditModal(true)}
                     >
                       <Play className="w-4 h-4 mr-2" />
                       Run Audit

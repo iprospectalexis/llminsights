@@ -1,11 +1,11 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { createPortal } from 'react-dom';
+import React, { useState, useEffect, useMemo } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { ArrowLeft, Download, Brain, ChevronDown, Check, CircleCheck as CheckCircle2, Circle as XCircle } from 'lucide-react';
+import { ArrowLeft, Download, CircleCheck as CheckCircle2, Circle as XCircle } from 'lucide-react';
 import { supabase } from '../lib/supabase';
 import { LoadingSpinner } from '../components/ui/LoadingSpinner';
 import { Button } from '../components/ui/Button';
 import { ProjectDetailPage } from './ProjectDetailPage';
+import { useDashboardFilters } from '../contexts/DashboardFiltersContext';
 import * as XLSX from 'xlsx';
 
 const LLM_ICONS = {
@@ -57,8 +57,6 @@ interface AllAuditsData {
   cells: Record<string, AuditCell[]>;
 }
 
-type DateRange = '7d' | '30d' | '90d' | 'all';
-
 export const ProjectPromptsPage: React.FC = () => {
   const { id } = useParams();
   const navigate = useNavigate();
@@ -71,45 +69,66 @@ export const ProjectPromptsPage: React.FC = () => {
   const [ownBrandNames, setOwnBrandNames] = useState<string[]>([]);
 
   // "All audits" tab state
-  const [dateRange, setDateRange] = useState<DateRange>('30d');
   const [allAudits, setAllAudits] = useState<{ id: string; created_at: string }[]>([]);
   const [allAuditsData, setAllAuditsData] = useState<AllAuditsData[]>([]);
   const [allAuditsLlmList, setAllAuditsLlmList] = useState<string[]>([]);
 
-  // LLM visibility filter — shared between Last audit and All audits tabs.
-  // `null` = all LLMs visible; otherwise a set of LLM keys to show.
-  // Multi-select via checkboxes in the dropdown.
-  const [selectedLlms, setSelectedLlms] = useState<Set<string> | null>(null);
-  const [showLlmDropdown, setShowLlmDropdown] = useState(false);
-  const [llmDropdownPos, setLlmDropdownPos] = useState<{ top: number; left: number; minWidth: number } | null>(null);
-  const llmButtonRef = useRef<HTMLButtonElement | null>(null);
+  // Global filters (date range / LLMs / prompt groups). The filter UI
+  // lives in the shared DashboardFilterBar; this page reads + applies.
+  const {
+    filters: globalFilters,
+    registerProjectMeta,
+    setLastAuditDate: setLastAuditDateInCtx,
+  } = useDashboardFilters();
 
-  // Union of LLMs across both tabs' data — drives the filter dropdown options.
+  // Union of LLMs across both tabs' data — drives the meta registration.
   const availableLlms = Array.from(new Set([...llmList, ...allAuditsLlmList])).sort();
 
-  const toggleLlm = (llm: string) => {
-    setSelectedLlms(prev => {
-      // Starting from "all visible" → first click creates set of all except
-      // the clicked one (feels natural: "hide this LLM")
-      const base = prev ?? new Set(availableLlms);
-      const next = new Set(base);
-      if (next.has(llm)) next.delete(llm);
-      else next.add(llm);
-      // If user toggled back to full set, drop back to null ("all")
-      if (availableLlms.every(l => next.has(l))) return null;
-      return next;
-    });
-  };
+  // Column-visibility helper driven by the global multi-select LLM
+  // filter. Empty selection = all LLMs visible.
+  const isLlmVisible = (llm: string): boolean =>
+    globalFilters.llms.length === 0 || globalFilters.llms.includes(llm);
 
-  const isLlmVisible = (llm: string): boolean => {
-    if (selectedLlms === null) return true;
-    return selectedLlms.has(llm);
-  };
+  // Row-visibility helper for the global prompt-group filter. Empty
+  // selection = all groups. Applied to every tab's data below.
+  const matchesPromptGroup = (group: string): boolean =>
+    globalFilters.promptGroups.length === 0 ||
+    globalFilters.promptGroups.includes(group);
 
-  const clearLlmFilter = () => {
-    setSelectedLlms(null);
-    setShowLlmDropdown(false);
-  };
+  // Filtered views of each tab's data — the global prompt-group filter
+  // applies here so the rendered rows (and exports) honor it. The LLM
+  // filter is applied per-column in render via isLlmVisible().
+  const filteredVisibilityData = useMemo(
+    () => visibilityData.filter(r => matchesPromptGroup(r.prompt_group)),
+    [visibilityData, globalFilters.promptGroups],
+  );
+  const filteredGoogleAIData = useMemo(
+    () => googleAIData.filter(r => matchesPromptGroup(r.prompt_group)),
+    [googleAIData, globalFilters.promptGroups],
+  );
+  const filteredAllAuditsData = useMemo(
+    () => allAuditsData.filter(r => matchesPromptGroup(r.prompt_group)),
+    [allAuditsData, globalFilters.promptGroups],
+  );
+
+  // Map the global date-range preset to a server-side start date for
+  // the All-audits query. 'lastAudit' has no clean server expression on
+  // a multi-audit table, so it falls through to "all" (the table is
+  // explicitly about showing every audit over time).
+  const globalStartDate = useMemo((): string | null => {
+    const f = globalFilters;
+    if (f.dateRange === 'all' || f.dateRange === 'lastAudit') return null;
+    if (f.dateRange === 'custom') {
+      return f.customDateRange.startDate
+        ? new Date(f.customDateRange.startDate).toISOString()
+        : null;
+    }
+    const days =
+      f.dateRange === 'last7days' ? 7 :
+      f.dateRange === 'last14days' ? 14 :
+      f.dateRange === 'last30days' ? 30 : 90;
+    return new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+  }, [globalFilters]);
 
   useEffect(() => {
     if (id && activeTab === 'visibility') {
@@ -119,7 +138,8 @@ export const ProjectPromptsPage: React.FC = () => {
     } else if (id && activeTab === 'all-audits') {
       loadAllAuditsData();
     }
-  }, [id, activeTab, dateRange]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id, activeTab, globalStartDate]);
 
   const loadVisibilityData = async () => {
     try {
@@ -468,14 +488,6 @@ export const ProjectPromptsPage: React.FC = () => {
     }
   };
 
-  const getStartDateForRange = (range: DateRange): string | null => {
-    if (range === 'all') return null;
-    const now = new Date();
-    const days = range === '7d' ? 7 : range === '30d' ? 30 : 90;
-    const start = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
-    return start.toISOString();
-  };
-
   const loadAllAuditsData = async () => {
     try {
       setLoading(true);
@@ -500,7 +512,7 @@ export const ProjectPromptsPage: React.FC = () => {
 
       // Fetch all completed audits within the selected timeframe (oldest first
       // → icons render chronologically left-to-right in each cell).
-      const startDate = getStartDateForRange(dateRange);
+      const startDate = globalStartDate;
       let auditsQuery = supabase
         .from('audits')
         .select('id, created_at')
@@ -711,107 +723,46 @@ export const ProjectPromptsPage: React.FC = () => {
     return nameMap[llm] || llm;
   };
 
-  // Multi-select LLM filter dropdown — same visual style as the Overview
-  // page (Brain + ChevronDown + LLM icons), but with checkboxes to support
-  // multi-select. Rendered inside toolbars on both tabs.
-  const renderLlmFilter = () => {
-    const selectedCount = selectedLlms === null ? availableLlms.length : selectedLlms.size;
-    const totalCount = availableLlms.length;
-    const label =
-      selectedLlms === null || selectedCount === totalCount
-        ? 'All LLMs'
-        : selectedCount === 0
-          ? 'No LLM selected'
-          : selectedCount === 1
-            ? getLlmDisplayName(Array.from(selectedLlms!)[0])
-            : `${selectedCount} LLMs`;
+  // The inline multi-select LLM dropdown that used to live here was
+  // replaced by the global DashboardFilterBar (AppLayout). Column
+  // visibility now derives from `globalFilters.llms` via isLlmVisible().
 
-    return (
-      <div className="relative flex items-center space-x-2">
-        <Brain className="w-4 h-4 text-gray-500" />
-        <div className="relative">
-          <button
-            ref={llmButtonRef}
-            type="button"
-            onClick={() => {
-              if (!showLlmDropdown) {
-                const rect = llmButtonRef.current?.getBoundingClientRect();
-                if (rect) {
-                  setLlmDropdownPos({
-                    top: rect.bottom + 4,
-                    left: rect.left,
-                    minWidth: Math.max(rect.width, 220),
-                  });
-                }
-              }
-              setShowLlmDropdown(!showLlmDropdown);
-            }}
-            className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-xl bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 text-sm flex items-center space-x-2"
-          >
-            <span>{label}</span>
-            <ChevronDown className="w-4 h-4" />
-          </button>
-          {showLlmDropdown && createPortal(
-            <>
-              <div
-                className="fixed inset-0 z-[9998]"
-                onClick={() => setShowLlmDropdown(false)}
-              />
-              <div
-                className="fixed bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded-xl shadow-lg z-[9999] max-h-[400px] overflow-y-auto py-1"
-                style={llmDropdownPos || {}}
-              >
-                {/* Select all / clear */}
-                <button
-                  onClick={clearLlmFilter}
-                  className="w-full flex items-center justify-between px-3 py-2 text-sm hover:bg-gray-100 dark:hover:bg-gray-600 text-gray-700 dark:text-gray-200"
-                >
-                  <span className="font-medium">All LLMs</span>
-                  {selectedLlms === null && <Check className="w-4 h-4 text-[rgb(126,34,206)] dark:text-purple-400" />}
-                </button>
-                <div className="border-t border-gray-200 dark:border-gray-600 my-1" />
-                {availableLlms.length === 0 ? (
-                  <div className="px-3 py-2 text-xs text-gray-500 dark:text-gray-400">
-                    No LLMs in the current data.
-                  </div>
-                ) : (
-                  availableLlms.map((llm) => {
-                    const checked = isLlmVisible(llm);
-                    return (
-                      <button
-                        key={llm}
-                        onClick={() => toggleLlm(llm)}
-                        className="w-full flex items-center justify-between px-3 py-2 text-sm hover:bg-gray-100 dark:hover:bg-gray-600 text-gray-700 dark:text-gray-200"
-                      >
-                        <span className="flex items-center space-x-2">
-                          {LLM_ICONS[llm as keyof typeof LLM_ICONS] && (
-                            <img
-                              src={LLM_ICONS[llm as keyof typeof LLM_ICONS]}
-                              alt=""
-                              className="w-4 h-4 rounded"
-                            />
-                          )}
-                          <span>{getLlmDisplayName(llm)}</span>
-                        </span>
-                        {checked && <Check className="w-4 h-4 text-[rgb(126,34,206)] dark:text-purple-400" />}
-                      </button>
-                    );
-                  })
-                )}
-              </div>
-            </>,
-            document.body
-          )}
-        </div>
-      </div>
-    );
-  };
+  // Register meta with the global filter bar: LLMs (union across tabs),
+  // prompt groups (union across whichever tab data is loaded so the
+  // dropdown is populated on every tab), and audit dates. Mirror the
+  // most recent audit date for the "Last audit" preset.
+  useEffect(() => {
+    const availablePromptGroups = Array.from(
+      new Set(
+        [
+          ...visibilityData.map(v => v.prompt_group),
+          ...googleAIData.map(g => g.prompt_group),
+          ...allAuditsData.map(a => a.prompt_group),
+        ].filter(Boolean),
+      ),
+    ).sort();
+    const availableDates = Array.from(
+      new Set(allAudits.map(a => a.created_at.split('T')[0])),
+    ).sort();
+    const lastDate =
+      availableDates.length > 0 ? availableDates[availableDates.length - 1] : null;
+    registerProjectMeta({
+      availableLlms,
+      availablePromptGroups,
+      availableDates,
+      hasAudits:
+        allAudits.length > 0 ||
+        visibilityData.length > 0 ||
+        googleAIData.length > 0,
+    });
+    setLastAuditDateInCtx(lastDate);
+  }, [availableLlms, visibilityData, googleAIData, allAuditsData, allAudits, registerProjectMeta, setLastAuditDateInCtx]);
 
   const exportAllAuditsToExcel = () => {
     // Long format — one row per (prompt × LLM × audit). Much easier to
     // pivot in Excel than a wide 200-column table.
     const rows: any[] = [];
-    for (const prompt of allAuditsData) {
+    for (const prompt of filteredAllAuditsData) {
       for (const llm of allAuditsLlmList) {
         if (!isLlmVisible(llm)) continue;
         const cells = prompt.cells[llm] || [];
@@ -833,15 +784,14 @@ export const ProjectPromptsPage: React.FC = () => {
     const worksheet = XLSX.utils.json_to_sheet(rows);
     const workbook = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(workbook, worksheet, 'All Audits');
-    const rangeLabel =
-      dateRange === 'all' ? 'all_time' : dateRange === '7d' ? 'last_7d' : dateRange === '30d' ? 'last_30d' : 'last_90d';
+    const rangeLabel = globalFilters.dateRange === 'all' ? 'all_time' : globalFilters.dateRange;
     XLSX.writeFile(workbook, `${project?.name || 'project'}_all_audits_${rangeLabel}.xlsx`);
   };
 
   const exportToExcel = () => {
     // Honour the LLM filter on export — skip hidden columns.
     const llmsToExport = llmList.filter(isLlmVisible);
-    const excelData = visibilityData.map((row) => {
+    const excelData = filteredVisibilityData.map((row) => {
       const rowData: any = {
         'Prompt': row.prompt_text,
         'Group': row.prompt_group
@@ -1021,7 +971,7 @@ export const ProjectPromptsPage: React.FC = () => {
                       </tr>
                     </thead>
                     <tbody>
-                      {googleAIData.length === 0 ? (
+                      {filteredGoogleAIData.length === 0 ? (
                         <tr>
                           <td
                             colSpan={7}
@@ -1031,7 +981,7 @@ export const ProjectPromptsPage: React.FC = () => {
                           </td>
                         </tr>
                       ) : (
-                        googleAIData.map((row) => (
+                        filteredGoogleAIData.map((row) => (
                           <tr
                             key={row.prompt_id}
                             className="border-b border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-750"
@@ -1218,23 +1168,11 @@ export const ProjectPromptsPage: React.FC = () => {
         {/* All Audits Tab Content */}
         {activeTab === 'all-audits' && (
           <>
-            {/* Toolbar: timeframe, LLM filter, export */}
+            {/* Toolbar: date range + LLM filter live in the global
+                DashboardFilterBar now; this row keeps the audit-count
+                summary + export. */}
             <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
               <div className="flex flex-wrap items-center gap-3">
-                <div className="flex items-center gap-2">
-                  <label className="text-sm text-gray-600 dark:text-gray-400">Timeframe:</label>
-                  <select
-                    value={dateRange}
-                    onChange={(e) => setDateRange(e.target.value as DateRange)}
-                    className="text-sm bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-1.5 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-purple-500"
-                  >
-                    <option value="7d">Last 7 days</option>
-                    <option value="30d">Last 30 days</option>
-                    <option value="90d">Last 90 days</option>
-                    <option value="all">All time</option>
-                  </select>
-                </div>
-                {renderLlmFilter()}
                 {!loading && allAudits.length > 0 && (
                   <span className="text-xs text-gray-500 dark:text-gray-400">
                     {allAudits.length} audit{allAudits.length === 1 ? '' : 's'} · {new Date(allAudits[0].created_at).toLocaleDateString()} → {new Date(allAudits[allAudits.length - 1].created_at).toLocaleDateString()}
@@ -1243,7 +1181,7 @@ export const ProjectPromptsPage: React.FC = () => {
               </div>
               <Button
                 onClick={exportAllAuditsToExcel}
-                variant="outline"
+                variant="secondary"
                 disabled={loading || allAudits.length === 0}
               >
                 <Download className="w-4 h-4 mr-2" />
@@ -1303,7 +1241,7 @@ export const ProjectPromptsPage: React.FC = () => {
                         </tr>
                       </thead>
                       <tbody>
-                        {allAuditsData.length === 0 ? (
+                        {filteredAllAuditsData.length === 0 ? (
                           <tr>
                             <td
                               colSpan={allAuditsLlmList.filter(isLlmVisible).length * 2 + 2}
@@ -1313,7 +1251,7 @@ export const ProjectPromptsPage: React.FC = () => {
                             </td>
                           </tr>
                         ) : (
-                          allAuditsData.map((row) => (
+                          filteredAllAuditsData.map((row) => (
                             <tr
                               key={row.prompt_id}
                               className="border-b border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-750"
@@ -1441,10 +1379,10 @@ export const ProjectPromptsPage: React.FC = () => {
               </div>
             ) : (
               <>
-                {/* Toolbar: LLM filter + export */}
-                <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
-                  {renderLlmFilter()}
-                  <Button onClick={exportToExcel} variant="outline">
+                {/* Toolbar: LLM filter lives in the global bar now;
+                    keep export only. */}
+                <div className="flex flex-wrap items-center justify-end gap-3 mb-4">
+                  <Button onClick={exportToExcel} variant="secondary">
                     <Download className="w-4 h-4 mr-2" />
                     Export to Excel
                   </Button>
@@ -1493,7 +1431,7 @@ export const ProjectPromptsPage: React.FC = () => {
                     </tr>
                   </thead>
                   <tbody>
-                    {visibilityData.length === 0 ? (
+                    {filteredVisibilityData.length === 0 ? (
                       <tr>
                         <td
                           colSpan={llmList.filter(isLlmVisible).length * 2 + 2}
@@ -1503,7 +1441,7 @@ export const ProjectPromptsPage: React.FC = () => {
                         </td>
                       </tr>
                     ) : (
-                      visibilityData.map((row) => (
+                      filteredVisibilityData.map((row) => (
                         <tr
                           key={row.prompt_id}
                           className="border-b border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-750"

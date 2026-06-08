@@ -12,7 +12,14 @@ if _env_file.exists():
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
                 key, _, value = line.partition("=")
-                os.environ[key.strip()] = value.strip()
+                value = value.strip()
+                # Strip matching surrounding quotes so VALUE="x" and
+                # VALUE='x' yield x (not the literal quoted string). Without
+                # this, a quoted secret like DATAFORSEO_PASSWORD="abc" would
+                # carry the quotes into Basic-auth and 401.
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+                    value = value[1:-1]
+                os.environ[key.strip()] = value
 
 
 class Settings(BaseSettings):
@@ -54,6 +61,14 @@ class Settings(BaseSettings):
     # OneSearch API (self or remote backend)
     onesearch_api_url: str = "http://localhost:8000"
     onesearch_api_key: str = ""
+
+    # DataForSEO (Google AI Overview + organic via SERP live/advanced).
+    # Basic auth: base64(login:password) is computed at request time.
+    dataforseo_login: str = ""
+    dataforseo_password: str = ""
+    dataforseo_base_url: str = "https://api.dataforseo.com"
+    # Max keywords per live/advanced request (DataForSEO allows up to 100).
+    dataforseo_batch_size: int = 100
 
     # Security
     api_key: Optional[str] = None

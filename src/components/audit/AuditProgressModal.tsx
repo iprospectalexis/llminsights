@@ -45,6 +45,17 @@ interface AuditProgressModalProps {
   isOpen: boolean;
   onClose: () => void;
   auditId: string;
+  /**
+   * Optional pre-fetched audit + steps. When provided, the modal skips
+   * its own DB fetch / realtime subscription / 15s polling and just
+   * renders the parent's state. Cuts the per-running-audit load on
+   * Supabase by 50% (Toast already subscribes; Modal piggybacks).
+   *
+   * If omitted (modal opened without a parent providing data), the
+   * modal falls back to fetching on its own.
+   */
+  externalAudit?: any;
+  externalSteps?: AuditStep[];
 }
 
 interface AuditStep {
@@ -59,15 +70,27 @@ export const AuditProgressModal: React.FC<AuditProgressModalProps> = ({
   isOpen,
   onClose,
   auditId,
+  externalAudit,
+  externalSteps,
 }) => {
-  const [audit, setAudit] = useState<any>(null);
-  const [steps, setSteps] = useState<AuditStep[]>([]);
-  const [loading, setLoading] = useState(true);
+  const usingExternalState = externalAudit !== undefined;
+
+  // Internal state is only used when the parent didn't supply pre-fetched
+  // data. With externalAudit provided we never write to these.
+  const [internalAudit, setInternalAudit] = useState<any>(null);
+  const [internalSteps, setInternalSteps] = useState<AuditStep[]>([]);
+  const [loading, setLoading] = useState(!usingExternalState);
+
+  const audit = usingExternalState ? externalAudit : internalAudit;
+  const steps = (usingExternalState ? externalSteps : internalSteps) || [];
 
   const isCompleted = audit?.status === 'completed' || audit?.status === 'failed';
 
   useEffect(() => {
     if (!isOpen || !auditId) return;
+    // When the parent already feeds us data, don't open another
+    // subscription / poll loop — that's the whole point of the prop.
+    if (usingExternalState) return;
 
     setLoading(true);
     fetchAll().then(() => setLoading(false));
@@ -79,7 +102,7 @@ export const AuditProgressModal: React.FC<AuditProgressModalProps> = ({
         event: 'UPDATE', schema: 'public', table: 'audits',
         filter: `id=eq.${auditId}`,
       }, (payload) => {
-        setAudit(payload.new);
+        setInternalAudit(payload.new);
         if (payload.new.status === 'completed' || payload.new.status === 'failed') {
           fetchSteps();
         }
@@ -95,7 +118,7 @@ export const AuditProgressModal: React.FC<AuditProgressModalProps> = ({
       supabase.removeChannel(channel);
       clearInterval(interval);
     };
-  }, [isOpen, auditId]);
+  }, [isOpen, auditId, usingExternalState]);
 
   const fetchAll = async () => {
     await Promise.all([fetchAudit(), fetchSteps()]);
@@ -107,7 +130,7 @@ export const AuditProgressModal: React.FC<AuditProgressModalProps> = ({
       .select('id, status, progress, llms, sentiment, pipeline_state, responses_expected, responses_received, competitors_processed, competitors_total, sentiment_processed, sentiment_total')
       .eq('id', auditId)
       .single();
-    if (data) setAudit(data);
+    if (data) setInternalAudit(data);
   };
 
   const fetchSteps = async () => {
@@ -116,7 +139,7 @@ export const AuditProgressModal: React.FC<AuditProgressModalProps> = ({
       .select('step, status, message, processed_count, total_count')
       .eq('audit_id', auditId)
       .order('created_at');
-    if (data) setSteps(data);
+    if (data) setInternalSteps(data);
   };
 
   const getProgressLabel = () => {

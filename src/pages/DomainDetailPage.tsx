@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { Card, CardContent, CardHeader } from '../components/ui/Card';
@@ -10,6 +10,8 @@ import {
 } from 'lucide-react';
 import { format } from 'date-fns';
 import * as XLSX from 'xlsx';
+import { useDashboardFilters } from '../contexts/DashboardFiltersContext';
+import { resolveDateWindow } from '../lib/dashboard-filter-utils';
 
 const LLM_ICONS = {
   searchgpt: 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/SearchGPT.PNG',
@@ -59,17 +61,31 @@ export const DomainDetailPage: React.FC = () => {
   const [filteredUrlData, setFilteredUrlData] = useState<URLData[]>([]);
   const [loading, setLoading] = useState(true);
   const [expandedUrls, setExpandedUrls] = useState<Set<string>>(new Set());
-  const [filters, setFilters] = useState({
-    sortBy: 'citations',
-    llm: 'all',
-    dateRange: 'all'
-  });
+  // Page-local sort control (not a data filter — stays here).
+  const [sortBy, setSortBy] = useState<'citations' | 'prompts' | 'recent' | 'oldest'>('citations');
+  // Global filters (LLM + date range). Sentiment / prompt-group filters
+  // from the global bar are intentionally not applied on this page —
+  // domain URL rows aggregate across prompts/sentiments, so narrowing
+  // them would misreport the per-URL counts.
+  const {
+    filters: globalFilters,
+    registerProjectMeta,
+    setLastAuditDate: setLastAuditDateInCtx,
+  } = useDashboardFilters();
   const [domainStats, setDomainStats] = useState({
     totalCitations: 0,
     totalUrls: 0,
     totalPrompts: 0,
     dateRange: { from: '', to: '' }
   });
+
+  // Most recent citation date across all URLs — feeds the "Last audit"
+  // preset of the global date filter.
+  const lastAuditDate = useMemo(() => {
+    if (urlData.length === 0) return null;
+    const dates = urlData.map(u => u.lastSeen.split('T')[0]).sort();
+    return dates[dates.length - 1];
+  }, [urlData]);
 
   useEffect(() => {
     if (projectId && domain) {
@@ -79,7 +95,29 @@ export const DomainDetailPage: React.FC = () => {
 
   useEffect(() => {
     applyFilters();
-  }, [urlData, filters]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [urlData, sortBy, globalFilters, lastAuditDate]);
+
+  // Register meta for the global filter bar (LLMs + prompt groups +
+  // dates derived from the loaded URL data).
+  useEffect(() => {
+    const availableLlms = Array.from(
+      new Set(urlData.flatMap(u => u.llms).filter(Boolean)),
+    ).sort();
+    const availablePromptGroups = Array.from(
+      new Set(urlData.flatMap(u => u.prompts.map(p => p.promptGroup)).filter(Boolean)),
+    ).sort();
+    const availableDates = Array.from(
+      new Set(urlData.flatMap(u => [u.firstSeen.split('T')[0], u.lastSeen.split('T')[0]])),
+    ).sort();
+    registerProjectMeta({
+      availableLlms,
+      availablePromptGroups,
+      availableDates,
+      hasAudits: urlData.length > 0,
+    });
+    setLastAuditDateInCtx(lastAuditDate);
+  }, [urlData, lastAuditDate, registerProjectMeta, setLastAuditDateInCtx]);
 
   const fetchData = async () => {
     setLoading(true);
@@ -98,11 +136,20 @@ export const DomainDetailPage: React.FC = () => {
         setProject(projectData);
       }
 
-      // Fetch citations for this domain within the current project only
+      // Fetch citations for this domain within the current project only.
+      // Cost reduction: explicit column list instead of `*` — drops
+      // unused columns (sentiment_score, position, cited, citation_url,
+      // etc.) from egress. Keeps only what processUrlData() consumes.
       const { data: citations } = await supabase
         .from('citations')
         .select(`
-          *,
+          id,
+          prompt_id,
+          llm,
+          page_url,
+          citation_text,
+          sentiment_label,
+          checked_at,
           prompts (
             id,
             prompt_text,
@@ -231,13 +278,27 @@ export const DomainDetailPage: React.FC = () => {
   const applyFilters = () => {
     let filtered = [...urlData];
 
-    // Filter by LLM
-    if (filters.llm !== 'all') {
-      filtered = filtered.filter(url => url.llms.includes(filters.llm));
+    // Filter by LLM (global multi-select). Empty = all. A URL row is
+    // kept when it was cited by at least one of the selected LLMs.
+    if (globalFilters.llms.length > 0) {
+      const llmSet = new Set(globalFilters.llms);
+      filtered = filtered.filter(url => url.llms.some(l => llmSet.has(l)));
     }
 
-    // Sort
-    switch (filters.sortBy) {
+    // Filter by date window (global). Previously this control existed
+    // but was never applied — that was the dead `dateRange` bug. A URL
+    // is kept when its [firstSeen, lastSeen] span overlaps the window.
+    const window = resolveDateWindow(globalFilters, lastAuditDate);
+    if (window) {
+      filtered = filtered.filter(url => {
+        const last = new Date(url.lastSeen);
+        const first = new Date(url.firstSeen);
+        return last >= window.start && first <= window.end;
+      });
+    }
+
+    // Sort (page-local control)
+    switch (sortBy) {
       case 'citations':
         filtered.sort((a, b) => b.totalCitations - a.totalCitations);
         break;
@@ -414,8 +475,8 @@ export const DomainDetailPage: React.FC = () => {
             </div>
 
             <select
-              value={filters.sortBy}
-              onChange={(e) => setFilters({ ...filters, sortBy: e.target.value })}
+              value={sortBy}
+              onChange={(e) => setSortBy(e.target.value as typeof sortBy)}
               className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
             >
               <option value="citations">Most Citations</option>
@@ -424,16 +485,7 @@ export const DomainDetailPage: React.FC = () => {
               <option value="oldest">Oldest First</option>
             </select>
 
-            <select
-              value={filters.llm}
-              onChange={(e) => setFilters({ ...filters, llm: e.target.value })}
-              className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
-            >
-              <option value="all">All LLMs</option>
-              <option value="searchgpt">SearchGPT</option>
-              <option value="perplexity">Perplexity</option>
-              <option value="gemini">Gemini</option>
-            </select>
+            {/* LLM + date filters are in the global DashboardFilterBar. */}
 
             <div className="ml-auto text-sm text-gray-600 dark:text-gray-400">
               Showing {filteredUrlData.length} of {urlData.length} URLs

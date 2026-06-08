@@ -33,6 +33,12 @@ class BrightDataClient:
     - Aggregates all results at the end
     """
 
+    # Fallback dataset IDs. These are the DEFAULTS; the per-source values
+    # are overridable via settings/env (see __init__ → self.dataset_ids)
+    # so a wrong/changed dataset ID can be corrected without a code edit.
+    # NOTE: a dataset ID here must be a *collectible* BrightData dataset
+    # (supports the /trigger "collect by input" API). A non-collectible
+    # dataset returns HTTP 400 "This dataset does not support collection".
     DATASET_IDS = {
         "chatgpt": "gd_m7aof0k82r803d5bjm",
         "perplexity": "gd_m7dhdot1vw9a7gc1n",
@@ -118,9 +124,26 @@ class BrightDataClient:
             "Authorization": f"Bearer {self.api_key}",
         }
 
+        # Resolve dataset IDs from settings (env-overridable), falling back
+        # to the hardcoded DATASET_IDS defaults. This lets an operator fix a
+        # wrong/changed dataset ID (e.g. google_ai_overview) via env without
+        # touching code — see config.Settings.brightdata_dataset_*.
+        self.dataset_ids = dict(self.DATASET_IDS)
+        for source, attr in (
+            ("chatgpt", "brightdata_dataset_chatgpt"),
+            ("perplexity", "brightdata_dataset_perplexity"),
+            ("gemini", "brightdata_dataset_gemini"),
+            ("grok", "brightdata_dataset_grok"),
+            ("google_ai_mode", "brightdata_dataset_google_ai_mode"),
+            ("google_ai_overview", "brightdata_dataset_google_ai_overview"),
+        ):
+            override = getattr(settings, attr, None)
+            if override:
+                self.dataset_ids[source] = override
+
     def get_dataset_id(self, source: str) -> str:
         """Get the dataset ID for the specified AI source."""
-        return self.DATASET_IDS.get(source.lower(), self.DATASET_IDS["chatgpt"])
+        return self.dataset_ids.get(source.lower(), self.dataset_ids["chatgpt"])
 
     # Country-specific Google TLDs
     GOOGLE_COUNTRY_TLDS = {

@@ -6,7 +6,7 @@ import { Input } from '../components/ui/Input';
 
 type LLMName = 'SearchGPT' | 'Perplexity' | 'Gemini' | 'Google AI Overview' | 'Google AI Mode' | 'Bing Copilot' | 'Grok';
 type DataProvider = 'BrightData' | 'OneSearch SERP API';
-type OneSearchProvider = 'brightdata' | 'serp';
+type OneSearchProvider = 'brightdata' | 'serp' | 'dataforseo';
 
 interface LLMSetting {
   id: string;
@@ -261,13 +261,14 @@ export const SettingsPage: React.FC = () => {
                           >
                             <option value="brightdata">BrightData</option>
                             <option value="serp">SERP</option>
+                            <option value="dataforseo">DataForSEO</option>
                           </select>
                         </div>
                       );
                     })}
                 </div>
                 <p className="mt-3 text-xs text-gray-600 dark:text-gray-400">
-                  Select the provider to use for OneSearch SERP API requests. BrightData and SERP are different data sources.
+                  Select the provider to use for OneSearch SERP API requests. BrightData, SERP and DataForSEO are different data sources. DataForSEO is recommended for Google AI Overview (returns the AI Overview answer plus organic results).
                 </p>
               </div>
             )}

@@ -24,6 +24,7 @@ class Provider(str, enum.Enum):
     """API provider enumeration."""
     SERP = "serp"
     BRIGHTDATA = "brightdata"
+    DATAFORSEO = "dataforseo"
 
 
 class Job(Base):

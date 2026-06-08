@@ -568,6 +568,9 @@ async def handle_polling(audit_id: str, worker_id: str) -> None:
                                 "response_timestamp": result.get("timestamp"),
                                 "raw_response_data": cleaned,
                                 "web_search_query": result.get("web_search_query"),
+                                # Google AI Overview returns organic results too →
+                                # store separately from raw_response_data.
+                                "organic_results": json.dumps(result["organic"], ensure_ascii=False) if result.get("organic") else None,
                             },
                         })
                     else:
@@ -641,6 +644,9 @@ async def handle_polling(audit_id: str, worker_id: str) -> None:
                                         "citations": json.dumps(matched["citations"]) if matched.get("citations") else None,
                                         "all_sources": json.dumps(matched["all_sources"]) if matched.get("all_sources") else None,
                                         "links_attached": json.dumps(matched["links_attached"]) if matched.get("links_attached") else None,
+                                        # Google AI Overview (DataForSEO/BrightData) also returns
+                                        # the page's organic results — stored in its own column.
+                                        "organic_results": json.dumps(matched["organic"], ensure_ascii=False) if matched.get("organic") else None,
                                     },
                                 })
                             else:

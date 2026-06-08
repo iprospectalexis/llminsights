@@ -1,16 +1,17 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Card, CardContent, CardHeader } from '../components/ui/Card';
 import { Button } from '../components/ui/Button';
-import { Modal } from '../components/ui/Modal';
 import { supabase } from '../lib/supabase';
+import { useDashboardFilters } from '../contexts/DashboardFiltersContext';
+import { applyFilters as applyDashboardFilters } from '../lib/dashboard-filter-utils';
 import {
-  Calendar, FileText, BarChart3, Globe, ArrowLeft, Brain,
-  Filter, Download, ExternalLink, MessageSquare, Clock, Eye, X,
-  Award, TrendingUp, ThumbsUp, ThumbsDown, Minus, Users, Search
+  FileText, Globe, ArrowLeft, Brain,
+  Download, ExternalLink, MessageSquare, Clock, Eye, X,
+  Award, ThumbsUp, ThumbsDown, Minus, Users, Search
 } from 'lucide-react';
 import { format } from 'date-fns';
 
@@ -24,11 +25,6 @@ const LLM_ICONS = {
   'grok': 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/Grok-icon.png',
 };
 
-const SENTIMENT_COLORS = {
-  positive: '#10B981',
-  neutral: '#6B7280',
-  negative: '#EF4444',
-};
 
 interface LLMResponse {
   id: string;
@@ -78,25 +74,56 @@ export const PromptDetailPage: React.FC = () => {
   const [prompt, setPrompt] = useState<any>(null);
   const [project, setProject] = useState<any>(null);
   const [llmResponses, setLlmResponses] = useState<LLMResponse[]>([]);
-  const [filteredResponses, setFilteredResponses] = useState<LLMResponse[]>([]);
-  const [processedCitations, setProcessedCitations] = useState<ProcessedCitation[]>([]);
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState('responses');
-  const [filters, setFilters] = useState({
-    dateRange: 'lastAudit',
-    llms: 'all',
-    sentiment: 'all',
-  });
-  const [showCustomDatePicker, setShowCustomDatePicker] = useState(false);
-  const [customDateRange, setCustomDateRange] = useState({
-    startDate: '',
-    endDate: '',
-  });
-  const [availableDates, setAvailableDates] = useState<string[]>([]);
+  // Global filter state (date range / LLM / sentiment). This page has
+  // no prompt-group filter — it's already scoped to one prompt — so it
+  // ignores globalFilters.promptGroups. The filter UI lives in the
+  // global DashboardFilterBar (AppLayout); this page only reads.
+  const {
+    filters: globalFilters,
+    registerProjectMeta,
+    setLastAuditDate: setLastAuditDateInCtx,
+  } = useDashboardFilters();
   const [selectedResponse, setSelectedResponse] = useState<LLMResponse | null>(null);
   const [showResponseModal, setShowResponseModal] = useState(false);
   const [lastAuditDate, setLastAuditDate] = useState<string>('');
   const [loadingFullResponse, setLoadingFullResponse] = useState(false);
+
+  // Single-string view of the multi-select LLM filter for the few
+  // citation/date helpers below that branch on a single LLM value.
+  const filters = useMemo(() => ({
+    dateRange: globalFilters.dateRange,
+    llms: globalFilters.llms.length === 1 ? globalFilters.llms[0] : 'all',
+    sentiment: globalFilters.sentiment,
+  }), [globalFilters]);
+  const customDateRange = globalFilters.customDateRange;
+
+  // Filtered responses — derived, never stale. Uses the shared filter
+  // helper so the date window honors `audits.created_at` (with
+  // `created_at` fallback), fixing the old bug where this page filtered
+  // on response.created_at and dropped rows whose insert date drifted
+  // off the audit date.
+  //
+  // We strip `promptGroups` from the filter set: the page is already
+  // scoped to a single prompt, so a global prompt-group filter (set on
+  // another dashboard) must not zero out this view.
+  const filteredResponses = useMemo<LLMResponse[]>(
+    () =>
+      applyDashboardFilters(
+        llmResponses,
+        { ...globalFilters, promptGroups: [] },
+        lastAuditDate || null,
+        {
+          getAuditDate: (r: any) => r.audits?.created_at ?? null,
+          getFallbackDate: (r: any) => r.created_at ?? null,
+          getLlm: (r: any) => r.llm,
+          getPromptGroup: () => null,
+          getSentiment: (r: any) => r.sentiment_label,
+        },
+      ),
+    [llmResponses, globalFilters, lastAuditDate],
+  );
 
   useEffect(() => {
     if (projectId && promptId) {
@@ -104,28 +131,39 @@ export const PromptDetailPage: React.FC = () => {
     }
   }, [projectId, promptId]);
 
-  useEffect(() => {
-    applyFilters();
-  }, [llmResponses, filters]);
+  // filteredResponses is derived via useMemo above — no applyFilters
+  // effect needed (that was the source of the stale-deps bug).
 
   useEffect(() => {
     if (llmResponses.length > 0) {
-      // Extract available dates from responses
-      const dates = llmResponses.map(r => r.created_at.split('T')[0]);
+      // Prefer the audit date for grouping (matches the rest of the
+      // app); fall back to the row's created_at when audit info is
+      // missing.
+      const dates = llmResponses.map(
+        r => (r.audits?.created_at ?? r.created_at).split('T')[0],
+      );
       const uniqueDates = [...new Set(dates)].sort();
-      setAvailableDates(uniqueDates);
-      
-      // Set last audit date (most recent date)
-      if (uniqueDates.length > 0) {
-        const mostRecentDate = uniqueDates[uniqueDates.length - 1];
-        setLastAuditDate(mostRecentDate);
-      }
-      
-      // Process citations from raw response data
-      const citations = processLlmResponsesIntoCitations(llmResponses);
-      setProcessedCitations(citations);
+
+      // Set last audit date (most recent date) — locally and in the
+      // global filter context so the bar's "Last audit" preset resolves.
+      const mostRecentDate =
+        uniqueDates.length > 0 ? uniqueDates[uniqueDates.length - 1] : null;
+      if (mostRecentDate) setLastAuditDate(mostRecentDate);
+      setLastAuditDateInCtx(mostRecentDate);
+
+      // Register meta so the global bar's LLM dropdown + custom-date
+      // picker are populated for this prompt's project.
+      const availableLlms = Array.from(
+        new Set(llmResponses.map(r => r.llm).filter(Boolean)),
+      ).sort();
+      registerProjectMeta({
+        availableLlms,
+        availablePromptGroups: [],
+        availableDates: uniqueDates,
+        hasAudits: uniqueDates.length > 0,
+      });
     }
-  }, [llmResponses]);
+  }, [llmResponses, registerProjectMeta, setLastAuditDateInCtx]);
 
   const extractDomainFromUrl = (url: string): string => {
     try {
@@ -136,180 +174,11 @@ export const PromptDetailPage: React.FC = () => {
     }
   };
 
-  const processLlmResponsesIntoCitations = (responses: LLMResponse[]): ProcessedCitation[] => {
-    const citations: ProcessedCitation[] = [];
 
-    responses.forEach(response => {
-      if (!response.raw_response_data) return;
-
-      const auditDate = response.audits?.created_at ? 
-        response.audits.created_at.split('T')[0] : 
-        response.created_at.split('T')[0];
-
-      if (response.llm === 'perplexity' && response.raw_response_data.sources) {
-        response.raw_response_data.sources.forEach((source: any, index: number) => {
-          if (source.url) {
-            citations.push({
-              url: source.url,
-              domain: extractDomainFromUrl(source.url),
-              title: source.title,
-              description: source.description,
-              position: index + 1,
-              llm: response.llm,
-              auditDate,
-            });
-          }
-        });
-      }
-
-      if (response.llm === 'searchgpt') {
-        // Try multiple possible fields for SearchGPT citations
-        let searchGptCitations = [];
-        
-        if (response.raw_response_data.citations) {
-          searchGptCitations = response.raw_response_data.citations;
-        } else if (response.raw_response_data.links_attached) {
-          searchGptCitations = response.raw_response_data.links_attached;
-        } else if (response.raw_response_data.sources) {
-          searchGptCitations = response.raw_response_data.sources;
-        }
-        
-        searchGptCitations.forEach((link: any, index: number) => {
-          if (link.url) {
-            citations.push({
-              url: link.url,
-              domain: extractDomainFromUrl(link.url),
-              title: link.text || link.title || link.description,
-              position: link.position || index + 1,
-              llm: response.llm,
-              auditDate,
-            });
-          }
-        });
-      }
-
-      if (response.llm === 'gemini') {
-        // Handle Gemini citations
-        let geminiCitations = [];
-        
-        if (response.raw_response_data.links_attached) {
-          geminiCitations = response.raw_response_data.links_attached;
-        } else if (response.raw_response_data.citations) {
-          geminiCitations = response.raw_response_data.citations;
-        } else if (response.raw_response_data.sources) {
-          geminiCitations = response.raw_response_data.sources;
-        }
-        
-        geminiCitations.forEach((link: any, index: number) => {
-          if (link.url) {
-            citations.push({
-              url: link.url,
-              domain: extractDomainFromUrl(link.url),
-              title: link.text || link.title || link.description,
-              position: link.position || index + 1,
-              llm: response.llm,
-              auditDate,
-            });
-          }
-        });
-      }
-    });
-
-    return citations;
-  };
-
-  const applyFilters = () => {
-    let filtered = [...llmResponses];
-
-    // Apply date range filter
-    if (filters.dateRange !== 'all') {
-      if (filters.dateRange === 'lastAudit' && lastAuditDate) {
-        // Filter to show only responses from the last audit date
-        filtered = filtered.filter(response => 
-          response.created_at.split('T')[0] === lastAuditDate
-        );
-      } else if (filters.dateRange === 'custom') {
-        if (customDateRange.startDate && customDateRange.endDate) {
-          const startDate = new Date(customDateRange.startDate);
-          const endDate = new Date(customDateRange.endDate);
-          endDate.setHours(23, 59, 59, 999);
-          
-          filtered = filtered.filter(response => {
-            const responseDate = new Date(response.created_at);
-            return responseDate >= startDate && responseDate <= endDate;
-          });
-        }
-      } else {
-        const now = new Date();
-        now.setHours(23, 59, 59, 999);
-        const cutoffDate = new Date();
-        
-        switch (filters.dateRange) {
-          case 'last7days':
-            cutoffDate.setDate(now.getDate() - 6);
-            break;
-          case 'last14days':
-            cutoffDate.setDate(now.getDate() - 13);
-            break;
-          case 'last30days':
-            cutoffDate.setDate(now.getDate() - 29);
-            break;
-          case 'last90days':
-            cutoffDate.setDate(now.getDate() - 89);
-            break;
-        }
-        
-        cutoffDate.setHours(0, 0, 0, 0);
-        
-        filtered = filtered.filter(response => 
-          new Date(response.created_at) >= cutoffDate && new Date(response.created_at) <= now
-        );
-      }
-    }
-
-    // Apply LLM filter
-    if (filters.llms !== 'all') {
-      filtered = filtered.filter(response => response.llm === filters.llms);
-    }
-
-    // Apply sentiment filter
-    if (filters.sentiment !== 'all') {
-      filtered = filtered.filter(response => response.sentiment_label === filters.sentiment);
-    }
-
-    setFilteredResponses(filtered);
-  };
-
-  const handleFilterChange = (filterType: string, value: string) => {
-    if (filterType === 'dateRange' && value === 'custom') {
-      setShowCustomDatePicker(true);
-    } else if (filterType === 'dateRange' && value !== 'custom') {
-      setShowCustomDatePicker(false);
-    }
-    
-    setFilters(prev => ({
-      ...prev,
-      [filterType]: value,
-    }));
-  };
-
-  const resetFilters = () => {
-    setFilters({
-      dateRange: 'lastAudit',
-      llms: 'all',
-      sentiment: 'all',
-    });
-    setShowCustomDatePicker(false);
-    setCustomDateRange({ startDate: '', endDate: '' });
-  };
-
-  const getActiveFiltersCount = () => {
-    let count = 0;
-    if (filters.dateRange !== 'lastAudit') count++;
-    if (filters.llms !== 'all') count++;
-    if (filters.sentiment !== 'all') count++;
-    return count;
-  };
+  // Filter handlers (handleFilterChange / resetFilters /
+  // getActiveFiltersCount) and the inline Filter Card UI were removed —
+  // the global DashboardFilterBar (AppLayout) now owns all of that and
+  // writes through DashboardFiltersContext.
 
   const fetchPromptData = async () => {
     if (!projectId || !promptId) return;
@@ -750,174 +619,6 @@ export const PromptDetailPage: React.FC = () => {
         </div>
       </motion.div>
 
-      {/* Filter Bar */}
-      <Card>
-        <CardContent className="p-6 pt-8">
-          <div className="flex flex-wrap items-center justify-between gap-4">
-            <div className="flex flex-wrap items-center gap-4">
-              <div className="flex items-center space-x-2">
-                <Calendar className="w-4 h-4 text-gray-500" />
-                <select 
-                  value={filters.dateRange}
-                  onChange={(e) => handleFilterChange('dateRange', e.target.value)}
-                  className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-xl bg-white dark:bg-gray-700 text-sm font-sans focus:ring-2 focus:ring-brand-primary/20 focus:border-brand-primary"
-                >
-                  <option value="lastAudit">
-                    Last Audit {lastAuditDate && `(${new Date(lastAuditDate).toLocaleDateString()})`}
-                  </option>
-                  <option value="all">All time</option>
-                  <option value="last7days">Last 7 days</option>
-                  <option value="last14days">Last 14 days</option>
-                  <option value="last30days">Last 30 days</option>
-                  <option value="last90days">Last 90 days</option>
-                  <option value="custom">Custom</option>
-                </select>
-              </div>
-              
-              <div className="flex items-center space-x-2">
-                <Brain className="w-4 h-4 text-gray-500" />
-                <select
-                  value={filters.llms}
-                  onChange={(e) => handleFilterChange('llms', e.target.value)}
-                  className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-xl bg-white dark:bg-gray-700 text-sm font-sans focus:ring-2 focus:ring-brand-primary/20 focus:border-brand-primary"
-                >
-                  <option value="all">All LLMs</option>
-                  <option value="searchgpt">SearchGPT</option>
-                  <option value="perplexity">Perplexity</option>
-                  <option value="gemini">Gemini</option>
-                </select>
-              </div>
-
-              <div className="flex items-center space-x-2">
-                <ThumbsUp className="w-4 h-4 text-gray-500" />
-                <select
-                  value={filters.sentiment}
-                  onChange={(e) => handleFilterChange('sentiment', e.target.value)}
-                  className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-xl bg-white dark:bg-gray-700 text-sm font-sans focus:ring-2 focus:ring-brand-primary/20 focus:border-brand-primary"
-                >
-                  <option value="all">All Sentiments</option>
-                  <option value="positive">Positive</option>
-                  <option value="neutral">Neutral</option>
-                  <option value="negative">Negative</option>
-                </select>
-              </div>
-            </div>
-            
-            <div className="flex items-center space-x-2">
-              {getActiveFiltersCount() > 0 && (
-                <div className="flex items-center space-x-2">
-                  <span className="text-sm text-gray-600 dark:text-gray-400">
-                    {getActiveFiltersCount()} filter{getActiveFiltersCount() > 1 ? 's' : ''} active
-                  </span>
-                  <div className="w-2 h-2 bg-brand-primary rounded-full"></div>
-                </div>
-              )}
-              <Button variant="ghost" size="sm" onClick={resetFilters}>
-                Reset
-              </Button>
-            </div>
-          </div>
-          
-          {filteredResponses.length !== llmResponses.length && (
-            <div className="mt-6 pt-4 border-t border-gray-200 dark:border-gray-700">
-              <div className="text-sm text-gray-600 dark:text-gray-400">
-                Showing {filteredResponses.length} of {llmResponses.length} responses
-              </div>
-            </div>
-          )}
-        </CardContent>
-      </Card>
-
-      {/* Custom Date Range Picker Modal */}
-      <Modal 
-        isOpen={showCustomDatePicker} 
-        onClose={() => {
-          setShowCustomDatePicker(false);
-          if (!customDateRange.startDate || !customDateRange.endDate) {
-            setFilters(prev => ({ ...prev, dateRange: 'lastAudit' }));
-          }
-        }} 
-        title="Select Custom Date Range"
-      >
-        <div className="p-6 space-y-4">
-          <div className="text-sm text-gray-600 dark:text-gray-400 mb-4">
-            Select from dates with available audit data
-          </div>
-          
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-                Start Date
-              </label>
-              <select
-                value={customDateRange.startDate}
-                onChange={(e) => setCustomDateRange(prev => ({ ...prev, startDate: e.target.value }))}
-                className="block w-full rounded-2xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-4 py-2.5 text-gray-900 dark:text-gray-100 focus:border-brand-primary focus:ring-2 focus:ring-brand-primary/20 font-sans"
-              >
-                <option value="">Select start date</option>
-                {availableDates.map(date => (
-                  <option key={date} value={date}>
-                    {new Date(date).toLocaleDateString()}
-                  </option>
-                ))}
-              </select>
-            </div>
-            
-            <div>
-              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-                End Date
-              </label>
-              <select
-                value={customDateRange.endDate}
-                onChange={(e) => setCustomDateRange(prev => ({ ...prev, endDate: e.target.value }))}
-                className="block w-full rounded-2xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-4 py-2.5 text-gray-900 dark:text-gray-100 focus:border-brand-primary focus:ring-2 focus:ring-brand-primary/20 font-sans"
-                disabled={!customDateRange.startDate}
-              >
-                <option value="">Select end date</option>
-                {availableDates
-                  .filter(date => !customDateRange.startDate || date >= customDateRange.startDate)
-                  .map(date => (
-                    <option key={date} value={date}>
-                      {new Date(date).toLocaleDateString()}
-                    </option>
-                  ))}
-              </select>
-            </div>
-          </div>
-          
-          {customDateRange.startDate && customDateRange.endDate && (
-            <div className="p-3 bg-blue-50 dark:bg-blue-900/20 rounded-xl">
-              <div className="text-sm text-blue-800 dark:text-blue-200">
-                Selected range: {new Date(customDateRange.startDate).toLocaleDateString()} - {new Date(customDateRange.endDate).toLocaleDateString()}
-              </div>
-            </div>
-          )}
-          
-          <div className="flex justify-end space-x-3 pt-4 border-t border-gray-200 dark:border-gray-700">
-            <Button 
-              variant="secondary" 
-              onClick={() => {
-                setShowCustomDatePicker(false);
-                setFilters(prev => ({ ...prev, dateRange: 'lastAudit' }));
-                setCustomDateRange({ startDate: '', endDate: '' });
-              }}
-            >
-              Cancel
-            </Button>
-            <Button
-              variant="gradient"
-              onClick={() => {
-                setShowCustomDatePicker(false);
-                applyFilters();
-              }}
-              disabled={!customDateRange.startDate || !customDateRange.endDate}
-            >
-              Apply Date Range
-            </Button>
-          </div>
-        </div>
-      </Modal>
-
       {/* Prompt Details Card */}
       <Card>
         <CardHeader>
@@ -1044,84 +745,6 @@ export const PromptDetailPage: React.FC = () => {
               </div>
             </div>
           </div>
-        </CardContent>
-      </Card>
-
-      {/* Filter Bar */}
-      <Card>
-        <CardContent className="p-6 pt-8">
-          <div className="flex flex-wrap items-center justify-between gap-4">
-            <div className="flex flex-wrap items-center gap-4">
-              <div className="flex items-center space-x-2">
-                <Calendar className="w-4 h-4 text-gray-500" />
-                <select 
-                  value={filters.dateRange}
-                  onChange={(e) => handleFilterChange('dateRange', e.target.value)}
-                  className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-xl bg-white dark:bg-gray-700 text-sm font-sans focus:ring-2 focus:ring-brand-primary/20 focus:border-brand-primary"
-                >
-                  <option value="lastAudit">
-                    Last Audit {lastAuditDate && `(${new Date(lastAuditDate).toLocaleDateString()})`}
-                  </option>
-                  <option value="all">All time</option>
-                  <option value="last7days">Last 7 days</option>
-                  <option value="last14days">Last 14 days</option>
-                  <option value="last30days">Last 30 days</option>
-                  <option value="last90days">Last 90 days</option>
-                  <option value="custom">Custom</option>
-                </select>
-              </div>
-              
-              <div className="flex items-center space-x-2">
-                <Brain className="w-4 h-4 text-gray-500" />
-                <select
-                  value={filters.llms}
-                  onChange={(e) => handleFilterChange('llms', e.target.value)}
-                  className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-xl bg-white dark:bg-gray-700 text-sm font-sans focus:ring-2 focus:ring-brand-primary/20 focus:border-brand-primary"
-                >
-                  <option value="all">All LLMs</option>
-                  <option value="searchgpt">SearchGPT</option>
-                  <option value="perplexity">Perplexity</option>
-                  <option value="gemini">Gemini</option>
-                </select>
-              </div>
-
-              <div className="flex items-center space-x-2">
-                <ThumbsUp className="w-4 h-4 text-gray-500" />
-                <select
-                  value={filters.sentiment}
-                  onChange={(e) => handleFilterChange('sentiment', e.target.value)}
-                  className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-xl bg-white dark:bg-gray-700 text-sm font-sans focus:ring-2 focus:ring-brand-primary/20 focus:border-brand-primary"
-                >
-                  <option value="all">All Sentiments</option>
-                  <option value="positive">Positive</option>
-                  <option value="neutral">Neutral</option>
-                  <option value="negative">Negative</option>
-                </select>
-              </div>
-            </div>
-            
-            <div className="flex items-center space-x-2">
-              {getActiveFiltersCount() > 0 && (
-                <div className="flex items-center space-x-2">
-                  <span className="text-sm text-gray-600 dark:text-gray-400">
-                    {getActiveFiltersCount()} filter{getActiveFiltersCount() > 1 ? 's' : ''} active
-                  </span>
-                  <div className="w-2 h-2 bg-brand-primary rounded-full"></div>
-                </div>
-              )}
-              <Button variant="ghost" size="sm" onClick={resetFilters}>
-                Reset
-              </Button>
-            </div>
-          </div>
-          
-          {filteredResponses.length !== llmResponses.length && (
-            <div className="mt-6 pt-4 border-t border-gray-200 dark:border-gray-700">
-              <div className="text-sm text-gray-600 dark:text-gray-400">
-                Showing {filteredResponses.length} of {llmResponses.length} responses
-              </div>
-            </div>
-          )}
         </CardContent>
       </Card>
 

@@ -83,7 +83,7 @@ async def _retry_transient(fn: Callable[[], Awaitable[_T]], op: str, attempts: i
 _JSONB_COLUMNS = {
     "raw_response_data", "answer_competitors", "provider_config",
     "metadata", "config", "settings", "extra",
-    "citations", "all_sources", "links_attached",
+    "citations", "all_sources", "links_attached", "organic_results",
 }
 
 # Columns that are text[] (PostgreSQL arrays) — pass as native Python lists
@@ -649,7 +649,23 @@ class SupabaseDB:
             return [dict(r) for r in rows]
 
     async def update_competitors_batch(self, updates: list[dict]) -> None:
-        """Batch-update answer_competitors using UPDATE … FROM VALUES."""
+        """Batch-update answer_competitors using UPDATE … FROM VALUES.
+
+        Cost-reduction side-effect: NULL the heavy ``raw_response_data``
+        JSONB on the same UPDATE, since by the time competitor extraction
+        has run the raw provider payload is no longer needed downstream:
+          - sentiment analysis reads ``answer_text``;
+          - citation rendering reads the ``citations`` / ``links_attached``
+            columns, populated during polling for OneSearch rows;
+          - the frontend's legacy ``raw_response_data`` fallback short-
+            circuits on NULL (``if (!response.raw_response_data) return``).
+
+        Guard: only NULL ``raw_response_data`` when ``citations`` is
+        already populated on the row. OneSearch always populates it
+        during polling; legacy BrightData rows do not, and the frontend
+        still extracts citations from raw_response_data for those — so
+        we leave them alone.
+        """
         if not updates:
             return
         CHUNK = 100
@@ -664,7 +680,11 @@ class SupabaseDB:
                     params[f"comp_{j}"] = _serialize_value(u["competitors"])
                 sql = f"""
                     UPDATE llm_responses SET
-                      answer_competitors = v.competitors
+                      answer_competitors = v.competitors,
+                      raw_response_data = CASE
+                        WHEN llm_responses.citations IS NOT NULL THEN NULL
+                        ELSE llm_responses.raw_response_data
+                      END
                     FROM (VALUES {', '.join(values_parts)}) AS v(id, competitors)
                     WHERE llm_responses.id = v.id
                 """

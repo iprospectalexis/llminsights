@@ -1,8 +1,9 @@
 import React, { useEffect, useState } from 'react';
-import { Outlet, useNavigate, useLocation } from 'react-router-dom';
+import { Outlet, useNavigate, useLocation, useMatch } from 'react-router-dom';
 import { Navbar } from './Navbar';
 import { Sidebar } from './Sidebar';
 import { Footer } from './Footer';
+import { DashboardFilterBar } from '../filters/DashboardFilterBar';
 import { supabase } from '../../lib/supabase';
 import { User } from '@supabase/supabase-js';
 import { Loader2 } from 'lucide-react';
@@ -20,6 +21,12 @@ export const AppLayout: React.FC = () => {
   const [staleSessionBanner, setStaleSessionBanner] = useState<string | null>(null);
   const navigate = useNavigate();
   const location = useLocation();
+  // Show the global filter bar only on dashboard routes — every
+  // /projects/:id/* page consumes the filters. Settings page is
+  // explicitly excluded since it has no charts to filter.
+  const isProjectDashboard = Boolean(useMatch('/projects/:id/*'));
+  const isProjectSettings = Boolean(useMatch('/projects/:id/settings'));
+  const showFilterBar = isProjectDashboard && !isProjectSettings;
 
   // Close mobile menu on route change
   useEffect(() => {
@@ -174,6 +181,7 @@ export const AppLayout: React.FC = () => {
                 </button>
               </div>
             )}
+            {showFilterBar && <DashboardFilterBar />}
             <div className="p-3 md:p-6">
               <Outlet />
             </div>

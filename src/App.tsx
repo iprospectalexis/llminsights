@@ -2,6 +2,7 @@ import React from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
 import { ThemeProvider } from './contexts/ThemeContext';
 import { ProjectProvider } from './contexts/ProjectContext';
+import { DashboardFiltersProvider } from './contexts/DashboardFiltersContext';
 import { AppLayout } from './components/layout/AppLayout';
 import { SignInForm } from './components/auth/SignInForm';
 import { SignUpForm } from './components/auth/SignUpForm';
@@ -36,6 +37,10 @@ function App() {
     <ThemeProvider>
       <ProjectProvider>
         <Router>
+          {/* DashboardFiltersProvider needs to live inside the Router
+              so it can use useSearchParams / useParams to hydrate from
+              the URL and namespace localStorage by projectId. */}
+          <DashboardFiltersProvider>
           <Routes>
             {/* Public routes */}
             <Route path="/signin" element={<SignInForm />} />
@@ -73,6 +78,7 @@ function App() {
           {/* Catch all */}
           <Route path="*" element={<Navigate to="/projects" replace />} />
         </Routes>
+          </DashboardFiltersProvider>
       </Router>
       </ProjectProvider>
     </ThemeProvider>

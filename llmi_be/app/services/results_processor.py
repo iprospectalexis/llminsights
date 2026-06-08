@@ -223,6 +223,48 @@ class ResultsProcessor:
             "converted_items": converted_count,
         }
 
+    async def save_dataforseo_results(
+        self,
+        results: list[dict],
+        job_id: str,
+    ) -> dict:
+        """Save DataForSEO results.
+
+        Unlike BrightData, the DataForSeoClient already returns records in
+        the canonical "converted" shape (see dataforseo_client._convert_task
+        / json_converter.convert_google_aio_record), so there is no
+        conversion step — we write the same list to both the merged and
+        converted files. The OneSearch /results?format=converted endpoint
+        reads `converted_results_file`.
+        """
+        if not results:
+            logger.warning(f"No DataForSEO results provided for job {job_id}")
+            return {
+                "merged_file": None,
+                "converted_file": None,
+                "total_items": 0,
+                "converted_items": 0,
+            }
+
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        filename = f"{job_id}_{timestamp}.json"
+        filepath = RESULTS_DIR / filename
+        converted_path = str(filepath).replace(".json", "_converted.json")
+
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(results, f, ensure_ascii=False)
+        # Already converted → converted file is identical content.
+        with open(converted_path, "w", encoding="utf-8") as f:
+            json.dump(results, f, ensure_ascii=False)
+
+        logger.info(f"Saved {len(results)} DataForSEO results for job {job_id} → {converted_path}")
+        return {
+            "merged_file": str(filepath),
+            "converted_file": converted_path,
+            "total_items": len(results),
+            "converted_items": len(results),
+        }
+
 
 # Singleton instance
 results_processor = ResultsProcessor()

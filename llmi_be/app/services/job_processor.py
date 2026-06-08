@@ -10,6 +10,7 @@ from app.database import AsyncSessionLocal
 from app.models import Job, JobStatus, Provider
 from app.services.serp_client import SerpClient
 from app.services.brightdata_client import BrightDataClient
+from app.services.dataforseo_client import DataForSeoClient
 from app.services.webhook import webhook_service
 from app.services.results_processor import results_processor
 from app.config import get_settings
@@ -90,10 +91,14 @@ class JobProcessor:
                 # Select client based on provider
                 provider = job.provider or Provider.SERP.value
                 is_brightdata = provider == Provider.BRIGHTDATA.value
+                is_dataforseo = provider == Provider.DATAFORSEO.value
 
                 if is_brightdata:
                     client = BrightDataClient()
                     logger.info(f"Job {job_id}: Using BrightData provider")
+                elif is_dataforseo:
+                    client = DataForSeoClient()
+                    logger.info(f"Job {job_id}: Using DataForSEO provider")
                 else:
                     client = SerpClient()
                     logger.info(f"Job {job_id}: Using SERP provider")
@@ -108,8 +113,10 @@ class JobProcessor:
                     try:
                         job.processed_prompts = processed
                         job.progress = int((processed / total) * 100)
-                        # Don't update results during progress for BrightData (too much data)
-                        if not is_brightdata and results_so_far:
+                        # Don't store bulk results in the DB during progress for
+                        # BrightData / DataForSEO (large payloads → final file write
+                        # handles persistence). SERP stores its link list here.
+                        if not is_brightdata and not is_dataforseo and results_so_far:
                             job.results = results_so_far
                         await session.commit()
 
@@ -211,6 +218,29 @@ class JobProcessor:
                             logger.error(f"Failed to save results for job {job_id}: {save_error}")
                             await session.rollback()
                             # Re-fetch job to update with fallback
+                            result = await session.execute(select(Job).filter(Job.id == job_id))
+                            job = result.scalar_one_or_none()
+                            if job:
+                                job.results = results  # Fallback: store in DB
+                                await session.commit()
+                elif is_dataforseo:
+                    # DataForSEO returns already-converted records directly.
+                    if results:
+                        try:
+                            logger.info(f"Saving DataForSEO results for job {job_id}...")
+                            result_info = await results_processor.save_dataforseo_results(
+                                results=results,
+                                job_id=job_id,
+                            )
+                            job.merged_results_file = result_info.get("merged_file")
+                            job.merged_results_count = result_info.get("total_items", 0)
+                            job.converted_results_file = result_info.get("converted_file")
+                            job.results = None  # Don't store raw data in DB
+                            logger.info(f"Job {job_id}: saved {job.merged_results_count} DataForSEO items")
+                            await session.commit()
+                        except Exception as save_error:
+                            logger.error(f"Failed to save DataForSEO results for job {job_id}: {save_error}")
+                            await session.rollback()
                             result = await session.execute(select(Job).filter(Job.id == job_id))
                             job = result.scalar_one_or_none()
                             if job:
