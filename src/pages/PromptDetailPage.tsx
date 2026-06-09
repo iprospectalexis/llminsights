@@ -8,6 +8,7 @@ import { Button } from '../components/ui/Button';
 import { supabase } from '../lib/supabase';
 import { useDashboardFilters } from '../contexts/DashboardFiltersContext';
 import { applyFilters as applyDashboardFilters } from '../lib/dashboard-filter-utils';
+import { FanOutDiagram } from '../components/prompt/FanOutDiagram';
 import {
   FileText, Globe, ArrowLeft, Brain,
   Download, ExternalLink, MessageSquare, Clock, Eye, X,
@@ -689,32 +690,21 @@ export const PromptDetailPage: React.FC = () => {
                 const sortedQueries = Array.from(queryCounts.entries())
                   .sort(([, a], [, b]) => b - a);
 
+                const fanOutItems = sortedQueries.map(([key, count]) => ({
+                  label: displayByKey.get(key) || key,
+                  count,
+                }));
+
                 return (
                   <div className="bg-gray-50 dark:bg-gray-700 rounded-2xl p-4">
                     <h3 className="font-medium text-gray-900 dark:text-gray-100 mb-3 flex items-center gap-2">
                       <Search className="w-4 h-4 text-gray-500 dark:text-gray-400" />
-                      Web Search Queries
+                      Fan-out diagram
                       <span className="text-xs font-normal text-gray-500 dark:text-gray-400">
-                        ({sortedQueries.length} unique)
+                        ({sortedQueries.length} unique web search {sortedQueries.length === 1 ? 'query' : 'queries'})
                       </span>
                     </h3>
-                    <div className="flex flex-wrap gap-2">
-                      {sortedQueries.map(([key, count]) => (
-                        <span
-                          key={key}
-                          className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-white dark:bg-gray-600 border border-gray-200 dark:border-gray-500 rounded-full text-sm text-gray-700 dark:text-gray-200 shadow-sm"
-                          title={displayByKey.get(key)}
-                        >
-                          <Search className="w-3 h-3 text-gray-400 dark:text-gray-400 flex-shrink-0" />
-                          <span>{displayByKey.get(key)}</span>
-                          {count > 1 && (
-                            <span className="ml-1 px-1.5 py-0.5 text-xs font-medium bg-brand-primary/10 text-brand-primary rounded-full">
-                              {count}×
-                            </span>
-                          )}
-                        </span>
-                      ))}
-                    </div>
+                    <FanOutDiagram seed={prompt?.prompt_text || ''} items={fanOutItems} />
                   </div>
                 );
               })()}
