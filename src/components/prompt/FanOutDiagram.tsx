@@ -15,15 +15,20 @@ interface Props {
 
 // ── geometry (viewBox units; the SVG scales to container width) ──────
 const VIEW_W = 900;
-const ROW_H = 30;
 const PAD_Y = 18;
 const SEED_X = 8;
 const SEED_W = 236;
-const SEED_H = 78;
-const BRANCH_X = 300;     // x of the branch dots
-const LABEL_X = 314;      // x where branch labels start
+const SEED_LINE_H = 16;     // line height for wrapped seed text
+const SEED_TOP_PAD = 30;    // room for the "PROMPT" label above seed lines
+const SEED_BOT_PAD = 16;
+const BRANCH_X = 300;       // x of the branch dots
+const LABEL_X = 314;        // x where branch labels start
 const COUNT_X = VIEW_W - 12; // right-aligned count
-const LABEL_MAX_CHARS = 60;
+const BR_LINE_H = 16;       // line height for wrapped branch labels
+const BR_ROW_PAD = 14;      // vertical padding inside a branch row
+const MIN_ROW_H = 30;
+const SEED_WRAP = 26;       // chars per seed line
+const BRANCH_WRAP = 72;     // chars per branch line
 
 // Branch colour gradient (top → bottom). Rendered as a single vertical
 // SVG gradient in user space, so each curve picks up the colour at its
@@ -42,8 +47,9 @@ const PALETTE = [
 ];
 const GRADIENT_ID = 'fanoutGradient';
 
-function wrapText(text: string, maxChars: number, maxLines: number): string[] {
-  const words = text.trim().split(/\s+/);
+/** Greedy word-wrap into lines of at most `maxChars`. No truncation. */
+function wrapText(text: string, maxChars: number): string[] {
+  const words = (text || '—').trim().split(/\s+/);
   const lines: string[] = [];
   let cur = '';
   for (const w of words) {
@@ -51,31 +57,21 @@ function wrapText(text: string, maxChars: number, maxLines: number): string[] {
     if (next.length > maxChars && cur) {
       lines.push(cur);
       cur = w;
-      if (lines.length === maxLines - 1) break;
     } else {
       cur = next;
     }
   }
-  if (cur && lines.length < maxLines) lines.push(cur);
-  // If we truncated, add an ellipsis to the last line.
-  const consumed = lines.join(' ').length;
-  if (consumed < text.trim().length) {
-    lines[lines.length - 1] = `${lines[lines.length - 1]}…`;
-  }
-  return lines;
-}
-
-function truncate(s: string, max: number): string {
-  return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+  if (cur) lines.push(cur);
+  return lines.length ? lines : ['—'];
 }
 
 /**
  * Fan-out diagram: a seed query on the left branching to a ranked list of
- * related queries on the right. Branch thickness + opacity scale with each
- * query's frequency, so the dominant searches read at a glance.
+ * related queries on the right. Branch thickness + colour scale with each
+ * query's frequency / position, so the dominant searches read at a glance.
  *
- * Pure SVG with `fill/stroke="currentColor"` so it inherits text colour and
- * respects dark mode via Tailwind text utilities on the wrapper.
+ * Full text is shown — both the prompt and every branch label wrap onto as
+ * many lines as needed (no truncation); the node and rows grow to fit.
  */
 export const FanOutDiagram: React.FC<Props> = ({ seed, items, className = '' }) => {
   const data = useMemo(
@@ -83,13 +79,31 @@ export const FanOutDiagram: React.FC<Props> = ({ seed, items, className = '' }) 
     [items],
   );
 
+  // Pre-compute wrapped seed lines + node height.
+  const seedLines = useMemo(() => wrapText(seed, SEED_WRAP), [seed]);
+  const seedNodeH = SEED_TOP_PAD + seedLines.length * SEED_LINE_H + SEED_BOT_PAD;
+
+  // Lay out branches top-to-bottom with per-row heights based on wrapping.
+  const layout = useMemo(() => {
+    let y = PAD_Y;
+    const rows = data.map(d => {
+      const lines = wrapText(d.label, BRANCH_WRAP);
+      const h = Math.max(MIN_ROW_H, lines.length * BR_LINE_H + BR_ROW_PAD);
+      const top = y;
+      const centerY = y + h / 2;
+      y += h;
+      return { ...d, lines, centerY };
+    });
+    return { rows, bottom: y };
+  }, [data]);
+
   if (data.length === 0) return null;
 
   const maxCount = Math.max(...data.map(d => d.count), 1);
-  const height = Math.max(SEED_H + PAD_Y * 2, PAD_Y * 2 + data.length * ROW_H);
+  const height = Math.max(seedNodeH + PAD_Y * 2, layout.bottom + PAD_Y);
   const seedY = height / 2;
   const seedRightX = SEED_X + SEED_W;
-  const seedLines = wrapText(seed || '—', 26, 3);
+  const seedTopY = seedY - seedNodeH / 2;
 
   return (
     <div className={`w-full overflow-x-auto text-gray-700 dark:text-gray-200 ${className}`}>
@@ -118,14 +132,13 @@ export const FanOutDiagram: React.FC<Props> = ({ seed, items, className = '' }) 
         </defs>
 
         {/* branches (drawn first, behind the dots/labels) */}
-        {data.map((d, i) => {
-          const y = PAD_Y + i * ROW_H + ROW_H / 2;
+        {layout.rows.map((d, i) => {
           const ratio = d.count / maxCount;
           const strokeW = 0.75 + ratio * 2.25;
           const opacity = 0.55 + ratio * 0.45;
           const c1x = seedRightX + 40;
           const c2x = BRANCH_X - 60;
-          const path = `M ${seedRightX} ${seedY} C ${c1x} ${seedY}, ${c2x} ${y}, ${BRANCH_X} ${y}`;
+          const path = `M ${seedRightX} ${seedY} C ${c1x} ${seedY}, ${c2x} ${d.centerY}, ${BRANCH_X} ${d.centerY}`;
           return (
             <path
               key={`p-${i}`}
@@ -139,18 +152,18 @@ export const FanOutDiagram: React.FC<Props> = ({ seed, items, className = '' }) 
           );
         })}
 
-        {/* seed node */}
+        {/* seed (prompt) node */}
         <rect
           x={SEED_X}
-          y={seedY - SEED_H / 2}
+          y={seedTopY}
           width={SEED_W}
-          height={SEED_H}
+          height={seedNodeH}
           rx={16}
           fill="#560bad"
         />
         <text
           x={SEED_X + SEED_W / 2}
-          y={seedY - SEED_H / 2 + 20}
+          y={seedTopY + 18}
           textAnchor="middle"
           className="fill-purple-200"
           style={{ fontSize: 10, letterSpacing: 1.5, fontWeight: 600 }}
@@ -161,7 +174,7 @@ export const FanOutDiagram: React.FC<Props> = ({ seed, items, className = '' }) 
           <text
             key={`s-${li}`}
             x={SEED_X + SEED_W / 2}
-            y={seedY - SEED_H / 2 + 38 + li * 15}
+            y={seedTopY + SEED_TOP_PAD + 6 + li * SEED_LINE_H}
             textAnchor="middle"
             className="fill-white"
             style={{ fontSize: 13, fontWeight: 600 }}
@@ -171,31 +184,34 @@ export const FanOutDiagram: React.FC<Props> = ({ seed, items, className = '' }) 
         ))}
 
         {/* branch dots + labels + counts */}
-        {data.map((d, i) => {
-          const y = PAD_Y + i * ROW_H + ROW_H / 2;
+        {layout.rows.map((d, i) => {
           const ratio = d.count / maxCount;
+          const firstLineY = d.centerY - ((d.lines.length - 1) * BR_LINE_H) / 2;
           return (
             <g key={`g-${i}`}>
               <title>{`${d.label} — ${d.count}`}</title>
               <circle
                 cx={BRANCH_X}
-                cy={y}
+                cy={d.centerY}
                 r={4}
                 fill={`url(#${GRADIENT_ID})`}
                 fillOpacity={0.6 + ratio * 0.4}
               />
-              <text
-                x={LABEL_X}
-                y={y}
-                dominantBaseline="middle"
-                fill="currentColor"
-                style={{ fontSize: 13, fontWeight: i === 0 ? 600 : 400 }}
-              >
-                {truncate(d.label, LABEL_MAX_CHARS)}
-              </text>
+              {d.lines.map((line, li) => (
+                <text
+                  key={`l-${i}-${li}`}
+                  x={LABEL_X}
+                  y={firstLineY + li * BR_LINE_H}
+                  dominantBaseline="middle"
+                  fill="currentColor"
+                  style={{ fontSize: 13, fontWeight: i === 0 ? 600 : 400 }}
+                >
+                  {line}
+                </text>
+              ))}
               <text
                 x={COUNT_X}
-                y={y}
+                y={d.centerY}
                 textAnchor="end"
                 dominantBaseline="middle"
                 className="fill-gray-500 dark:fill-gray-400"
