@@ -121,7 +121,7 @@ export const FanOutDiagram: React.FC<Props> = ({ seed, items, className = '' }) 
         {data.map((d, i) => {
           const y = PAD_Y + i * ROW_H + ROW_H / 2;
           const ratio = d.count / maxCount;
-          const strokeW = 1.5 + ratio * 4.5;
+          const strokeW = 0.75 + ratio * 2.25;
           const opacity = 0.55 + ratio * 0.45;
           const c1x = seedRightX + 40;
           const c2x = BRANCH_X - 60;
