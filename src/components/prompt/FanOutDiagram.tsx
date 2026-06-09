@@ -146,13 +146,13 @@ export const FanOutDiagram: React.FC<Props> = ({ seed, items, className = '' }) 
           width={SEED_W}
           height={SEED_H}
           rx={16}
-          className="fill-gray-800 dark:fill-gray-900"
+          fill="#560bad"
         />
         <text
           x={SEED_X + SEED_W / 2}
           y={seedY - SEED_H / 2 + 20}
           textAnchor="middle"
-          className="fill-gray-400"
+          className="fill-purple-200"
           style={{ fontSize: 10, letterSpacing: 1.5, fontWeight: 600 }}
         >
           PROMPT
