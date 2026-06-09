@@ -25,6 +25,23 @@ const LABEL_X = 314;      // x where branch labels start
 const COUNT_X = VIEW_W - 12; // right-aligned count
 const LABEL_MAX_CHARS = 60;
 
+// Branch colour gradient (top → bottom). Rendered as a single vertical
+// SVG gradient in user space, so each curve picks up the colour at its
+// vertical position — the fan sweeps the full spectrum.
+const PALETTE = [
+  '#f72585', // neon pink
+  '#b5179e', // raspberry plum
+  '#7209b7', // indigo bloom
+  '#560bad', // ultrasonic blue
+  '#480ca8', // true azure
+  '#3a0ca3', // vivid royal
+  '#3f37c9', // bright indigo
+  '#4361ee', // electric sapphire
+  '#4895ef', // blue energy
+  '#4cc9f0', // sky aqua
+];
+const GRADIENT_ID = 'fanoutGradient';
+
 function wrapText(text: string, maxChars: number, maxLines: number): string[] {
   const words = text.trim().split(/\s+/);
   const lines: string[] = [];
@@ -85,12 +102,27 @@ export const FanOutDiagram: React.FC<Props> = ({ seed, items, className = '' }) 
         aria-label="Fan-out diagram of search queries"
         style={{ minWidth: 640 }}
       >
+        <defs>
+          <linearGradient
+            id={GRADIENT_ID}
+            gradientUnits="userSpaceOnUse"
+            x1="0"
+            y1={PAD_Y}
+            x2="0"
+            y2={height - PAD_Y}
+          >
+            {PALETTE.map((c, i) => (
+              <stop key={c} offset={`${(i / (PALETTE.length - 1)) * 100}%`} stopColor={c} />
+            ))}
+          </linearGradient>
+        </defs>
+
         {/* branches (drawn first, behind the dots/labels) */}
         {data.map((d, i) => {
           const y = PAD_Y + i * ROW_H + ROW_H / 2;
           const ratio = d.count / maxCount;
           const strokeW = 1.5 + ratio * 4.5;
-          const opacity = 0.22 + ratio * 0.78;
+          const opacity = 0.55 + ratio * 0.45;
           const c1x = seedRightX + 40;
           const c2x = BRANCH_X - 60;
           const path = `M ${seedRightX} ${seedY} C ${c1x} ${seedY}, ${c2x} ${y}, ${BRANCH_X} ${y}`;
@@ -99,7 +131,7 @@ export const FanOutDiagram: React.FC<Props> = ({ seed, items, className = '' }) 
               key={`p-${i}`}
               d={path}
               fill="none"
-              stroke="currentColor"
+              stroke={`url(#${GRADIENT_ID})`}
               strokeWidth={strokeW}
               strokeOpacity={opacity}
               strokeLinecap="round"
@@ -123,7 +155,7 @@ export const FanOutDiagram: React.FC<Props> = ({ seed, items, className = '' }) 
           className="fill-gray-400"
           style={{ fontSize: 10, letterSpacing: 1.5, fontWeight: 600 }}
         >
-          SEED QUERY
+          PROMPT
         </text>
         {seedLines.map((line, li) => (
           <text
@@ -149,8 +181,8 @@ export const FanOutDiagram: React.FC<Props> = ({ seed, items, className = '' }) 
                 cx={BRANCH_X}
                 cy={y}
                 r={4}
-                fill="currentColor"
-                fillOpacity={0.3 + ratio * 0.7}
+                fill={`url(#${GRADIENT_ID})`}
+                fillOpacity={0.6 + ratio * 0.4}
               />
               <text
                 x={LABEL_X}
