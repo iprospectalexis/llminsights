@@ -219,6 +219,9 @@ export const PromptDetailPage: React.FC = () => {
           response_timestamp,
           country,
           raw_response_data,
+          citations,
+          links_attached,
+          all_sources,
           web_search_query,
           answer_competitors,
           sentiment_score,
@@ -243,61 +246,67 @@ export const PromptDetailPage: React.FC = () => {
 
   const getResponseCitations = (response: LLMResponse): ProcessedCitation[] => {
     const citations: ProcessedCitation[] = [];
-    
-    if (!response.raw_response_data) return citations;
 
-    const auditDate = response.audits?.created_at ? 
-      response.audits.created_at.split('T')[0] : 
+    const auditDate = response.audits?.created_at ?
+      response.audits.created_at.split('T')[0] :
       response.created_at.split('T')[0];
 
+    // Preferred source: the dedicated columns populated at poll time
+    // (citations / links_attached / all_sources). These survive even after
+    // raw_response_data is NULLed post-extraction (cost-reduction). We only
+    // fall back to raw_response_data for legacy rows that predate those
+    // columns being populated.
+    const pushUrl = (url?: string, title?: string, position?: number) => {
+      if (!url) return;
+      citations.push({
+        url,
+        domain: extractDomainFromUrl(url),
+        title,
+        position: position ?? citations.length + 1,
+        llm: response.llm,
+        auditDate,
+      });
+    };
+
+    const r: any = response;
+    const asArray = (v: any) => {
+      if (!v) return [];
+      if (Array.isArray(v)) return v;
+      try { return JSON.parse(v); } catch { return []; }
+    };
+
+    // 1) citations column (all LLMs — SearchGPT/Perplexity/Gemini/Google AIO…)
+    const col = asArray(r.citations);
+    if (col.length > 0) {
+      col.forEach((c: any, i: number) =>
+        pushUrl(c.url || c.page_url, c.title || c.description, c.position ?? i + 1));
+      return citations;
+    }
+
+    // 2) links_attached (SearchGPT / Gemini) and all_sources (Bing/Google/Grok)
+    const links = asArray(r.links_attached);
+    if (links.length > 0) {
+      links.forEach((l: any, i: number) =>
+        pushUrl(l.url, l.text || l.title || l.description, l.position ?? i + 1));
+      return citations;
+    }
+    const sources = asArray(r.all_sources);
+    if (sources.length > 0) {
+      sources.forEach((s: any, i: number) =>
+        pushUrl(s.url, s.title || s.description, i + 1));
+      return citations;
+    }
+
+    // 3) Legacy fallback: raw_response_data (only present on old rows).
+    if (!response.raw_response_data) return citations;
+
     if (response.llm === 'perplexity' && response.raw_response_data.sources) {
-      response.raw_response_data.sources.forEach((source: any, index: number) => {
-        if (source.url) {
-          citations.push({
-            url: source.url,
-            domain: extractDomainFromUrl(source.url),
-            title: source.title,
-            description: source.description,
-            position: index + 1,
-            llm: response.llm,
-            auditDate,
-          });
-        }
-      });
+      response.raw_response_data.sources.forEach((source: any, index: number) =>
+        pushUrl(source.url, source.title || source.description, index + 1));
     }
-
-    if (response.llm === 'searchgpt') {
-      const linksAttached = response.raw_response_data.links_attached || [];
-      
-      linksAttached.forEach((link: any, index: number) => {
-        if (link.url) {
-          citations.push({
-            url: link.url,
-            domain: extractDomainFromUrl(link.url),
-            title: link.text || link.title || link.description,
-            position: link.position || index + 1,
-            llm: response.llm,
-            auditDate,
-          });
-        }
-      });
-    }
-
-    if (response.llm === 'gemini') {
-      const linksAttached = response.raw_response_data.links_attached || [];
-      
-      linksAttached.forEach((link: any, index: number) => {
-        if (link.url) {
-          citations.push({
-            url: link.url,
-            domain: extractDomainFromUrl(link.url),
-            title: link.text || link.title || link.description,
-            position: link.position || index + 1,
-            llm: response.llm,
-            auditDate,
-          });
-        }
-      });
+    if (response.llm === 'searchgpt' || response.llm === 'gemini') {
+      (response.raw_response_data.links_attached || []).forEach((link: any, index: number) =>
+        pushUrl(link.url, link.text || link.title || link.description, link.position || index + 1));
     }
     return citations;
   };
