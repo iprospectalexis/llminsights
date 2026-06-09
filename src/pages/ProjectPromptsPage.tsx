@@ -1092,7 +1092,7 @@ export const ProjectPromptsPage: React.FC = () => {
                                     ? 'text-yellow-600 dark:text-yellow-400'
                                     : 'text-orange-600 dark:text-orange-400'
                                 }`}>
-                                  #{row.organic_rank}
+                                  {row.organic_rank}
                                 </span>
                               ) : (
                                 <span className="text-gray-400">-</span>
