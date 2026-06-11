@@ -25,13 +25,24 @@ _T = TypeVar("_T")
 
 
 def _is_transient_db_error(exc: BaseException) -> bool:
-    """Identify pool/connection drops that we can safely retry.
+    """Identify pool/connection drops + query timeouts we can safely retry.
 
     Catches the Supavisor-class failure mode where a Supavisor-pooled
     connection is killed underneath us mid-statement and asyncpg surfaces
     `ConnectionDoesNotExistError`, plus the broader family of transient
     transport errors (server closed, TCP reset, DNS hiccup).
+
+    Also treats query/connection TIMEOUTS as transient. asyncpg's
+    `command_timeout` (10s) fires a bare `asyncio.TimeoutError` (empty
+    message) when a statement is slow — almost always transient lock
+    contention / DB load on a background pipeline write (e.g. the polling
+    stage's `mark_polling_attempt`). Retrying with a short backoff lets
+    the contention clear instead of failing the whole step. (A genuinely
+    stuck query just fails after the retries, same as before — only later.)
     """
+    # asyncio.TimeoutError IS builtin TimeoutError on Python 3.11+.
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return True
     msg = str(exc).lower()
     return any(token in msg for token in (
         "connectiondoesnotexisterror",
@@ -40,6 +51,9 @@ def _is_transient_db_error(exc: BaseException) -> bool:
         "ssl connection has been closed",
         "connection reset",
         "connection refused",
+        "timeout",                       # asyncpg command_timeout / pool acquire
+        "querycanceled",                 # asyncpg QueryCanceledError
+        "canceling statement due to",    # server-side statement_timeout
     ))
 
 
@@ -63,7 +77,10 @@ async def _retry_transient(fn: Callable[[], Awaitable[_T]], op: str, attempts: i
     for i in range(attempts):
         try:
             return await fn()
-        except (DBAPIError, OperationalError) as e:
+        except (DBAPIError, OperationalError, asyncio.TimeoutError, TimeoutError) as e:
+            # asyncpg command_timeout raises a bare asyncio.TimeoutError that
+            # SQLAlchemy does NOT wrap as DBAPIError — catch it explicitly so
+            # transient query timeouts retry instead of bubbling up.
             if not _is_transient_db_error(e):
                 raise
             last = e
