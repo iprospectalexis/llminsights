@@ -20,6 +20,7 @@ import { utils as xlsxUtils, writeFile as xlsxWriteFile } from 'xlsx';
 import { getCountryByCode } from '../utils/countries';
 import { useProject } from '../contexts/ProjectContext';
 import { useDashboardFilters } from '../contexts/DashboardFiltersContext';
+import { resolveDateWindow } from '../lib/dashboard-filter-utils';
 
 // Explicit filter type. Catches keyboard slips like `promptGroup` vs
 // `promptGroups` — the latter is the real state key (a string[] of
@@ -130,6 +131,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
   const [showCompetitorsInBrandChart, setShowCompetitorsInBrandChart] = useState(false);
   const [selectedCompetitorBrands, setSelectedCompetitorBrands] = useState<string[]>([]);
   const [showRunAuditModal, setShowRunAuditModal] = useState(false);
+  const [exporting, setExporting] = useState(false);
   // Helper function to check if a date is within the selected range
   const isWithinDateRange = (dateString: string, range: string): boolean => {
     if (range === 'all') return true;
@@ -2291,167 +2293,178 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     xlsxWriteFile(wb, filename);
   };
 
-  const exportAuditDataByLLM = () => {
-    if (!lastAuditDate) {
-      return;
-    }
+  // Global Excel export (button next to "Run Audit").
+  //
+  // Exports EVERY prompt of EVERY audit within the currently-selected
+  // filter period — not just the last audit. Because the page only keeps
+  // the most recent audits in memory, this does its own complete fetch
+  // for the period (paginated). Honors the active LLM / prompt-group /
+  // sentiment filters. One sheet per LLM; one row per (audit × prompt).
+  const exportAuditDataByLLM = async () => {
+    if (!id || exporting) return;
+    setExporting(true);
+    try {
+      // 1. Resolve the date window from the global filters. null = all time.
+      const win = resolveDateWindow(globalFilters, lastAuditDate || null);
 
-    // Debug: Show all available audit dates and which one we're exporting
-    const allAuditDatesInResponses = [...new Set(llmResponses
-      .map(r => r.audits?.created_at?.split('T')[0])
-      .filter(Boolean)
-    )].sort();
-
-    console.log('Export Audit Selection:', {
-      lastAuditDate,
-      allAvailableAuditDates: allAuditDatesInResponses,
-      isLastAuditMostRecent: lastAuditDate === allAuditDatesInResponses[allAuditDatesInResponses.length - 1]
-    });
-
-    const responsesFromLastAudit = llmResponses.filter(response =>
-      response.audits?.created_at &&
-      response.audits.created_at.split('T')[0] === lastAuditDate
-    );
-
-    // Filter citations to only those from the last audit
-    const citationsFromLastAudit = citations.filter(citation =>
-      citation.audits?.created_at &&
-      citation.audits.created_at.split('T')[0] === lastAuditDate
-    );
-
-    const llmGroups = responsesFromLastAudit.reduce((acc, response) => {
-      const llm = response.llm || 'unknown';
-      if (!acc[llm]) {
-        acc[llm] = [];
+      // 2. Audits in the window (id + when it ran).
+      let auditsQuery = supabase
+        .from('audits')
+        .select('id, created_at')
+        .eq('project_id', id)
+        .eq('status', 'completed')
+        .order('created_at', { ascending: false });
+      if (win) {
+        auditsQuery = auditsQuery
+          .gte('created_at', win.start.toISOString())
+          .lte('created_at', win.end.toISOString());
       }
-      acc[llm].push(response);
-      return acc;
-    }, {} as Record<string, any[]>);
+      const { data: auditsList } = await auditsQuery;
+      if (!auditsList || auditsList.length === 0) {
+        alert('No completed audits in the selected period.');
+        return;
+      }
+      const auditIds = auditsList.map(a => a.id);
+      const auditDateById = new Map<string, string>(
+        auditsList.map(a => [a.id, a.created_at]),
+      );
 
-    const wb = xlsxUtils.book_new();
+      // 3. All llm_responses for those audits (paginated past PostgREST's
+      //    1000-row cap).
+      const PAGE = 1000;
+      const responses: any[] = [];
+      for (let from = 0; ; from += PAGE) {
+        const { data: page, error } = await supabase
+          .from('llm_responses')
+          .select(`
+            id, audit_id, prompt_id, llm, answer_text, web_search_query,
+            answer_competitors, citations, all_sources, links_attached,
+            sentiment_label,
+            prompts (prompt_text, prompt_group)
+          `)
+          .in('audit_id', auditIds)
+          .order('audit_id', { ascending: false })
+          .range(from, from + PAGE - 1);
+        if (error) throw error;
+        if (!page || page.length === 0) break;
+        responses.push(...page);
+        if (page.length < PAGE) break;
+      }
 
-    Object.entries(llmGroups).forEach(([llm, responses]) => {
-      // Group responses by prompt_id to avoid duplicates
-      const responsesByPrompt = responses.reduce((acc, response) => {
-        const promptId = response.prompt_id || 'unknown';
-        if (!acc[promptId]) {
-          acc[promptId] = [];
+      // 4. Apply the active LLM / prompt-group / sentiment filters.
+      const llmSet = globalFilters.llms.length > 0 ? new Set(globalFilters.llms) : null;
+      const pgSet = globalFilters.promptGroups.length > 0 ? new Set(globalFilters.promptGroups) : null;
+      const filtered = responses.filter(r => {
+        if (llmSet && !llmSet.has(r.llm)) return false;
+        if (pgSet) {
+          const g = r.prompts?.prompt_group;
+          if (!g || !pgSet.has(g)) return false;
         }
-        acc[promptId].push(response);
+        if (globalFilters.sentiment !== 'all' && r.sentiment_label !== globalFilters.sentiment) return false;
+        return true;
+      });
+
+      // helpers ────────────────────────────────────────────────────────
+      const fanOut = (r: any): string => {
+        const set = new Set<string>();
+        const raw = r.web_search_query;
+        if (Array.isArray(raw)) raw.forEach((q: any) => q && set.add(String(q)));
+        else if (typeof raw === 'string' && raw.trim()) {
+          const t = raw.trim();
+          if (t.startsWith('[')) {
+            try { JSON.parse(t).forEach((q: any) => q && set.add(String(q))); }
+            catch { set.add(t); }
+          } else set.add(t);
+        }
+        return Array.from(set).join('; ');
+      };
+      const asArray = (v: any) => {
+        if (!v) return [];
+        if (Array.isArray(v)) return v;
+        try { return JSON.parse(v); } catch { return []; }
+      };
+      const sourcesText = (r: any): string => {
+        const set = new Set<string>();
+        asArray(r.all_sources).forEach((s: any) => {
+          const u = typeof s === 'string' ? s : s?.url;
+          if (u) set.add(u);
+        });
+        return Array.from(set).join('; ');
+      };
+      const brandsText = (r: any): string => {
+        const brands = r.answer_competitors?.brands;
+        if (!Array.isArray(brands)) return '';
+        return brands.map((b: any) => b?.name).filter(Boolean).join('; ');
+      };
+      const citationCols = (r: any) => {
+        const cites = asArray(r.citations);
+        const url = (c: any) => c?.url || c?.page_url;
+        const cited = new Set<string>();
+        const more = new Set<string>();
+        if (r.llm === 'searchgpt') {
+          cites.filter((c: any) => c?.cited === true).forEach((c: any) => url(c) && cited.add(url(c)));
+          asArray(r.links_attached).forEach((l: any) => l?.url && cited.add(l.url));
+        } else {
+          cites.filter((c: any) => c?.cited === true || c?.cited == null).forEach((c: any) => url(c) && cited.add(url(c)));
+        }
+        cites.filter((c: any) => c?.cited === false).forEach((c: any) => url(c) && more.add(url(c)));
+        let citedText = Array.from(cited).join('; ');
+        const allSrc = sourcesText(r);
+        if (!citedText && r.llm !== 'searchgpt' && allSrc) citedText = allSrc; // fallback
+        return { citedText, moreText: Array.from(more).join('; '), allSrc };
+      };
+
+      // 5. Build one sheet per LLM, one row per (audit × prompt).
+      const byLlm = filtered.reduce((acc: Record<string, any[]>, r: any) => {
+        const llm = r.llm || 'unknown';
+        (acc[llm] = acc[llm] || []).push(r);
         return acc;
-      }, {} as Record<string, any[]>);
+      }, {});
 
-      const exportData = Object.values(responsesByPrompt)
-        .map(promptResponses => {
-          // Use the first response for prompt text and basic info
-          const response = promptResponses[0];
-          const promptText = response.prompts?.prompt_text || '';
+      const wb = xlsxUtils.book_new();
+      let totalRows = 0;
+      Object.entries(byLlm).forEach(([llm, rows]) => {
+        const data = (rows as any[])
+          .map(r => {
+            const created = auditDateById.get(r.audit_id) || '';
+            const { citedText, moreText, allSrc } = citationCols(r);
+            return {
+              'audit_id': r.audit_id,
+              'datetime': created ? new Date(created).toLocaleString() : '',
+              'prompt': r.prompts?.prompt_text || '',
+              'fan-out': fanOut(r),
+              'brands': brandsText(r),
+              'citations': citedText,
+              'citations (more)': moreText,
+              'all sources': allSrc,
+              'answer': r.answer_text || '',
+            };
+          })
+          .filter(row => row.prompt.trim() !== '')
+          // newest audit first, then by prompt
+          .sort((a, b) => (a.datetime < b.datetime ? 1 : a.datetime > b.datetime ? -1 : a.prompt.localeCompare(b.prompt)));
+        totalRows += data.length;
+        // Sheet names are capped at 31 chars by Excel.
+        const ws = xlsxUtils.json_to_sheet(data);
+        xlsxUtils.book_append_sheet(wb, ws, llm.slice(0, 31));
+      });
 
-          // Collect all unique fan-out queries from all responses for this prompt
-          const allFanOutQueries = new Set<string>();
-          promptResponses.forEach(r => {
-            if (r.web_search_query) {
-              if (Array.isArray(r.web_search_query)) {
-                r.web_search_query.forEach(q => allFanOutQueries.add(q));
-              } else if (typeof r.web_search_query === 'string') {
-                const cleaned = r.web_search_query
-                  .replace(/^\[['"]?|['"]?\]$/g, '')
-                  .replace(/^['"]|['"]$/g, '');
-                if (cleaned) allFanOutQueries.add(cleaned);
-              }
-            }
-          });
-          const fanOutQueries = Array.from(allFanOutQueries).join('; ');
+      if (totalRows === 0) {
+        alert('No rows match the current filters in the selected period.');
+        return;
+      }
 
-          // Get all citations for this prompt across all responses
-          const promptCitations = citationsFromLastAudit.filter(citation =>
-            citation.prompt_id === response.prompt_id &&
-            citation.llm === response.llm
-          );
-
-          // Collect all unique sources from all responses
-          const allSourcesSet = new Set<string>();
-          promptResponses.forEach(r => {
-            if (r.all_sources && Array.isArray(r.all_sources)) {
-              r.all_sources.forEach((source: any) => {
-                if (typeof source === 'string') {
-                  allSourcesSet.add(source);
-                } else if (source.url) {
-                  allSourcesSet.add(source.url);
-                }
-              });
-            }
-          });
-          const allSourcesText = Array.from(allSourcesSet).filter(Boolean).join('; ');
-
-          // For SearchGPT: only include citations where cited=true
-          // For other LLMs (Perplexity, Gemini): include cited=true or cited=null
-          let citedCitations = '';
-          if (llm === 'searchgpt') {
-            const citedUrls = new Set<string>();
-
-            // Get citations from citations table where cited=true
-            promptCitations
-              .filter(citation => citation.cited === true)
-              .forEach(citation => {
-                if (citation.page_url) citedUrls.add(citation.page_url);
-              });
-
-            // Also check links_attached field for SearchGPT
-            promptResponses.forEach(r => {
-              if (r.links_attached && Array.isArray(r.links_attached)) {
-                r.links_attached.forEach((link: any) => {
-                  if (link.url) citedUrls.add(link.url);
-                });
-              }
-            });
-
-            citedCitations = Array.from(citedUrls).join('; ');
-          } else {
-            const citedUrls = new Set(
-              promptCitations
-                .filter(citation => citation.cited === true || citation.cited == null) // Use == to catch both null and undefined
-                .map(citation => citation.page_url)
-                .filter(Boolean)
-            );
-            citedCitations = Array.from(citedUrls).join('; ');
-
-            // Fallback for non-SearchGPT: If no citations found, use all_sources
-            if (promptCitations.length === 0 && allSourcesText) {
-              citedCitations = allSourcesText;
-            }
-          }
-
-          // Citations with cited=false (Citations More)
-          // This applies to all LLMs including SearchGPT: only include URLs where cited=false
-          const moreUrls = new Set(
-            promptCitations
-              .filter(citation => citation.cited === false)
-              .map(citation => citation.page_url)
-              .filter(Boolean)
-          );
-          const moreCitations = Array.from(moreUrls).join('; ');
-
-          // Use the answer from the first response
-          const answer = response.answer_text || '';
-
-          return {
-            'prompt': promptText,
-            'fan-out': fanOutQueries,
-            'citations': citedCitations,
-            'citations (more)': moreCitations,
-            'all sources': allSourcesText,
-            'answer': answer
-          };
-        })
-        .filter(row => row.prompt.trim() !== ''); // Exclude rows with empty prompts
-
-      const ws = xlsxUtils.json_to_sheet(exportData);
-      xlsxUtils.book_append_sheet(wb, ws, llm);
-    });
-
-    const filename = `${project?.name || 'project'}_audit_${lastAuditDate}.xlsx`;
-    xlsxWriteFile(wb, filename);
+      const periodLabel = win
+        ? `${win.start.toISOString().slice(0, 10)}_to_${win.end.toISOString().slice(0, 10)}`
+        : 'all';
+      const filename = `${project?.name || 'project'}_audits_${periodLabel}.xlsx`;
+      xlsxWriteFile(wb, filename);
+    } catch (e: any) {
+      console.error('Export failed:', e);
+      alert(`Export failed: ${e?.message || e}`);
+    } finally {
+      setExporting(false);
+    }
   };
 
   const getFilteredPromptCitationsByAudit = (promptId: string, auditDate: string) => {
@@ -3124,9 +3137,10 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
           <Button
             variant="secondary"
             onClick={exportAuditDataByLLM}
+            disabled={exporting}
           >
             <Download className="w-4 h-4 mr-2" />
-            Export
+            {exporting ? 'Exporting…' : 'Export'}
           </Button>
           <Button
             variant="gradient"
