@@ -1324,14 +1324,14 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
         setAuditDates([]);
       } else {
         // Then fetch LLM responses for only these recent audits.
-        // Cost reduction: dropped `raw_response_data`, `all_sources`, and
-        // `links_attached` from the select. These were used by a legacy
-        // fallback path that extracted citations from the raw provider
-        // payload; the citation-rendering primary path uses the `citations`
-        // JSONB column (populated during polling for OneSearch rows) and
-        // the separate `citations` table. The fallback code below
-        // (`if (!response.raw_response_data) return`) gracefully no-ops
-        // when the column is absent.
+        // Cost reduction: we drop only the heavy `raw_response_data`
+        // (the big egress win). `all_sources` and `links_attached` MUST
+        // stay — they are where several providers keep their citations:
+        //   • Bing Copilot / Google AI / Grok → all_sources
+        //   • SearchGPT / Gemini             → links_attached
+        // Perplexity/SearchGPT also use the `citations` column + table.
+        // Dropping all_sources/links_attached zeroed out Citation Rate,
+        // Pages and Domains for Bing/Google/Grok.
         const { data: llmResponsesData, error: responsesError } = await supabase
           .from('llm_responses')
           .select(`
@@ -1341,6 +1341,8 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
             llm,
             answer_text,
             citations,
+            all_sources,
+            links_attached,
             web_search_query,
             sentiment_score,
             sentiment_label,
