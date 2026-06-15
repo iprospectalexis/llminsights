@@ -68,6 +68,9 @@ export const RunAuditModal: React.FC<RunAuditModalProps> = ({
   const [selectedLlms, setSelectedLlms] = useState<string[]>(['searchgpt', 'perplexity']);
   const [enableSentiment, setEnableSentiment] = useState(true);
   const [forceWebSearch, setForceWebSearch] = useState(true);
+  // Gemini: when checked, route this audit through DataForSEO Gemini
+  // (web-search grounded); when unchecked (default), use BrightData.
+  const [geminiWebSearch, setGeminiWebSearch] = useState(false);
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
@@ -116,6 +119,7 @@ export const RunAuditModal: React.FC<RunAuditModalProps> = ({
         llms: selectedLlms,
         enableSentiment,
         forceWebSearch,
+        geminiWebSearch,
       });
 
       console.log('RunAuditModal: Backend API response:', data);
@@ -179,6 +183,22 @@ export const RunAuditModal: React.FC<RunAuditModalProps> = ({
                       />
                       <span className="text-xs font-medium text-gray-700 dark:text-gray-300 ml-2">
                         Force web-search
+                      </span>
+                    </label>
+                  </div>
+                )}
+
+                {llm.id === 'gemini' && selectedLlms.includes('gemini') && (
+                  <div className="ml-8 mt-2">
+                    <label className="flex items-center cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={geminiWebSearch}
+                        onChange={(e) => setGeminiWebSearch(e.target.checked)}
+                        className="w-4 h-4 text-brand-primary border-gray-300 rounded focus:ring-brand-primary"
+                      />
+                      <span className="text-xs font-medium text-gray-700 dark:text-gray-300 ml-2">
+                        With web-search
                       </span>
                     </label>
                   </div>

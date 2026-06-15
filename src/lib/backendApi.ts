@@ -107,6 +107,8 @@ export interface RunAuditPayload {
   forceWebSearch?: boolean;
   groupIds?: string[];
   isScheduled?: boolean;
+  // Gemini only: true → DataForSEO Gemini (web-search), false → BrightData.
+  geminiWebSearch?: boolean;
 }
 
 export interface AuditStatusResponse {

@@ -54,6 +54,10 @@ class RunAuditRequest(BaseModel):
     forceWebSearch: Optional[bool] = True
     groupIds: Optional[list[str]] = None
     isScheduled: Optional[bool] = False
+    # Per-audit Gemini provider override from the Run Audit modal:
+    #   True  → DataForSEO Gemini (web-search grounded)
+    #   False → BrightData Gemini  (default)
+    geminiWebSearch: Optional[bool] = False
 
 
 class AuditStatusResponse(BaseModel):
@@ -331,6 +335,16 @@ async def run_audit(req: RunAuditRequest, background_tasks: BackgroundTasks):
         provider_map[llm] = (setting or {}).get("data_provider", "BrightData")
         if setting and setting.get("provider_config"):
             provider_config_map[llm] = setting["provider_config"]
+
+    # Per-audit Gemini provider override from the modal's "With web-search"
+    # checkbox — takes precedence over the global llm_data_provider_settings
+    # for this run only. Checked → DataForSEO Gemini (grounded web search);
+    # unchecked → BrightData Gemini.
+    if "gemini" in audit_llms:
+        provider_map["gemini"] = "OneSearch SERP API"
+        provider_config_map["gemini"] = {
+            "provider": "dataforseo" if req.geminiWebSearch else "brightdata"
+        }
 
     # Create audit with pipeline_state
     now = datetime.now(timezone.utc)
