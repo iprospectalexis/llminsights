@@ -1,9 +1,12 @@
 """
-DataForSEO client — Google AI Overview + organic results.
+DataForSEO client — Google AI Overview + organic results, and Gemini.
 
-Uses the SERP "live/advanced" endpoint with `load_async_ai_overview` so a
-single synchronous request returns both the AI Overview block and the
-organic results for each keyword (up to 100 keywords per request).
+Two source families, routed by `source` in process_all_prompts():
+  • google_ai_overview → SERP "live/advanced" with load_async_ai_overview
+    (AI Overview block + organic results).
+  • gemini → ai_optimization/gemini/llm_responses/live (answer + fan-out
+    queries + grounding annotations, whose redirect URLs are resolved to
+    their final destinations).
 
 The client maps each DataForSEO task result into the SAME canonical
 "converted" record shape produced by
@@ -104,6 +107,16 @@ class DataForSeoClient:
         # with bounded concurrency instead.
         self.batch_size = batch_size or getattr(settings, "dataforseo_batch_size", 1)
         self.max_concurrent = max_concurrent or getattr(settings, "dataforseo_max_concurrent", 10)
+        # Gemini (ai_optimization) params.
+        self.gemini_model = getattr(settings, "dataforseo_gemini_model", "gemini-3.5-flash")
+        self.gemini_web_search = getattr(settings, "dataforseo_gemini_web_search", True)
+        self.gemini_max_tokens = getattr(settings, "dataforseo_gemini_max_output_tokens", 2048)
+        self.gemini_temperature = getattr(settings, "dataforseo_gemini_temperature", 1.3)
+        self.gemini_top_p = getattr(settings, "dataforseo_gemini_top_p", 0.9)
+        self.gemini_system_message = getattr(
+            settings, "dataforseo_gemini_system_message",
+            "You are a helpful assistant that provides accurate information.",
+        )
         token = base64.b64encode(f"{self.login}:{self.password}".encode()).decode()
         self.headers = {
             "Authorization": f"Basic {token}",
@@ -229,6 +242,203 @@ class DataForSeoClient:
             "organic": organic,
         }
 
+    # ── Gemini (ai_optimization/gemini/llm_responses/live) ───────────
+    async def _resolve_urls(
+        self, client: httpx.AsyncClient, urls: list[str], cache: dict[str, str],
+    ) -> dict[str, str]:
+        """Resolve Vertex AI grounding-redirect URLs to their final
+        destinations. Gemini annotation URLs are
+        `vertexaisearch.cloud.google.com/grounding-api-redirect/...` — we
+        follow the redirect (streamed, so we don't download the page body)
+        and capture the final URL. Cached + concurrency-capped; on any
+        failure we keep the original redirect URL.
+        """
+        sem = asyncio.Semaphore(5)  # be gentle with Google's redirector
+
+        async def one(u: str) -> None:
+            if u in cache:
+                return
+            final = u
+            try:
+                async with sem:
+                    async with client.stream(
+                        "GET", u, follow_redirects=True, timeout=15.0,
+                    ) as resp:
+                        final = str(resp.url)
+            except Exception:
+                final = u
+            cache[u] = final
+
+        await asyncio.gather(*[one(u) for u in urls])
+        return {u: cache.get(u, u) for u in urls}
+
+    async def _post_gemini_one(
+        self, client: httpx.AsyncClient, prompt: str, max_retries: int,
+    ) -> dict:
+        """POST one prompt to the Gemini llm_responses live endpoint."""
+        payload = [{
+            "model_name": self.gemini_model,
+            "user_prompt": prompt,
+            "web_search": self.gemini_web_search,
+            "max_output_tokens": self.gemini_max_tokens,
+            "temperature": self.gemini_temperature,
+            "top_p": self.gemini_top_p,
+            "system_message": self.gemini_system_message,
+        }]
+        url = f"{self.base_url}/v3/ai_optimization/gemini/llm_responses/live"
+        last_err = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                resp = await client.post(url, json=payload, headers=self.headers)
+                resp.raise_for_status()
+                return resp.json()
+            except Exception as e:
+                last_err = e
+                if attempt < max_retries:
+                    await asyncio.sleep(3 ** (attempt - 1))
+                else:
+                    raise last_err
+
+    async def _convert_gemini(
+        self, client: httpx.AsyncClient, task: dict, prompt: str, url_cache: dict[str, str],
+    ) -> Optional[dict]:
+        """Map a Gemini llm_responses task → the canonical converted record.
+
+        answer_text = the message text; citations / all_sources = the text
+        annotations (with redirect URLs resolved to finals);
+        web_search_query = fan_out_queries.
+        """
+        results = task.get("result") or []
+        if task.get("status_code") != 20000 or not results:
+            return None
+        res0 = results[0] or {}
+
+        text_parts: list[str] = []
+        annotations: list[dict] = []
+        for item in (res0.get("items") or []):
+            if item.get("type") != "message":
+                continue
+            for sec in (item.get("sections") or []):
+                if sec.get("type") != "text":
+                    continue
+                if sec.get("text"):
+                    text_parts.append(sec["text"])
+                for ann in (sec.get("annotations") or []):
+                    if ann.get("url"):
+                        annotations.append(ann)
+
+        answer_text = "\n\n".join(text_parts).strip()
+        fan_out = [str(q) for q in (res0.get("fan_out_queries") or []) if q]
+
+        # Resolve grounding-redirect URLs → final URLs (deduped + cached).
+        unique = list({a["url"] for a in annotations})
+        resolved = await self._resolve_urls(client, unique, url_cache) if unique else {}
+
+        citations: list[dict] = []
+        all_sources: list[dict] = []
+        seen: set[str] = set()
+        for a in annotations:
+            final = resolved.get(a["url"], a["url"])
+            if final in seen:
+                continue
+            seen.add(final)
+            dom = _clean_domain(None, final)
+            title = a.get("title")
+            citations.append({"url": final, "page_url": final, "title": title, "domain": dom, "cited": True})
+            all_sources.append({"url": final, "title": title, "domain": dom})
+
+        timestamp = res0.get("datetime") or (datetime.utcnow().isoformat(timespec="milliseconds") + "Z")
+        return {
+            "map": None,
+            "url": "",
+            "index": None,
+            "input": {"user_prompt": prompt},
+            "model": "gemini",
+            "is_map": False,
+            "prompt": prompt,
+            "country": "",
+            "shopping": [],
+            "shopping_visible": False,
+            "citations": citations,
+            "timestamp": timestamp,
+            "references": [],
+            "answer_text": answer_text,
+            "links_attached": [],
+            "answer_section_html": "",
+            "answer_text_markdown": answer_text,
+            "web_search_triggered": bool(self.gemini_web_search),
+            "web_search_query": fan_out,
+            "search_sources": [],
+            "recommendations": [],
+            "additional_prompt": "",
+            "additional_answer_text": None,
+            "all_sources": all_sources,
+            "organic": [],
+        }
+
+    async def _process_gemini(
+        self,
+        prompts: list[str],
+        max_retries: int,
+        progress_callback: Optional[Callable],
+    ) -> tuple[list[dict], list[str]]:
+        """One Gemini request per prompt, bounded concurrency. Each call is
+        slow (~13s) and pricey (~$0.05), so per-prompt + parallel is the
+        right model (the endpoint isn't a cheap batch)."""
+        logger.info(
+            f"DataForSEO Gemini: {len(prompts)} prompts, model={self.gemini_model}, "
+            f"web_search={self.gemini_web_search}, max_concurrent={self.max_concurrent}"
+        )
+        results: list[dict] = []
+        failed: list[str] = []
+        total = len(prompts)
+        processed = 0
+        sem = asyncio.Semaphore(self.max_concurrent)
+        lock = asyncio.Lock()
+        url_cache: dict[str, str] = {}  # shared redirect→final cache across prompts
+        timeout = httpx.Timeout(120.0, connect=30.0)
+
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async def run_one(prompt: str) -> None:
+                nonlocal processed
+                rec = None
+                try:
+                    async with sem:
+                        data = await self._post_gemini_one(client, prompt, max_retries)
+                    tasks = data.get("tasks") or ([data] if data.get("result") else [])
+                    task = tasks[0] if tasks else None
+                    if task:
+                        self.total_cost += float(task.get("cost") or 0)
+                        rec = await self._convert_gemini(client, task, prompt, url_cache)
+                        if not rec:
+                            logger.warning(
+                                f"DataForSEO Gemini task not usable for '{prompt[:60]}': "
+                                f"status={task.get('status_code')} msg={task.get('status_message')!r}"
+                            )
+                except Exception as e:
+                    logger.error(
+                        f"DataForSEO Gemini failed for '{prompt[:60]}': {type(e).__name__}: {e}"
+                    )
+                async with lock:
+                    if rec and rec.get("answer_text"):
+                        results.append(rec)
+                    else:
+                        failed.append(prompt)
+                    processed += 1
+                    if progress_callback:
+                        try:
+                            await progress_callback(processed, total, results)
+                        except Exception:
+                            pass
+
+            await asyncio.gather(*[run_one(p) for p in prompts])
+
+        logger.info(
+            f"DataForSEO Gemini: done — {len(results)} ok, {len(failed)} failed, "
+            f"cost=${self.total_cost:.4f}"
+        )
+        return results, failed
+
     async def _post_batch(
         self, client: httpx.AsyncClient, keywords: list[str],
         location_code: int, language_code: str, max_retries: int,
@@ -281,6 +491,11 @@ class DataForSeoClient:
         (default 1 keyword) + concurrency keep each request fast and the
         whole job reliable.
         """
+        # Gemini uses a completely different endpoint/payload/response
+        # (ai_optimization/gemini/llm_responses/live), so route it out.
+        if (source or "").lower() == "gemini":
+            return await self._process_gemini(prompts, max_retries, progress_callback)
+
         location_code, language_code = self._resolve_location(geo_targeting)
         country = (geo_targeting or "").strip().upper()[:2] or "US"
         logger.info(

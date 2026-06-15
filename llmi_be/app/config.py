@@ -74,6 +74,18 @@ class Settings(BaseSettings):
     # Concurrent live/advanced requests (bounded fan-out).
     dataforseo_max_concurrent: int = 10
 
+    # DataForSEO Gemini (ai_optimization/gemini/llm_responses/live).
+    # A different endpoint+payload from the SERP/AI-Overview path; used when
+    # the LLM source is "gemini" and the provider is DataForSEO.
+    dataforseo_gemini_model: str = "gemini-3.5-flash"
+    dataforseo_gemini_web_search: bool = True
+    dataforseo_gemini_max_output_tokens: int = 2048
+    dataforseo_gemini_temperature: float = 1.3
+    dataforseo_gemini_top_p: float = 0.9
+    dataforseo_gemini_system_message: str = (
+        "You are a helpful assistant that provides accurate information."
+    )
+
     # Security
     api_key: Optional[str] = None
     

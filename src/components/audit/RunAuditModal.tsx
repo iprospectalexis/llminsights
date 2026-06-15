@@ -29,7 +29,7 @@ const llmOptions = [
     id: 'gemini',
     name: 'Gemini',
     iconUrl: 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/Gemini.png',
-    disabled: true
+    disabled: false
   },
   {
     id: 'google-ai-overview',
