@@ -252,6 +252,39 @@ MIN_POLL_INTERVAL_SECONDS = 5
 # work and polluted the pipeline_log with fake "timeout" errors).
 MAX_BATCHES_PER_INVOCATION = 10  # = 200 responses with batch_size=20
 
+# Auto-fallback on exhaustion. When a source's rows exhaust polling with no
+# data (would otherwise be marked `provider_no_response`), re-trigger that
+# source ONCE on the alternate provider below, then reset the rows so the
+# scheduler re-polls the new job. Diagnosed 2026-06-18: the OneSearch SERP
+# gateway intermittently returns no Gemini/Perplexity responses for a whole
+# audit window while ChatGPT succeeds — these alternates bypass the flaky
+# source engine. A row only falls back once (`fallback_attempted` guard);
+# a second exhaustion is terminal.
+FALLBACK_PROVIDER_BY_LLM = {
+    "gemini": "dataforseo",
+    "perplexity": "brightdata",
+}
+# data_provider label stamped on rows after a successful fallback re-trigger.
+# DataForSEO still runs as a sub-provider of a OneSearch job (POST /jobs),
+# so its label matches the run-audit convention.
+_FALLBACK_PROVIDER_LABEL = {
+    "dataforseo": "OneSearch SERP API",
+    "brightdata": "BrightData",
+}
+
+
+def _fallback_provider_available(provider: str) -> bool:
+    """True only if the alternate provider has usable credentials configured —
+    otherwise the fallback would just 401/no-op, so we skip it and let the
+    row go terminal as `provider_no_response`."""
+    if provider == "dataforseo":
+        return bool(settings.dataforseo_login and settings.dataforseo_password)
+    if provider == "brightdata":
+        return bool(settings.brightdata_api_key)
+    if provider == "serp":
+        return bool(settings.serp_api_key)
+    return False
+
 
 async def handle_fetching(audit_id: str, worker_id: str) -> None:
     """
@@ -360,7 +393,8 @@ async def handle_polling(audit_id: str, worker_id: str) -> None:
     and returns to the scheduler.
     """
     from app.api.v1.endpoints.audits import (
-        fetch_onesearch_results, _fetch_brightdata_result, collect_citations
+        fetch_onesearch_results, _fetch_brightdata_result, collect_citations,
+        trigger_onesearch_job,
     )
 
     # `phase` tracks where in the handler we currently are. On any uncaught
@@ -731,20 +765,83 @@ async def handle_polling(audit_id: str, worker_id: str) -> None:
             if prev_attempts + 1 >= MAX_POLL_ATTEMPTS_PER_ROW:
                 exhausted_ids.append(rid)
         if exhausted_ids:
-            logger.warning(
-                f"[polling] {audit_id}: {len(exhausted_ids)} rows exhausted "
-                f"after {MAX_POLL_ATTEMPTS_PER_ROW} attempts → provider_no_response"
-            )
-            await db.mark_polling_terminal(exhausted_ids, "provider_no_response")
-            try:
-                await db.update_audit(audit_id, {
-                    "error_message": (
-                        f"Polling: {len(exhausted_ids)} rows marked provider_no_response "
-                        f"(exhausted {MAX_POLL_ATTEMPTS_PER_ROW} attempts)"
+            # ── Auto-fallback before giving up ──────────────────────────
+            # For sources with an alternate provider configured that haven't
+            # already fallen back, re-trigger on that provider and reset the
+            # rows instead of marking them terminal. The scheduler re-polls
+            # the new job next tick. A row only falls back once.
+            phase = "fallback_select"
+            due_by_id = {str(r["id"]): r for r in due}
+            eligible_by_llm: dict[str, list[dict]] = {}
+            for rid in exhausted_ids:
+                r = due_by_id.get(rid)
+                if not r or r.get("fallback_attempted"):
+                    continue
+                prov = FALLBACK_PROVIDER_BY_LLM.get(r.get("llm"))
+                if prov and _fallback_provider_available(prov):
+                    eligible_by_llm.setdefault(r["llm"], []).append(r)
+
+            fellback_ids: set[str] = set()
+            for llm, rows in eligible_by_llm.items():
+                prov = FALLBACK_PROVIDER_BY_LLM[llm]
+                phase = f"fallback_trigger_{llm}"
+                try:
+                    pids = [str(rr["prompt_id"]) for rr in rows if rr.get("prompt_id")]
+                    pmap = await db.get_prompt_texts(pids)
+                    prompt_texts = [pmap[pid] for pid in pids if pmap.get(pid)]
+                    if not prompt_texts:
+                        continue
+                    country = next(
+                        (rr.get("country") for rr in rows if rr.get("country")), "FR"
                     )
-                })
-            except Exception:
-                pass
+                    new_job_id = await trigger_onesearch_job(
+                        llm, prompt_texts, country, True,
+                        {"provider": prov}, audit_id=audit_id,
+                    )
+                    await db.reassign_responses_for_fallback(
+                        [str(rr["id"]) for rr in rows],
+                        new_job_id,
+                        _FALLBACK_PROVIDER_LABEL.get(prov, prov),
+                    )
+                    fellback_ids.update(str(rr["id"]) for rr in rows)
+                    logger.warning(
+                        f"[polling] {audit_id}: {len(rows)} {llm} rows had no response "
+                        f"→ auto-retry on {prov} (new job {new_job_id})"
+                    )
+                    try:
+                        await db.update_audit(audit_id, {
+                            "error_message": (
+                                f"Polling: {len(rows)} {llm} rows had no response; "
+                                f"auto-retrying on {prov}"
+                            )
+                        })
+                    except Exception:
+                        pass
+                except Exception as e:
+                    logger.error(
+                        f"[polling] {audit_id}: fallback re-trigger for {llm} on "
+                        f"{prov} failed: {e} — rows stay provider_no_response"
+                    )
+
+            # Rows with no eligible fallback (or whose re-trigger failed) are
+            # terminal, exactly as before.
+            phase = "exhaustion_mark_terminal"
+            remaining = [rid for rid in exhausted_ids if rid not in fellback_ids]
+            if remaining:
+                logger.warning(
+                    f"[polling] {audit_id}: {len(remaining)} rows exhausted "
+                    f"after {MAX_POLL_ATTEMPTS_PER_ROW} attempts → provider_no_response"
+                )
+                await db.mark_polling_terminal(remaining, "provider_no_response")
+                try:
+                    await db.update_audit(audit_id, {
+                        "error_message": (
+                            f"Polling: {len(remaining)} rows marked provider_no_response "
+                            f"(exhausted {MAX_POLL_ATTEMPTS_PER_ROW} attempts)"
+                        )
+                    })
+                except Exception:
+                    pass
 
         # Re-read counters after persisting so the UI reflects reality
         # immediately instead of lagging by one tick (~15s).

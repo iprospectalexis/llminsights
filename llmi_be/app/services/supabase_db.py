@@ -483,6 +483,46 @@ class SupabaseDB:
             await s.commit()
             return updated
 
+    async def reassign_responses_for_fallback(
+        self, row_ids: list[str], job_id: str, data_provider: str
+    ) -> int:
+        """Re-point exhausted rows at a NEW fallback job and reset poll state.
+
+        Used by the polling handler's auto-fallback: rows that exhausted
+        polling on their original provider are re-triggered on an alternate
+        provider (a fresh OneSearch job) and handed back to the scheduler.
+        Clears the terminal reason + attempt counters so the rows re-enter
+        the active-pending set, stamps the new provider label, and sets
+        `fallback_attempted = true` so a row can only fall back once.
+
+        `snapshot_id` is cleared because the new job is OneSearch job-based
+        (the legacy BrightData snapshot path keys off snapshot_id).
+        Uses `ANY(:ids)` (no CAST) per the asyncpg+text() binding rule — see
+        `mark_polling_attempt` for the rationale.
+        """
+        if not row_ids:
+            return 0
+        async with AsyncSessionLocal() as s:
+            result = await s.execute(
+                text("""
+                    UPDATE llm_responses
+                    SET job_id               = :job_id,
+                        data_provider        = :dp,
+                        snapshot_id          = NULL,
+                        poll_attempts        = 0,
+                        first_polled_at      = NULL,
+                        last_polled_at       = NULL,
+                        poll_terminal_reason = NULL,
+                        fallback_attempted   = true
+                    WHERE id = ANY(:ids)
+                    RETURNING id
+                """),
+                {"job_id": job_id, "dp": data_provider, "ids": list(row_ids)},
+            )
+            updated = len(result.fetchall())
+            await s.commit()
+            return updated
+
     async def get_polling_status(self, audit_id: str) -> dict:
         """Single-row health summary for an audit's polling progress.
 

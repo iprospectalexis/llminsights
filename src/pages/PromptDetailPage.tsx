@@ -12,7 +12,7 @@ import { FanOutDiagram } from '../components/prompt/FanOutDiagram';
 import {
   FileText, Globe, ArrowLeft, Brain,
   Download, ExternalLink, MessageSquare, Clock, Eye, X,
-  Award, ThumbsUp, ThumbsDown, Minus, Users, Search
+  Award, ThumbsUp, ThumbsDown, Minus, Users, Search, AlertTriangle
 } from 'lucide-react';
 import { format } from 'date-fns';
 
@@ -25,6 +25,23 @@ const LLM_ICONS = {
   'bing-copilot': 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/bing_copilot.png',
   'grok': 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/Grok-icon.png',
 };
+
+// Human-readable explanation for a response that has no answer. Mirrors the
+// pipeline's `poll_terminal_reason` values (audit_pipeline.py) so an empty
+// LLM response reads as "the provider didn't answer" rather than a bug.
+const NO_DATA_REASONS: Record<string, string> = {
+  provider_no_response: 'The provider returned no response for this prompt. It was retried, and — where an alternate provider is configured — automatically re-run on a fallback provider.',
+  provider_dropped: 'The provider returned results but dropped this specific prompt.',
+  provider_error: 'The provider returned an error while fetching this prompt.',
+  polling_timeout: 'The provider did not return results within the polling window.',
+  orphan_no_job_id: 'No scraping job was created for this prompt.',
+  polling_giveup: 'Polling was stopped before a response arrived.',
+};
+
+function getNoDataReason(reason?: string | null): string {
+  if (!reason) return 'No response has been collected for this prompt yet.';
+  return NO_DATA_REASONS[reason] || `No response collected (${reason}).`;
+}
 
 
 interface LLMResponse {
@@ -50,6 +67,7 @@ interface LLMResponse {
   } | null;
   sentiment_score?: number | null;
   sentiment_label?: 'positive' | 'neutral' | 'negative' | null;
+  poll_terminal_reason?: string | null;
   created_at: string;
   audits: {
     id: string;
@@ -227,6 +245,7 @@ export const PromptDetailPage: React.FC = () => {
           answer_competitors,
           sentiment_score,
           sentiment_label,
+          poll_terminal_reason,
           created_at,
           audits!inner (
             id,
@@ -880,6 +899,23 @@ export const PromptDetailPage: React.FC = () => {
                                         response.answer_competitors?.brands || []
                                       )}
                                     </p>
+                                  </div>
+                                </div>
+                              )}
+
+                              {/* No answer collected — explain why instead of showing a blank card */}
+                              {!response.answer_text && (
+                                <div className="rounded-xl border border-amber-200 dark:border-amber-700 bg-amber-50 dark:bg-amber-900/20 p-4">
+                                  <div className="flex items-start gap-2">
+                                    <AlertTriangle className="w-4 h-4 text-amber-600 dark:text-amber-400 mt-0.5 flex-shrink-0" />
+                                    <div>
+                                      <p className="text-sm font-medium text-amber-800 dark:text-amber-200">
+                                        No response collected
+                                      </p>
+                                      <p className="text-xs text-amber-700 dark:text-amber-300 mt-0.5">
+                                        {getNoDataReason(response.poll_terminal_reason)}
+                                      </p>
+                                    </div>
                                   </div>
                                 </div>
                               )}
