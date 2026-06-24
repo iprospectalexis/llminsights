@@ -281,11 +281,11 @@ export const ProjectsPage: React.FC = () => {
     setDeleteModalOpen(false);
 
     try {
-      // Delete project (cascade will handle related data)
+      // Delete via the server-side RPC, which lifts the statement_timeout for
+      // the cascade (large projects otherwise hit 57014 and never delete).
+      // FK cascade handles all related data; RLS still governs authorization.
       const { error: deleteError } = await supabase
-        .from('projects')
-        .delete()
-        .eq('id', projectToDelete.id);
+        .rpc('delete_project', { p_id: projectToDelete.id });
 
       if (deleteError) throw deleteError;
 
@@ -298,11 +298,12 @@ export const ProjectsPage: React.FC = () => {
         message: `Project "${projectToDelete.name}" and all its associated data have been deleted successfully.`
       });
       setResultModalOpen(true);
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error deleting project:', error);
+      const detail = error?.message || error?.code || 'unknown error';
       setResultMessage({
         type: 'error',
-        message: 'Failed to delete project. Please try again.'
+        message: `Failed to delete project: ${detail}. Please try again.`
       });
       setResultModalOpen(true);
     } finally {
