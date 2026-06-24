@@ -1548,9 +1548,16 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
   useEffect(() => {
     if (activeTab === 'insights') {
       fetchCompletedReports();
-      fetchPromptGroups();
     }
   }, [activeTab, id]);
+
+  // Prompt groups feed the global filter bar's "Groups" dropdown, which is
+  // visible on every dashboard tab. Load them on mount — previously this
+  // only ran on the Insights tab, so the group filter never appeared on the
+  // Overview (or any other tab) for projects that do have groups.
+  useEffect(() => {
+    fetchPromptGroups();
+  }, [id]);
 
   useEffect(() => {
     if (project && brands.length > 0) {
