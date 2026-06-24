@@ -2441,6 +2441,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
               'audit_id': r.audit_id,
               'datetime': created ? new Date(created).toLocaleString() : '',
               'prompt': r.prompts?.prompt_text || '',
+              'group': r.prompts?.prompt_group || '',
               'fan-out': fanOut(r),
               'brands': brandsText(r),
               'citations': citedText,
