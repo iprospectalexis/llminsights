@@ -1,5 +1,5 @@
 import React, { useRef, useState, useEffect } from 'react';
-import { Plus, X, Monitor, Smartphone, Search, Loader2, Maximize2 } from 'lucide-react';
+import { Plus, X, Monitor, Smartphone, Search, Loader2, Maximize2, ChevronDown } from 'lucide-react';
 import { Button } from '../components/ui/Button';
 import { getSerpPreview } from '../lib/backendApi';
 import type { SerpPreviewResult, SerpSource } from '../lib/backendApi';
@@ -23,6 +23,15 @@ const INPUT_CLASS =
   'bg-white dark:bg-gray-800 px-4 py-2.5 text-gray-900 dark:text-white ' +
   'placeholder-gray-500 dark:placeholder-gray-300 ' +
   'focus:border-brand-primary focus:ring-2 focus:ring-brand-primary/20 transition-colors duration-200';
+
+// Sur Windows, Segoe UI Emoji ne rend pas les emoji drapeaux (affiche « us » au
+// lieu de 🇺🇸). On charge une police dédiée, restreinte aux indicateurs
+// régionaux, qui ne s'applique donc qu'aux codepoints des drapeaux.
+const FLAG_FONT_FAMILY = '"Twemoji Country Flags", ui-sans-serif, system-ui, sans-serif';
+const FLAG_FONT_FACE =
+  '@font-face{font-family:"Twemoji Country Flags";unicode-range:U+1F1E6-1F1FF;' +
+  'src:url("https://cdn.jsdelivr.net/npm/country-flag-emoji-polyfill@0.1/dist/TwemojiCountryFlags.woff2") format("woff2");' +
+  'font-display:swap}';
 
 function SourceList({ items, emptyMsg }: { items: SerpSource[]; emptyMsg: string }) {
   if (!items || items.length === 0) {
@@ -58,6 +67,86 @@ function SourceList({ items, emptyMsg }: { items: SerpSource[]; emptyMsg: string
         </li>
       ))}
     </ol>
+  );
+}
+
+// Dropdown pays custom : le <select> natif ignore les web-fonts sous Windows
+// (les drapeaux emoji y restent « us »). Ici les drapeaux sont des <span> avec
+// la police Twemoji Country Flags → rendus correctement partout.
+function CountrySelect({
+  value,
+  onChange,
+  options,
+}: {
+  value: string;
+  onChange: (code: string) => void;
+  options: { code: string; name: string; flag: string }[];
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setOpen(false);
+    };
+    document.addEventListener('mousedown', onDoc);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDoc);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [open]);
+
+  const selected = options.find((o) => o.code === value) || options[0];
+  const triggerClass =
+    'w-full rounded-2xl border border-gray-300 dark:border-gray-500 bg-white dark:bg-gray-800 ' +
+    'px-4 py-2.5 text-gray-900 dark:text-white flex items-center gap-2 text-left ' +
+    'focus:border-brand-primary focus:ring-2 focus:ring-brand-primary/20 transition-colors duration-200';
+
+  return (
+    <div ref={ref} className="relative">
+      <button type="button" onClick={() => setOpen((o) => !o)} aria-haspopup="listbox" aria-expanded={open} className={triggerClass}>
+        <span style={{ fontFamily: FLAG_FONT_FAMILY }} className="text-lg leading-none">
+          {selected.flag}
+        </span>
+        <span className="flex-1 truncate">{selected.name}</span>
+        <ChevronDown className={`w-4 h-4 flex-shrink-0 text-gray-400 transition-transform ${open ? 'rotate-180' : ''}`} />
+      </button>
+      {open && (
+        <ul
+          role="listbox"
+          className="absolute z-30 mt-1 w-full max-h-72 overflow-auto rounded-2xl border border-gray-200 dark:border-gray-600 bg-white dark:bg-gray-800 shadow-lg py-1"
+        >
+          {options.map((o) => (
+            <li key={o.code}>
+              <button
+                type="button"
+                role="option"
+                aria-selected={o.code === value}
+                onClick={() => {
+                  onChange(o.code);
+                  setOpen(false);
+                }}
+                className={`w-full flex items-center gap-2 px-3 py-2 text-left text-sm transition-colors ${
+                  o.code === value
+                    ? 'bg-brand-primary/10 text-brand-primary'
+                    : 'text-gray-800 dark:text-gray-100 hover:bg-gray-100 dark:hover:bg-gray-700'
+                }`}
+              >
+                <span style={{ fontFamily: FLAG_FONT_FAMILY }} className="text-lg leading-none">
+                  {o.flag}
+                </span>
+                <span className="truncate">{o.name}</span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
   );
 }
 
@@ -154,6 +243,7 @@ export const AIOverviewPreviewPage: React.FC = () => {
 
   return (
     <>
+    <style>{FLAG_FONT_FACE}</style>
     <div className="p-6 space-y-6">
       <div>
         <h1 className="text-2xl font-semibold text-gray-900 dark:text-white">AI Overview Preview</h1>
@@ -218,17 +308,7 @@ export const AIOverviewPreviewPage: React.FC = () => {
             <label className="block text-sm font-medium text-gray-700 dark:text-gray-100 mb-1.5">
               Pays
             </label>
-            <select
-              value={geo}
-              onChange={(e) => setGeo(e.target.value)}
-              className={INPUT_CLASS}
-            >
-              {GEO_OPTIONS.map((c) => (
-                <option key={c.code} value={c.code}>
-                  {c.flag} {c.name}
-                </option>
-              ))}
-            </select>
+            <CountrySelect value={geo} onChange={setGeo} options={GEO_OPTIONS} />
           </div>
 
           {/* Appareil */}
