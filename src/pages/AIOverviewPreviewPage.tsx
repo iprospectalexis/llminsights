@@ -1,4 +1,4 @@
-import React, { useRef, useState, useEffect } from 'react';
+import React, { useRef, useState, useEffect, useLayoutEffect, useCallback, useId } from 'react';
 import { Plus, X, Monitor, Smartphone, Search, Loader2, Maximize2, ChevronDown } from 'lucide-react';
 import { Button } from '../components/ui/Button';
 import { getSerpPreview } from '../lib/backendApi';
@@ -6,7 +6,7 @@ import type { SerpPreviewResult, SerpSource } from '../lib/backendApi';
 import { getCountryByCode } from '../utils/countries';
 
 const MAX_KEYWORDS = 5;
-const GEO_CODES = ['US', 'FR', 'GB', 'DE', 'ES', 'IT', 'NL', 'CA', 'BR', 'JP'];
+const GEO_CODES = ['US', 'BE', 'CH', 'FR', 'GB', 'DE', 'ES', 'IT', 'NL', 'CA', 'BR', 'JP'];
 // Le champ `flag` de countries.ts est une URL d'image (non affichable dans une
 // <option>). On dérive l'emoji drapeau depuis le code pays (indicateurs régionaux).
 const codeToFlag = (code: string) =>
@@ -33,40 +33,222 @@ const FLAG_FONT_FACE =
   'src:url("https://cdn.jsdelivr.net/npm/country-flag-emoji-polyfill@0.1/dist/TwemojiCountryFlags.woff2") format("woff2");' +
   'font-display:swap}';
 
-function SourceList({ items, emptyMsg }: { items: SerpSource[]; emptyMsg: string }) {
+// Clé d'URL normalisée (hôte sans www + chemin, sans ?query/#fragment/slash
+// final) pour apparier une même PAGE entre organique et AI Overview.
+function normUrl(u: string): string {
+  if (!u) return '';
+  try {
+    const url = new URL(u);
+    return url.hostname.toLowerCase().replace(/^www\./, '') + url.pathname.replace(/\/+$/, '');
+  } catch {
+    return u.toLowerCase().replace(/[?#].*$/, '').replace(/\/+$/, '');
+  }
+}
+
+function SourceItems({
+  items,
+  emptyMsg,
+  col,
+  shared,
+}: {
+  items: SerpSource[];
+  emptyMsg: string;
+  col: 'org' | 'aio';
+  shared: Set<string>;
+}) {
+  // Organique surligné en vert, AI Overview en rose.
+  const sharedBox =
+    col === 'aio'
+      ? 'bg-pink-50 border-pink-300 dark:bg-pink-900/30 dark:border-pink-700'
+      : 'bg-green-50 border-green-300 dark:bg-green-900/30 dark:border-green-700';
+  const sharedText =
+    col === 'aio'
+      ? 'text-pink-800 dark:text-pink-300'
+      : 'text-green-800 dark:text-green-300';
   if (!items || items.length === 0) {
     return <p className="text-xs italic text-gray-400 dark:text-gray-500 px-1 py-1">{emptyMsg}</p>;
   }
   return (
     <ol className="space-y-1">
-      {items.map((s, i) => (
-        <li
-          key={`${s.url}-${i}`}
-          className={`rounded-xl border ${
-            s.shared
-              ? 'bg-green-50 border-green-300 dark:bg-green-900/30 dark:border-green-700'
-              : 'border-transparent'
-          }`}
-        >
-          <a
-            href={s.url}
-            target="_blank"
-            rel="noopener noreferrer"
-            title={s.title || s.url}
-            className="block px-2.5 py-1.5 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-xl"
+      {items.map((s, i) => {
+        const urlKey = normUrl(s.url);
+        const isShared = !!urlKey && shared.has(urlKey);
+        return (
+          <li
+            key={`${s.url}-${i}`}
+            data-col={col}
+            data-key={urlKey}
+            className={`rounded-xl border ${isShared ? sharedBox : 'border-transparent'}`}
           >
-            <span
-              className={`block text-[13px] font-medium truncate ${
-                s.shared ? 'text-green-800 dark:text-green-300' : 'text-gray-800 dark:text-gray-100'
-              }`}
+            <a
+              href={s.url}
+              target="_blank"
+              rel="noopener noreferrer"
+              title={s.title || s.url}
+              className="block px-2 py-1.5 rounded-xl hover:bg-gray-100 dark:hover:bg-gray-800"
             >
-              {s.source || s.host || s.url}
-            </span>
-            <span className="block text-[11px] text-gray-400 dark:text-gray-500 truncate">{s.host}</span>
-          </a>
-        </li>
-      ))}
+              <span
+                className={`block text-[12px] font-medium truncate ${
+                  isShared ? sharedText : 'text-gray-800 dark:text-gray-100'
+                }`}
+              >
+                {s.title || s.source || s.host || s.url}
+              </span>
+              <span className="block text-[10px] text-gray-400 dark:text-gray-500 truncate">{s.host}</span>
+            </a>
+          </li>
+        );
+      })}
     </ol>
+  );
+}
+
+// Colonne « Sources » : organique (gauche) et AI Overview (droite) côte à côte,
+// avec des flèches SVG reliant une même PAGE (URL) de l'organique vers sa
+// citation dans l'AI Overview. Le SVG vit dans le conteneur scrollable,
+// donc il défile avec le contenu et reste aligné.
+function SourcesPanel({
+  aioSources,
+  organicSources,
+  aioTitle,
+}: {
+  aioSources: SerpSource[];
+  organicSources: SerpSource[];
+  aioTitle: string;
+}) {
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const uid = useId().replace(/:/g, '');
+  const [lines, setLines] = useState<{ x1: number; y1: number; x2: number; y2: number }[]>([]);
+  const [size, setSize] = useState({ w: 0, h: 0 });
+
+  const aioKeys = new Set(aioSources.map((s) => normUrl(s.url)).filter(Boolean));
+  const shared = new Set(organicSources.map((s) => normUrl(s.url)).filter((k) => k && aioKeys.has(k)));
+  const sharedKey = [...shared].sort().join('\n');
+
+  const recompute = useCallback(() => {
+    const wrap = wrapRef.current;
+    if (!wrap) return;
+    const wr = wrap.getBoundingClientRect();
+    if (wr.width === 0 || wr.height === 0) return;
+    const esc = (h: string) =>
+      window.CSS && CSS.escape ? CSS.escape(h) : h.replace(/["\\]/g, '\\$&');
+    const next: { x1: number; y1: number; x2: number; y2: number }[] = [];
+    sharedKey
+      .split('\n')
+      .filter(Boolean)
+      .forEach((k) => {
+        const org = wrap.querySelector<HTMLElement>(`[data-col="org"][data-key="${esc(k)}"]`);
+        const aio = wrap.querySelector<HTMLElement>(`[data-col="aio"][data-key="${esc(k)}"]`);
+        if (!org || !aio) return;
+        const o = org.getBoundingClientRect();
+        const a = aio.getBoundingClientRect();
+        next.push({
+          x1: o.right - wr.left,
+          y1: o.top - wr.top + o.height / 2,
+          x2: a.left - wr.left,
+          y2: a.top - wr.top + a.height / 2,
+        });
+      });
+    setLines((prev) => (JSON.stringify(prev) === JSON.stringify(next) ? prev : next));
+    const w = wrap.offsetWidth;
+    const h = wrap.offsetHeight;
+    setSize((prev) => (prev.w === w && prev.h === h ? prev : { w, h }));
+  }, [sharedKey]);
+
+  useLayoutEffect(() => {
+    recompute();
+  }, [recompute, aioSources, organicSources]);
+
+  useEffect(() => {
+    const wrap = wrapRef.current;
+    if (!wrap) return;
+    const ro = new ResizeObserver(() => recompute());
+    ro.observe(wrap);
+    window.addEventListener('resize', recompute);
+    return () => {
+      ro.disconnect();
+      window.removeEventListener('resize', recompute);
+    };
+  }, [recompute]);
+
+  return (
+    <div className="p-4">
+      <h2 className="text-sm font-semibold text-gray-900 dark:text-white mb-2">
+        Résultats organiques <span className="font-normal text-gray-400">vs</span> Citations AIO
+      </h2>
+      <p className="text-xs leading-snug text-gray-500 dark:text-gray-400 mb-3">
+        Une flèche relie une source présente en organique (
+        <span className="font-medium text-green-600 dark:text-green-400">vert</span>) et citée dans
+        l'AI Overview (<span className="font-medium text-pink-600 dark:text-pink-400">rose</span>).
+      </p>
+
+      <div ref={wrapRef} className="relative">
+        <svg
+          width={size.w}
+          height={size.h}
+          viewBox={`0 0 ${size.w} ${size.h}`}
+          className="pointer-events-none absolute inset-0 z-10"
+          style={{ overflow: 'visible' }}
+        >
+          <defs>
+            <marker
+              id={`arw-${uid}`}
+              viewBox="0 0 10 10"
+              refX="8"
+              refY="5"
+              markerWidth="7"
+              markerHeight="7"
+              orient="auto-start-reverse"
+            >
+              <path d="M0,0 L10,5 L0,10 z" fill="#ec4899" />
+            </marker>
+            {lines.map((l, i) => (
+              <linearGradient
+                key={i}
+                id={`grad-${uid}-${i}`}
+                gradientUnits="userSpaceOnUse"
+                x1={l.x1}
+                y1={l.y1}
+                x2={l.x2}
+                y2={l.y2}
+              >
+                <stop offset="0%" stopColor="#22c55e" />
+                <stop offset="100%" stopColor="#ec4899" />
+              </linearGradient>
+            ))}
+          </defs>
+          {lines.map((l, i) => {
+            const dx = Math.max(14, Math.abs(l.x2 - l.x1) * 0.6);
+            return (
+              <path
+                key={i}
+                d={`M ${l.x1} ${l.y1} C ${l.x1 + dx} ${l.y1}, ${l.x2 - dx} ${l.y2}, ${l.x2} ${l.y2}`}
+                fill="none"
+                stroke={`url(#grad-${uid}-${i})`}
+                strokeWidth={1.5}
+                strokeOpacity={0.85}
+                markerEnd={`url(#arw-${uid})`}
+              />
+            );
+          })}
+        </svg>
+
+        <div className="grid grid-cols-2 gap-x-8">
+          <div className="min-w-0">
+            <h3 className="text-[11px] font-bold uppercase tracking-wide text-gray-700 dark:text-gray-200 mb-2">
+              Résultats organiques
+            </h3>
+            <SourceItems items={organicSources} emptyMsg="Aucun résultat organique." col="org" shared={shared} />
+          </div>
+          <div className="min-w-0">
+            <h3 className="text-[11px] font-bold uppercase tracking-wide text-gray-700 dark:text-gray-200 mb-2">
+              {aioTitle}
+            </h3>
+            <SourceItems items={aioSources} emptyMsg="Aucun AI Overview pour cette requête." col="aio" shared={shared} />
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -151,8 +333,7 @@ function CountrySelect({
 }
 
 export const AIOverviewPreviewPage: React.FC = () => {
-  const [keywords, setKeywords] = useState<string[]>(['']);
-  const [geo, setGeo] = useState('US');
+  const [rows, setRows] = useState<{ kw: string; geo: string }[]>([{ kw: '', geo: 'US' }]);
   const [device, setDevice] = useState<'desktop' | 'mobile'>('desktop');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -160,6 +341,7 @@ export const AIOverviewPreviewPage: React.FC = () => {
   const [activeTab, setActiveTab] = useState(0);
   const [viewed, setViewed] = useState<Set<number>>(new Set([0]));
   const [resultDevice, setResultDevice] = useState<'desktop' | 'mobile'>('desktop');
+  const [resultGeos, setResultGeos] = useState<string[]>([]);
   const [elapsed, setElapsed] = useState(0);
   const timerRef = useRef<number | null>(null);
   // Index du mot-clé affiché en plein écran (null = aucun).
@@ -175,12 +357,14 @@ export const AIOverviewPreviewPage: React.FC = () => {
     return () => window.removeEventListener('keydown', onKey);
   }, [fullscreen]);
 
-  const updateKeyword = (i: number, v: string) =>
-    setKeywords((ks) => ks.map((k, idx) => (idx === i ? v : k)));
-  const addKeyword = () =>
-    setKeywords((ks) => (ks.length < MAX_KEYWORDS ? [...ks, ''] : ks));
-  const removeKeyword = (i: number) =>
-    setKeywords((ks) => (ks.length > 1 ? ks.filter((_, idx) => idx !== i) : ks));
+  const updateKw = (i: number, v: string) =>
+    setRows((rs) => rs.map((r, idx) => (idx === i ? { ...r, kw: v } : r)));
+  const updateGeo = (i: number, v: string) =>
+    setRows((rs) => rs.map((r, idx) => (idx === i ? { ...r, geo: v } : r)));
+  const addRow = () =>
+    setRows((rs) => (rs.length < MAX_KEYWORDS ? [...rs, { kw: '', geo: rs[rs.length - 1]?.geo || 'US' }] : rs));
+  const removeRow = (i: number) =>
+    setRows((rs) => (rs.length > 1 ? rs.filter((_, idx) => idx !== i) : rs));
 
   const activateTab = (i: number) => {
     setActiveTab(i);
@@ -190,18 +374,13 @@ export const AIOverviewPreviewPage: React.FC = () => {
   const onSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
-    const seen = new Set<string>();
-    const kws = keywords
-      .map((k) => k.trim())
-      .filter((k) => {
-        const low = k.toLowerCase();
-        if (!k || seen.has(low)) return false;
-        seen.add(low);
-        return true;
-      })
+    // Doublons autorisés ; chaque ligne a son propre pays.
+    const queries = rows
+      .map((r) => ({ keyword: r.kw.trim(), geo: r.geo }))
+      .filter((q) => q.keyword.length > 0)
       .slice(0, MAX_KEYWORDS);
 
-    if (kws.length === 0) {
+    if (queries.length === 0) {
       setError('Veuillez saisir au moins un mot-clé.');
       return;
     }
@@ -211,6 +390,7 @@ export const AIOverviewPreviewPage: React.FC = () => {
     setActiveTab(0);
     setViewed(new Set([0]));
     setResultDevice(device);
+    setResultGeos(queries.map((q) => q.geo));
     setFullscreen(null);
 
     const t0 = performance.now();
@@ -222,7 +402,7 @@ export const AIOverviewPreviewPage: React.FC = () => {
     );
 
     try {
-      const data = await getSerpPreview({ keywords: kws, geo, device });
+      const data = await getSerpPreview({ queries, device });
       setResults(data.results || []);
       setActiveTab(0);
       setViewed(new Set([0]));
@@ -240,6 +420,7 @@ export const AIOverviewPreviewPage: React.FC = () => {
   const cardClass =
     'bg-white dark:bg-gray-800 rounded-2xl border border-gray-200 dark:border-gray-700 shadow-sm';
   const fsResult = fullscreen !== null ? results[fullscreen] : undefined;
+  const fsGeo = fullscreen !== null ? resultGeos[fullscreen] || '' : '';
 
   return (
     <>
@@ -262,25 +443,28 @@ export const AIOverviewPreviewPage: React.FC = () => {
       {/* Formulaire */}
       <form onSubmit={onSubmit} className={`${cardClass} p-5 space-y-4`}>
         <div className="flex flex-col lg:flex-row gap-4 lg:items-start">
-          {/* Mots-clés */}
+          {/* Mots-clés + pays (un pays par mot-clé) */}
           <div className="flex-1 min-w-0">
             <label className="block text-sm font-medium text-gray-700 dark:text-gray-100 mb-1.5">
-              Mots-clés <span className="text-xs text-gray-400">(jusqu'à {MAX_KEYWORDS})</span>
+              Mots-clés &amp; pays <span className="text-xs text-gray-400">(jusqu'à {MAX_KEYWORDS})</span>
             </label>
             <div className="space-y-2">
-              {keywords.map((kw, i) => (
+              {rows.map((r, i) => (
                 <div key={i} className="flex items-center gap-2">
                   <input
                     type="text"
-                    value={kw}
-                    onChange={(e) => updateKeyword(i, e.target.value)}
+                    value={r.kw}
+                    onChange={(e) => updateKw(i, e.target.value)}
                     placeholder="Saisissez un mot-clé…"
                     className={INPUT_CLASS}
                   />
-                  {keywords.length > 1 && (
+                  <div className="w-44 flex-shrink-0">
+                    <CountrySelect value={r.geo} onChange={(v) => updateGeo(i, v)} options={GEO_OPTIONS} />
+                  </div>
+                  {rows.length > 1 && (
                     <button
                       type="button"
-                      onClick={() => removeKeyword(i)}
+                      onClick={() => removeRow(i)}
                       title="Retirer"
                       aria-label="Retirer ce mot-clé"
                       className="flex-shrink-0 w-10 h-10 flex items-center justify-center rounded-xl border border-gray-300 dark:border-gray-600 text-gray-500 hover:text-red-600 hover:border-red-400 transition-colors"
@@ -293,22 +477,14 @@ export const AIOverviewPreviewPage: React.FC = () => {
             </div>
             <button
               type="button"
-              onClick={addKeyword}
-              disabled={keywords.length >= MAX_KEYWORDS}
+              onClick={addRow}
+              disabled={rows.length >= MAX_KEYWORDS}
               title="Ajouter un mot-clé"
               aria-label="Ajouter un mot-clé"
               className="mt-2 w-9 h-9 flex items-center justify-center rounded-xl border border-dashed border-gray-300 dark:border-gray-600 text-brand-primary hover:bg-brand-primary/5 disabled:opacity-40 disabled:cursor-default transition-colors"
             >
               <Plus className="w-5 h-5" />
             </button>
-          </div>
-
-          {/* Pays */}
-          <div className="lg:w-56">
-            <label className="block text-sm font-medium text-gray-700 dark:text-gray-100 mb-1.5">
-              Pays
-            </label>
-            <CountrySelect value={geo} onChange={setGeo} options={GEO_OPTIONS} />
           </div>
 
           {/* Appareil */}
@@ -383,6 +559,9 @@ export const AIOverviewPreviewPage: React.FC = () => {
                       : 'border-transparent text-gray-500 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200'
                   } ${!r.ok ? 'text-red-600 dark:text-red-400' : ''}`}
                 >
+                  <span style={{ fontFamily: FLAG_FONT_FAMILY }} className="mr-1.5">
+                    {codeToFlag(resultGeos[i] || '')}
+                  </span>
                   {r.keyword}
                 </button>
               ))}
@@ -433,22 +612,13 @@ export const AIOverviewPreviewPage: React.FC = () => {
                     )}
                   </div>
 
-                  {/* Colonne Sources */}
-                  <aside className="w-80 flex-shrink-0 h-full overflow-y-auto border-l border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900/40 p-4">
-                    <p className="flex items-start gap-1.5 text-xs leading-snug text-gray-500 dark:text-gray-400 mb-4">
-                      <span className="mt-0.5 w-3 h-3 flex-shrink-0 rounded-[3px] bg-green-50 border border-green-300 dark:bg-green-900/30 dark:border-green-700" />
-                      URL présent à la fois dans l'AI Overview et en 1ère page organique Google
-                    </p>
-
-                    <h3 className="text-xs font-bold uppercase tracking-wide text-gray-700 dark:text-gray-200 mb-2">
-                      {aioTitle}
-                    </h3>
-                    <SourceList items={r.aio_sources} emptyMsg="Aucun AI Overview pour cette requête." />
-
-                    <h3 className="text-xs font-bold uppercase tracking-wide text-gray-700 dark:text-gray-200 mt-5 mb-2">
-                      Résultats organiques
-                    </h3>
-                    <SourceList items={r.organic_sources} emptyMsg="Aucun résultat organique." />
+                  {/* Colonne Sources : organique -> AI Overview reliés par des flèches */}
+                  <aside className="w-[420px] flex-shrink-0 h-full overflow-y-auto border-l border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900/40">
+                    <SourcesPanel
+                      aioSources={r.aio_sources}
+                      organicSources={r.organic_sources}
+                      aioTitle={aioTitle}
+                    />
                   </aside>
                 </div>
               );
@@ -477,7 +647,8 @@ export const AIOverviewPreviewPage: React.FC = () => {
               {fsResult.keyword}
             </span>
             <span className="hidden sm:inline text-xs text-gray-400 flex-shrink-0">
-              · {resultDevice === 'mobile' ? 'Mobile' : 'Ordinateur'}
+              · <span style={{ fontFamily: FLAG_FONT_FAMILY }}>{codeToFlag(fsGeo)}</span>{' '}
+              {resultDevice === 'mobile' ? 'Mobile' : 'Ordinateur'}
             </span>
           </div>
           <button

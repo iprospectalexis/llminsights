@@ -173,9 +173,13 @@ export interface SerpPreviewResult {
   error?: string | null;
 }
 
-export interface SerpPreviewPayload {
-  keywords: string[];           // jusqu'à 5
+export interface SerpQuery {
+  keyword: string;
   geo: string;                  // code pays ISO-2, ex. "US"
+}
+
+export interface SerpPreviewPayload {
+  queries: SerpQuery[];         // jusqu'à 5, un pays par mot-clé
   device: 'desktop' | 'mobile';
 }
 

@@ -24,9 +24,13 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-class SerpPreviewRequest(BaseModel):
-    keywords: List[str] = Field(default_factory=list)
+class SerpQuery(BaseModel):
+    keyword: str = ""
     geo: str = "US"
+
+
+class SerpPreviewRequest(BaseModel):
+    queries: List[SerpQuery] = Field(default_factory=list)
     device: str = "desktop"
 
 
@@ -57,7 +61,8 @@ class SerpPreviewResponse(BaseModel):
 @router.post("/preview", response_model=SerpPreviewResponse)
 async def serp_preview(req: SerpPreviewRequest):
     device = req.device if req.device in ("desktop", "mobile") else "desktop"
-    results = await fetch_previews(req.keywords[:MAX_KEYWORDS], req.geo, device)
+    queries = [(q.keyword, q.geo) for q in req.queries[:MAX_KEYWORDS]]
+    results = await fetch_previews(queries, device)
     return {"results": results}
 
 

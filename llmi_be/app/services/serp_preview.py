@@ -235,21 +235,18 @@ async def _fetch_one(keyword: str, country: str, device: str) -> dict:
     }
 
 
-async def fetch_previews(keywords: list, country: str, device: str) -> list:
-    """Récupère la preview (page + sources) pour chaque mot-clé, en parallèle."""
-    kws, seen = [], set()
-    for kw in keywords:
-        k = (kw or "").strip()
-        low = k.lower()
-        if k and low not in seen:
-            seen.add(low)
-            kws.append(k)
-    kws = kws[:MAX_KEYWORDS]
+async def fetch_previews(queries: list, device: str) -> list:
+    """Récupère la preview (page + sources) pour chaque (mot-clé, pays).
+
+    `queries` : liste de tuples (keyword, geo). Doublons autorisés ; chaque
+    requête a son propre pays."""
+    pairs = [((str(k or "").strip()), (g or "US")) for (k, g) in queries]
+    pairs = [(k, g) for (k, g) in pairs if k][:MAX_KEYWORDS]
 
     sem = asyncio.Semaphore(getattr(settings, "dataforseo_max_concurrent", 10) or 5)
 
-    async def _bounded(kw):
+    async def _bounded(kw, geo):
         async with sem:
-            return await _fetch_one(kw, country, device)
+            return await _fetch_one(kw, geo, device)
 
-    return list(await asyncio.gather(*[_bounded(kw) for kw in kws]))
+    return list(await asyncio.gather(*[_bounded(k, g) for (k, g) in pairs]))
