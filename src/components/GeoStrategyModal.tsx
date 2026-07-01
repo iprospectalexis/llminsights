@@ -91,8 +91,10 @@ export const GeoStrategyModal: React.FC<{ open: boolean; onClose: () => void }> 
             <Sparkles className="w-3.5 h-3.5" /> GEO
           </span>
           <h2 className="mt-3 text-xl font-bold text-gray-900 dark:text-white">Votre stratégie GEO</h2>
-          <p className="mt-1.5 text-sm text-gray-500 dark:text-gray-400">
-            État des lieux de votre visibilité dans les moteurs IA et recommandations GEO actionnables.
+          <p className="mt-2 text-sm leading-relaxed text-gray-500 dark:text-gray-400">
+            Bonjour ! Nous sommes l'équipe OneSearch d'iProspect France. Si vous souhaitez un état des
+            lieux de votre visibilité dans les moteurs IA et des recommandations GEO actionnables,
+            n'hésitez pas à remplir ce formulaire.
           </p>
 
           {status === 'ok' ? (
