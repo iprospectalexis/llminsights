@@ -90,23 +90,64 @@ def _normalize(text: str) -> str:
     return _WS_RE.sub(" ", text).strip().lower()
 
 
+def _gather_refs(aio: dict) -> list:
+    """Toutes les références (sources) citées par l'AI Overview, à plat."""
+    refs = list(aio.get("references") or [])
+    for el in (aio.get("items") or []):
+        refs.extend(el.get("references") or [])
+        for ln in (el.get("links") or []):
+            if ln.get("url"):
+                refs.append({"url": ln.get("url"), "title": ln.get("title"),
+                             "domain": ln.get("domain"), "source": None})
+    return refs
+
+
+def _aio_ref_hosts(aio: dict) -> set:
+    hosts = set()
+    for ref in _gather_refs(aio):
+        h = (ref.get("domain") or host_of(ref.get("url") or "")).lower()
+        if h.startswith("www."):
+            h = h[4:]
+        if h:
+            hosts.add(h)
+    return hosts
+
+
 def _aio_rendered_in_html(aio: dict, html: str) -> bool:
-    """Vrai si le texte de l'AI Overview apparaît dans le HTML de l'iframe."""
+    """Vrai si l'AI Overview de `/advanced` correspond à un AIO réellement
+    affiché dans le HTML de l'iframe.
+
+    Les deux endpoints sont des requêtes Google indépendantes : pour un même
+    mot-clé l'AIO existe des deux côtés, mais sa *formulation* diffère souvent.
+    On accepte donc deux signaux (l'un OU l'autre suffit) :
+      1. texte   — un 7-gramme du texte de l'AIO apparaît dans le HTML ;
+      2. sources — au moins 2 domaines cités par l'AIO apparaissent dans le
+                   HTML (même AIO, rédaction différente → mêmes sources citées).
+    """
     if not html:
         return False
+    html_norm = _normalize(html)
+
+    # Signal 1 — chevauchement de texte (formulation identique).
     text = aio.get("markdown") or ""
     if not text:
         text = " ".join(
             (el.get("snippet") or el.get("text") or "") for el in (aio.get("items") or [])
         )
     words = _normalize(text).split()
-    if len(words) < 7:
-        return False
-    html_norm = _normalize(html)
-    step = max(1, (len(words) - 7) // 5)
-    for i in range(0, len(words) - 6, step):
-        if " ".join(words[i:i + 7]) in html_norm:
+    if len(words) >= 7:
+        step = max(1, (len(words) - 7) // 5)
+        for i in range(0, len(words) - 6, step):
+            if " ".join(words[i:i + 7]) in html_norm:
+                return True
+
+    # Signal 2 — chevauchement des sources citées (formulation différente).
+    hosts = _aio_ref_hosts(aio)
+    if len(hosts) >= 2:
+        html_lower = html.lower()
+        if sum(1 for h in hosts if h in html_lower) >= 2:
             return True
+
     return False
 
 
@@ -129,14 +170,7 @@ def _extract_sources(items: list, html: str):
     aio = next((it for it in items if it.get("type") == "ai_overview"), None)
     if aio and _aio_rendered_in_html(aio, html):
         seen = set()
-        refs = list(aio.get("references") or [])
-        for el in (aio.get("items") or []):
-            refs.extend(el.get("references") or [])
-            for ln in (el.get("links") or []):
-                if ln.get("url"):
-                    refs.append({"url": ln.get("url"), "title": ln.get("title"),
-                                 "domain": ln.get("domain"), "source": None})
-        for ref in refs:
+        for ref in _gather_refs(aio):
             url = ref.get("url")
             if not url or url in seen:
                 continue
