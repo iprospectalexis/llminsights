@@ -27,9 +27,9 @@ export const AIOverviewPublicPage: React.FC = () => {
           <button
             type="button"
             onClick={() => setGeoOpen(true)}
-            className="inline-flex items-center gap-2 rounded-lg bg-gradient-to-r from-brand-primary to-fuchsia-500 px-4 py-2 text-sm font-semibold text-white shadow-sm transition-opacity hover:opacity-90"
+            className="group inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-indigo-500 via-fuchsia-500 to-pink-500 bg-[length:200%_auto] px-5 py-2.5 text-sm font-semibold text-white shadow-lg shadow-fuchsia-500/40 ring-1 ring-white/20 transition-all duration-300 hover:-translate-y-0.5 hover:bg-right hover:shadow-xl hover:shadow-fuchsia-500/60 focus:outline-none focus:ring-2 focus:ring-fuchsia-400 focus:ring-offset-2 dark:focus:ring-offset-gray-800"
           >
-            <Sparkles className="w-4 h-4" />
+            <Sparkles className="w-4 h-4 transition-transform duration-300 group-hover:rotate-12 group-hover:scale-110" />
             <span className="hidden sm:inline">Votre stratégie GEO</span>
             <span className="sm:hidden">Stratégie GEO</span>
           </button>
