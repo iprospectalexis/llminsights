@@ -1,14 +1,18 @@
 """SERP "AI Overview Preview" — page HTML Google + sources (AIO + organique).
 
-Pour un mot-clé / pays / appareil, on appelle DataForSEO en parallèle :
-  • /v3/serp/google/organic/live/html     → la page HTML (pour l'iframe),
-    avec load_async_ai_overview + expand_ai_overview.
-  • /v3/serp/google/organic/live/advanced → données structurées (références de
-    l'AI Overview + résultats organiques) pour la colonne « Sources ».
+Pour un mot-clé / pays / appareil, on récupère TOUT depuis un SEUL fetch Google
+(recommandation du support DataForSEO), ce qui garantit que l'iframe et la
+colonne « Sources » proviennent exactement du même résultat :
 
-On n'expose les sources de l'AI Overview QUE si l'AIO est réellement présent
-dans le HTML servi à l'iframe (les deux endpoints sont des requêtes Google
-distinctes et non déterministes ; cf. `_aio_rendered_in_html`).
+  1. /v3/serp/google/organic/live/html              → la page HTML (pour
+     l'iframe) avec load_async_ai_overview + expand_ai_overview ; la réponse
+     fournit aussi un `task id`.
+  2. /v3/serp/google/organic/task_get/advanced/{id} → données structurées
+     (références de l'AI Overview + résultats organiques) DU MÊME fetch.
+
+Comme les deux proviennent du même résultat Google, plus besoin d'heuristique
+pour deviner si l'AIO du JSON correspond à celui du HTML : s'il est présent dans
+l'un, il l'est dans l'autre (texte et sources identiques).
 
 Réutilise la config et la carte pays de `dataforseo_client`. Indépendant du
 pipeline d'audit (temps réel, pas de persistance).
@@ -18,7 +22,6 @@ import asyncio
 import base64
 import logging
 import re
-from html import unescape
 from urllib.parse import urlparse
 
 import httpx
@@ -30,7 +33,7 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 HTML_PATH = "/v3/serp/google/organic/live/html"
-ADVANCED_PATH = "/v3/serp/google/organic/live/advanced"
+TASK_GET_ADVANCED_PATH = "/v3/serp/google/organic/task_get/advanced/"
 
 # Pays manquants dans dataforseo_client.COUNTRY_LOCATION_LANG.
 _EXTRA_LOCATION_LANG = {"JP": (2392, "ja")}
@@ -41,9 +44,6 @@ _BASE_TAGS = '<base href="https://www.google.com/"><base target="_blank">'
 _HEAD_RE = re.compile(r"(<head\b[^>]*>)", re.IGNORECASE)
 _HTML_RE = re.compile(r"(<html\b[^>]*>)", re.IGNORECASE)
 _NOSCRIPT_RE = re.compile(r"<noscript\b[^>]*>.*?</noscript>", re.IGNORECASE | re.DOTALL)
-_TAG_RE = re.compile(r"<[^>]+>")
-_NONWORD_RE = re.compile(r"[^\w\s]", re.UNICODE)
-_WS_RE = re.compile(r"\s+")
 
 
 def _auth_headers() -> dict:
@@ -83,13 +83,6 @@ def prepare_for_iframe(html: str) -> str:
     return "<head>" + _BASE_TAGS + "</head>" + html
 
 
-def _normalize(text: str) -> str:
-    text = unescape(text or "")
-    text = _TAG_RE.sub(" ", text)
-    text = _NONWORD_RE.sub(" ", text)
-    return _WS_RE.sub(" ", text).strip().lower()
-
-
 def _gather_refs(aio: dict) -> list:
     """Toutes les références (sources) citées par l'AI Overview, à plat."""
     refs = list(aio.get("references") or [])
@@ -100,55 +93,6 @@ def _gather_refs(aio: dict) -> list:
                 refs.append({"url": ln.get("url"), "title": ln.get("title"),
                              "domain": ln.get("domain"), "source": None})
     return refs
-
-
-def _aio_ref_hosts(aio: dict) -> set:
-    hosts = set()
-    for ref in _gather_refs(aio):
-        h = (ref.get("domain") or host_of(ref.get("url") or "")).lower()
-        if h.startswith("www."):
-            h = h[4:]
-        if h:
-            hosts.add(h)
-    return hosts
-
-
-def _aio_rendered_in_html(aio: dict, html: str) -> bool:
-    """Vrai si l'AI Overview de `/advanced` correspond à un AIO réellement
-    affiché dans le HTML de l'iframe.
-
-    Les deux endpoints sont des requêtes Google indépendantes : pour un même
-    mot-clé l'AIO existe des deux côtés, mais sa *formulation* diffère souvent.
-    On accepte donc deux signaux (l'un OU l'autre suffit) :
-      1. texte   — un 7-gramme du texte de l'AIO apparaît dans le HTML ;
-      2. sources — au moins 2 domaines cités par l'AIO apparaissent dans le
-                   HTML (même AIO, rédaction différente → mêmes sources citées).
-    """
-    if not html:
-        return False
-    html_norm = _normalize(html)
-
-    # Signal 1 — chevauchement de texte (formulation identique).
-    text = aio.get("markdown") or ""
-    if not text:
-        text = " ".join(
-            (el.get("snippet") or el.get("text") or "") for el in (aio.get("items") or [])
-        )
-    words = _normalize(text).split()
-    if len(words) >= 7:
-        step = max(1, (len(words) - 7) // 5)
-        for i in range(0, len(words) - 6, step):
-            if " ".join(words[i:i + 7]) in html_norm:
-                return True
-
-    # Signal 2 — chevauchement des sources citées (formulation différente).
-    hosts = _aio_ref_hosts(aio)
-    if len(hosts) >= 2:
-        html_lower = html.lower()
-        if sum(1 for h in hosts if h in html_lower) >= 2:
-            return True
-
-    return False
 
 
 def _src(url, title, source, fallback_domain):
@@ -163,12 +107,16 @@ def _src(url, title, source, fallback_domain):
     }
 
 
-def _extract_sources(items: list, html: str):
-    """items 'advanced' + html → (aio_sources, organic_sources)."""
+def _extract_sources(items: list):
+    """items 'advanced' (MÊME fetch que le HTML) → (aio_sources, organic_sources).
+
+    Plus d'heuristique : l'AIO structuré provient du même résultat Google que le
+    HTML de l'iframe (task_get/advanced sur l'id du live/html), donc s'il est
+    présent ici il l'est aussi dans l'iframe."""
     aio_sources, organic_sources = [], []
 
     aio = next((it for it in items if it.get("type") == "ai_overview"), None)
-    if aio and _aio_rendered_in_html(aio, html):
+    if aio:
         seen = set()
         for ref in _gather_refs(aio):
             url = ref.get("url")
@@ -213,6 +161,23 @@ async def _post_task(client: httpx.AsyncClient, path: str, payload: list) -> dic
     return task
 
 
+async def _get_task(client: httpx.AsyncClient, path: str, tries: int = 4) -> dict:
+    """GET task_get/… ; relance brièvement si le résultat n'est pas encore prêt.
+    En pratique il l'est immédiatement pour une tâche live déjà terminée."""
+    last = {}
+    for attempt in range(tries):
+        resp = await client.get(
+            f"{settings.dataforseo_base_url.rstrip('/')}{path}", headers=_auth_headers()
+        )
+        resp.raise_for_status()
+        last = ((resp.json().get("tasks") or [{}])[0]) or {}
+        if last.get("status_code") == 20000 and last.get("result"):
+            return last
+        if attempt < tries - 1:
+            await asyncio.sleep(2.0)
+    raise RuntimeError(f"DataForSEO task_get {last.get('status_code')}: {last.get('status_message')}")
+
+
 def _first_items(task: dict) -> list:
     res = (task.get("result") or [{}])[0] or {}
     return res.get("items") or []
@@ -228,44 +193,37 @@ async def _fetch_one(keyword: str, country: str, device: str) -> dict:
         "device": dev, "os": os_name,
         "load_async_ai_overview": True, "expand_ai_overview": True,
     }]
-    adv_payload = [{
-        "keyword": keyword, "location_code": location_code, "language_code": language_code,
-        "device": dev, "os": os_name, "depth": 20, "load_async_ai_overview": True,
-    }]
     timeout = httpx.Timeout(120.0, connect=15.0)
 
+    aio_sources, organic_sources = [], []
+    html = ""
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            html_task, adv_task = await asyncio.gather(
-                _post_task(client, HTML_PATH, html_payload),
-                _post_task(client, ADVANCED_PATH, adv_payload),
-                return_exceptions=True,
-            )
+            # 1) UN seul fetch Google : live/html → page HTML (iframe) + task id.
+            html_task = await _post_task(client, HTML_PATH, html_payload)
+            task_id = html_task.get("id")
+
+            items_html = _first_items(html_task)
+            raw_html = items_html[0].get("html") if items_html and isinstance(items_html[0], dict) else ""
+            html = prepare_for_iframe(raw_html or "")
+            if not html.strip():
+                return {"keyword": keyword, "ok": False, "error": "Réponse vide de Google. Réessayez.",
+                        "html": "", "aio_sources": [], "organic_sources": [], "has_aio": False}
+
+            # 2) Sources structurées DU MÊME fetch : task_get/advanced/{id}.
+            if task_id:
+                try:
+                    adv_task = await _get_task(client, TASK_GET_ADVANCED_PATH + str(task_id))
+                    aio_sources, organic_sources = _extract_sources(_first_items(adv_task))
+                except Exception as exc:  # pragma: no cover - sources best-effort
+                    logger.warning("SERP preview task_get/advanced failed (%r): %r", keyword, exc)
     except Exception as exc:  # pragma: no cover - garde-fou réseau
         logger.warning("SERP preview fetch failed (%r): %r", keyword, exc)
-        return {"keyword": keyword, "ok": False, "error": "Erreur réseau.",
-                "html": "", "aio_sources": [], "organic_sources": [], "has_aio": False}
-
-    if isinstance(html_task, Exception):
-        logger.warning("SERP preview html error (%r): %r", keyword, html_task)
         return {"keyword": keyword, "ok": False,
                 "error": "Impossible de récupérer la page Google. Réessayez.",
                 "html": "", "aio_sources": [], "organic_sources": [], "has_aio": False}
 
-    items_html = _first_items(html_task)
-    html = items_html[0].get("html") if items_html and isinstance(items_html[0], dict) else ""
-    html = prepare_for_iframe(html or "")
-    if not html.strip():
-        return {"keyword": keyword, "ok": False, "error": "Réponse vide de Google. Réessayez.",
-                "html": "", "aio_sources": [], "organic_sources": [], "has_aio": False}
-
-    aio_sources, organic_sources = [], []
-    if not isinstance(adv_task, Exception):
-        aio_sources, organic_sources = _extract_sources(_first_items(adv_task), html)
-    else:
-        logger.warning("SERP preview advanced error (%r): %r", keyword, adv_task)
     _mark_shared(aio_sources, organic_sources)
-
     return {
         "keyword": keyword,
         "ok": True,
