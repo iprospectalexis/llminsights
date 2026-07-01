@@ -187,6 +187,20 @@ export function getSerpPreview(payload: SerpPreviewPayload, signal?: AbortSignal
   });
 }
 
+// ── Lead "Votre stratégie GEO" ───────────────────────────────
+
+export interface GeoLeadPayload {
+  first_name: string;
+  last_name: string;
+  email: string;
+  phone: string;
+  message: string;
+}
+
+export function submitGeoLead(payload: GeoLeadPayload) {
+  return request<{ ok: boolean }>('/v1/serp/lead', { method: 'POST', body: payload });
+}
+
 // ── Health ────────────────────────────────────────────────────
 
 export function checkHealth() {

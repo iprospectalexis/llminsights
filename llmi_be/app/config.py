@@ -101,7 +101,15 @@ class Settings(BaseSettings):
     webhook_timeout: int = 30
     webhook_max_retries: int = 3
     webhook_secret: Optional[str] = None
-    
+
+    # SMTP — formulaire public "Votre stratégie GEO" (lead → e-mail).
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_user: str = ""
+    smtp_password: str = ""
+    smtp_from: str = ""  # expéditeur affiché ; défaut = smtp_user si vide
+    lead_email_to: str = "aliaksei.rylko@iprospect.com"
+
     @property
     def database_url(self) -> str:
         if self.database_url_override:
