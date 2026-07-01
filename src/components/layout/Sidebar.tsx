@@ -656,6 +656,33 @@ export const Sidebar: React.FC<SidebarProps> = ({ user, userProfile, isOpen, onT
                 )}
               </AnimatePresence>
             </NavLink>
+            <NavLink
+              to="/ai-overview"
+              className={`
+                flex items-center px-3 py-2.5 text-sm font-medium rounded-xl transition-all duration-200
+                ${location.pathname === '/ai-overview'
+                  ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-100'
+                  : 'text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800'
+                }
+                ${effectiveCollapsed ? 'justify-center' : ''}
+              `}
+              title={effectiveCollapsed ? 'AI Overview' : ''}
+            >
+              <Eye className={`w-5 h-5 ${effectiveCollapsed ? '' : 'mr-3'} flex-shrink-0`} />
+              <AnimatePresence>
+                {!effectiveCollapsed && (
+                  <motion.span
+                    initial={{ opacity: 0, width: 0 }}
+                    animate={{ opacity: 1, width: 'auto' }}
+                    exit={{ opacity: 0, width: 0 }}
+                    transition={{ duration: 0.2 }}
+                    className="overflow-hidden whitespace-nowrap"
+                  >
+                    AI Overview
+                  </motion.span>
+                )}
+              </AnimatePresence>
+            </NavLink>
             {(() => {
               const isBarometersActive = location.pathname.startsWith('/barometers');
               const isBarometersExpanded = expandedItems.includes('Barometers');

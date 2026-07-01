@@ -3,6 +3,7 @@ from fastapi import APIRouter
 from app.api.v1.endpoints.jobs import router as jobs_router
 from app.api.v1.endpoints.api_keys import router as api_keys_router
 from app.api.v1.endpoints.audits import router as audits_router
+from app.api.v1.endpoints.serp import router as serp_router
 
 api_router = APIRouter()
 
@@ -22,4 +23,10 @@ api_router.include_router(
     audits_router,
     prefix="/audits",
     tags=["Audits"],
+)
+
+api_router.include_router(
+    serp_router,
+    prefix="/serp",
+    tags=["SERP"],
 )

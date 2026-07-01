@@ -20,6 +20,7 @@ import { ProjectSettingsPage } from './pages/ProjectSettingsPage';
 import { PromptDetailPage } from './pages/PromptDetailPage';
 import { DomainDetailPage } from './pages/DomainDetailPage';
 import { PromptFinderPage } from './pages/PromptFinderPage';
+import { AIOverviewPreviewPage } from './pages/AIOverviewPreviewPage';
 import { GroupsPage } from './pages/GroupsPage';
 import { TeamPage } from './pages/TeamPage';
 import { AccountPage } from './pages/AccountPage';
@@ -30,6 +31,7 @@ import { SettingsPage } from './pages/SettingsPage';
 import { CostsPage } from './pages/admin/CostsPage';
 import { TicketsPage } from './pages/TicketsPage';
 import ReportDetailPage from './pages/ReportDetailPage';
+import { AIOverviewPublicPage } from './pages/AIOverviewPublicPage';
 import './i18n';
 
 function App() {
@@ -45,11 +47,14 @@ function App() {
             {/* Public routes */}
             <Route path="/signin" element={<SignInForm />} />
             <Route path="/signup" element={<SignUpForm />} />
+            {/* Outil public (sans connexion) : header minimal + page */}
+            <Route path="/aio-preview" element={<AIOverviewPublicPage />} />
 
           {/* Protected routes */}
           <Route path="/" element={<AppLayout />}>
             <Route index element={<Navigate to="/projects" replace />} />
             <Route path="prompt-finder" element={<PromptFinderPage />} />
+            <Route path="ai-overview" element={<AIOverviewPreviewPage />} />
             <Route path="projects" element={<ProjectsPage />} />
             <Route path="projects/:id" element={<ProjectDetailPage />} />
             <Route path="projects/:id/overview" element={<ProjectOverviewPage />} />

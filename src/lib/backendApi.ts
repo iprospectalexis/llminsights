@@ -153,6 +153,40 @@ export function recoverPollingAudit(auditId: string) {
   });
 }
 
+// ── SERP / AI Overview Preview ───────────────────────────────
+
+export interface SerpSource {
+  title: string;
+  url: string;
+  source: string;
+  host: string;
+  shared: boolean;
+}
+
+export interface SerpPreviewResult {
+  keyword: string;
+  ok: boolean;
+  html: string;
+  aio_sources: SerpSource[];
+  organic_sources: SerpSource[];
+  has_aio: boolean;
+  error?: string | null;
+}
+
+export interface SerpPreviewPayload {
+  keywords: string[];           // jusqu'à 5
+  geo: string;                  // code pays ISO-2, ex. "US"
+  device: 'desktop' | 'mobile';
+}
+
+export function getSerpPreview(payload: SerpPreviewPayload, signal?: AbortSignal) {
+  return request<{ results: SerpPreviewResult[] }>('/v1/serp/preview', {
+    method: 'POST',
+    body: payload,
+    signal,
+  });
+}
+
 // ── Health ────────────────────────────────────────────────────
 
 export function checkHealth() {
