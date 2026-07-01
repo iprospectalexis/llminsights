@@ -9,6 +9,8 @@ const FIELD =
 const LABEL = 'block text-xs font-medium text-gray-600 dark:text-gray-300 mb-1';
 
 const DEFAULT_MESSAGE = 'Je souhaite savoir plus sur votre offre GEO.';
+const IP_LOGO_URL =
+  'https://iprospect-fr.com/hs-fs/hubfs/iP_Logo_Carbon_dentsu-3.png?width=161&height=41&name=iP_Logo_Carbon_dentsu-3.png';
 
 /**
  * Modale "Votre stratégie GEO" : formulaire de contact / lead. Les envois
@@ -80,6 +82,11 @@ export const GeoStrategyModal: React.FC<{ open: boolean; onClose: () => void }> 
         </button>
 
         <div className="px-7 pt-7 pb-6">
+          <img
+            src={IP_LOGO_URL}
+            alt="iProspect"
+            className="mb-5 h-7 w-auto dark:brightness-0 dark:invert"
+          />
           <span className="inline-flex items-center gap-1.5 rounded-full bg-brand-primary/10 text-brand-primary px-3 py-1 text-xs font-semibold">
             <Sparkles className="w-3.5 h-3.5" /> GEO
           </span>
