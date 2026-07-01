@@ -1,5 +1,5 @@
-import React, { useRef, useState } from 'react';
-import { Plus, X, Monitor, Smartphone, Search, Loader2 } from 'lucide-react';
+import React, { useRef, useState, useEffect } from 'react';
+import { Plus, X, Monitor, Smartphone, Search, Loader2, Maximize2 } from 'lucide-react';
 import { Button } from '../components/ui/Button';
 import { getSerpPreview } from '../lib/backendApi';
 import type { SerpPreviewResult, SerpSource } from '../lib/backendApi';
@@ -73,6 +73,18 @@ export const AIOverviewPreviewPage: React.FC = () => {
   const [resultDevice, setResultDevice] = useState<'desktop' | 'mobile'>('desktop');
   const [elapsed, setElapsed] = useState(0);
   const timerRef = useRef<number | null>(null);
+  // Index du mot-clé affiché en plein écran (null = aucun).
+  const [fullscreen, setFullscreen] = useState<number | null>(null);
+
+  // Fermer le plein écran avec la touche Échap.
+  useEffect(() => {
+    if (fullscreen === null) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setFullscreen(null);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [fullscreen]);
 
   const updateKeyword = (i: number, v: string) =>
     setKeywords((ks) => ks.map((k, idx) => (idx === i ? v : k)));
@@ -110,6 +122,7 @@ export const AIOverviewPreviewPage: React.FC = () => {
     setActiveTab(0);
     setViewed(new Set([0]));
     setResultDevice(device);
+    setFullscreen(null);
 
     const t0 = performance.now();
     setElapsed(0);
@@ -137,8 +150,10 @@ export const AIOverviewPreviewPage: React.FC = () => {
 
   const cardClass =
     'bg-white dark:bg-gray-800 rounded-2xl border border-gray-200 dark:border-gray-700 shadow-sm';
+  const fsResult = fullscreen !== null ? results[fullscreen] : undefined;
 
   return (
+    <>
     <div className="p-6 space-y-6">
       <div>
         <h1 className="text-2xl font-semibold text-gray-900 dark:text-white">AI Overview Preview</h1>
@@ -304,10 +319,21 @@ export const AIOverviewPreviewPage: React.FC = () => {
                 <div key={i} className={i === activeTab ? 'flex h-[70vh]' : 'hidden'}>
                   {/* Colonne SERP */}
                   <div
-                    className={`flex-1 min-w-0 h-full bg-white ${
+                    className={`relative flex-1 min-w-0 h-full bg-white ${
                       resultDevice === 'mobile' ? 'flex justify-center py-4 bg-gray-100 dark:bg-gray-900' : ''
                     }`}
                   >
+                    {r.ok && (
+                      <button
+                        type="button"
+                        onClick={() => setFullscreen(i)}
+                        title="Afficher en plein écran"
+                        aria-label="Afficher les résultats en plein écran"
+                        className="absolute top-2 right-2 z-10 w-9 h-9 flex items-center justify-center rounded-lg bg-white/90 dark:bg-gray-800/90 border border-gray-200 dark:border-gray-600 text-gray-600 dark:text-gray-300 shadow-sm hover:text-brand-primary transition-colors"
+                      >
+                        <Maximize2 className="w-4 h-4" />
+                      </button>
+                    )}
                     {r.ok ? (
                       <iframe
                         title={`Résultats Google — ${r.keyword}`}
@@ -360,6 +386,51 @@ export const AIOverviewPreviewPage: React.FC = () => {
         )}
       </div>
     </div>
+
+    {/* Plein écran : superposition couvrant tout le viewport */}
+    {fsResult?.ok && (
+      <div className="fixed inset-0 z-50 flex flex-col bg-white dark:bg-gray-900">
+        <div className="flex items-center justify-between gap-3 px-4 h-12 flex-shrink-0 border-b border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800">
+          <div className="flex items-center gap-2 min-w-0">
+            <Search className="w-4 h-4 text-gray-400 flex-shrink-0" />
+            <span className="text-sm font-medium text-gray-800 dark:text-gray-100 truncate">
+              {fsResult.keyword}
+            </span>
+            <span className="hidden sm:inline text-xs text-gray-400 flex-shrink-0">
+              · {resultDevice === 'mobile' ? 'Mobile' : 'Ordinateur'}
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setFullscreen(null)}
+            title="Fermer (Échap)"
+            aria-label="Fermer le plein écran"
+            className="flex items-center gap-1.5 px-3 h-9 flex-shrink-0 rounded-lg border border-gray-300 dark:border-gray-600 text-sm text-gray-600 dark:text-gray-300 hover:text-red-600 hover:border-red-400 transition-colors"
+          >
+            <X className="w-4 h-4" />
+            Fermer
+          </button>
+        </div>
+        <div
+          className={`flex-1 min-h-0 bg-white ${
+            resultDevice === 'mobile' ? 'flex justify-center py-4 bg-gray-100 dark:bg-gray-900' : ''
+          }`}
+        >
+          <iframe
+            title={`Résultats Google plein écran — ${fsResult.keyword}`}
+            srcDoc={fsResult.html}
+            referrerPolicy="no-referrer"
+            sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"
+            className={
+              resultDevice === 'mobile'
+                ? 'w-[420px] max-w-full h-full border border-gray-200 rounded-xl bg-white'
+                : 'w-full h-full border-0 bg-white'
+            }
+          />
+        </div>
+      </div>
+    )}
+    </>
   );
 };
 
