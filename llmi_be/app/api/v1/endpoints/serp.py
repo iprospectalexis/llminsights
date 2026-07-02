@@ -36,6 +36,13 @@ except ValueError:
     PREVIEW_DAILY_LIMIT = 20
 _preview_hits: dict = {}  # ip -> [jour "YYYY-MM-DD", count]
 
+# IP exemptées de la limite (collègues) : les IP par défaut ci-dessous + celles
+# listées dans l'env SERP_PREVIEW_IP_WHITELIST (séparées par des virgules).
+_DEFAULT_IP_WHITELIST = {"81.65.132.157", "88.181.106.232"}
+PREVIEW_IP_WHITELIST = _DEFAULT_IP_WHITELIST | {
+    ip.strip() for ip in os.getenv("SERP_PREVIEW_IP_WHITELIST", "").split(",") if ip.strip()
+}
+
 
 def _client_ip(request: Request) -> str:
     xff = request.headers.get("x-forwarded-for", "")
@@ -46,7 +53,10 @@ def _client_ip(request: Request) -> str:
 
 def _rate_limited(ip: str) -> bool:
     """Incrémente le compteur du jour pour cette IP ; renvoie True si la limite
-    est déjà atteinte (sans incrémenter au-delà)."""
+    est déjà atteinte (sans incrémenter au-delà). Les IP de la whitelist ne
+    sont jamais limitées."""
+    if ip in PREVIEW_IP_WHITELIST:
+        return False
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if len(_preview_hits) > 5000:  # purge des entrées des jours précédents
         for k in [k for k, v in _preview_hits.items() if v[0] != today]:
