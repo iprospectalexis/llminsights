@@ -407,7 +407,14 @@ export const AIOverviewPreviewPage: React.FC = () => {
       setActiveTab(0);
       setViewed(new Set([0]));
     } catch (err) {
-      setError('Impossible de récupérer les résultats Google pour le moment. Réessayez.');
+      const msg = err instanceof Error ? err.message : '';
+      const detail = msg.includes('429') ? msg.match(/"detail":"([^"]+)"/)?.[1] ?? null : null;
+      setError(
+        detail ||
+          (msg.includes('429')
+            ? 'Limite quotidienne atteinte. Réessayez demain.'
+            : 'Impossible de récupérer les résultats Google pour le moment. Réessayez.'),
+      );
     } finally {
       setLoading(false);
       if (timerRef.current) {
@@ -436,6 +443,11 @@ export const AIOverviewPreviewPage: React.FC = () => {
           <p>
             Entrez vos requêtes et nous allons requêter les résultats de Google depuis les pays où
             les AI Overview sont déjà présents.
+          </p>
+          <p>
+            Dans l'aperçu, nous développons volontairement le bloc AI Overview afin de pouvoir voir
+            l'intégralité de la réponse générée. Par défaut, le bloc est réduit et prend moins de
+            place.
           </p>
         </div>
       </div>
