@@ -89,7 +89,13 @@ export const RunAuditModal: React.FC<RunAuditModalProps> = ({
         .single();
 
       if (userProfile) {
-        setCanRunAudits(userProfile.can_run_audits ?? true);
+        // Managers and admins can always run audits — the per-user
+        // can_run_audits flag only gates clients. Historically managers were
+        // wrongly blocked because the flag defaults to false and the
+        // create-user upsert never sets it (see migration 20260624140000);
+        // deriving from role here makes the gate immune to that data drift.
+        const isPrivileged = userProfile.role === 'admin' || userProfile.role === 'manager';
+        setCanRunAudits(isPrivileged || (userProfile.can_run_audits ?? true));
       }
     }
   };

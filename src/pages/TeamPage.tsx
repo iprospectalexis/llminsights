@@ -950,21 +950,34 @@ export const TeamPage: React.FC = () => {
                       </td>
                       {isManager && (
                         <td className="px-6 py-4 whitespace-nowrap">
-                          <button
-                            onClick={() => handleToggleCanRunAudits(userData, !userData.can_run_audits)}
-                            className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 ${
-                              userData.can_run_audits
-                                ? 'bg-blue-600'
-                                : 'bg-gray-300 dark:bg-gray-600'
-                            }`}
-                            title={userData.can_run_audits ? 'Disable run audit' : 'Enable run audit'}
-                          >
-                            <span
-                              className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-                                userData.can_run_audits ? 'translate-x-6' : 'translate-x-1'
+                          {userData.role === 'admin' || userData.role === 'manager' ? (
+                            // Managers/admins can always run audits — the flag
+                            // only gates clients, so show a locked-on toggle.
+                            <button
+                              type="button"
+                              disabled
+                              className="relative inline-flex h-6 w-11 items-center rounded-full bg-blue-600 opacity-60 cursor-not-allowed"
+                              title="Managers and admins can always run audits"
+                            >
+                              <span className="inline-block h-4 w-4 transform rounded-full bg-white translate-x-6" />
+                            </button>
+                          ) : (
+                            <button
+                              onClick={() => handleToggleCanRunAudits(userData, !userData.can_run_audits)}
+                              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 ${
+                                userData.can_run_audits
+                                  ? 'bg-blue-600'
+                                  : 'bg-gray-300 dark:bg-gray-600'
                               }`}
-                            />
-                          </button>
+                              title={userData.can_run_audits ? 'Disable run audit' : 'Enable run audit'}
+                            >
+                              <span
+                                className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                                  userData.can_run_audits ? 'translate-x-6' : 'translate-x-1'
+                                }`}
+                              />
+                            </button>
+                          )}
                         </td>
                       )}
                       <td className="px-6 py-4 whitespace-nowrap">
