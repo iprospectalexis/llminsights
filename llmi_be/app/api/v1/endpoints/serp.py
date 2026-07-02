@@ -8,12 +8,14 @@ Temps réel, pas de persistance.
 
 import asyncio
 import logging
+import os
 import smtplib
 import ssl
+from datetime import datetime, timezone
 from email.message import EmailMessage
 from typing import List, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from app.config import get_settings
@@ -22,6 +24,42 @@ from app.services.serp_preview import MAX_KEYWORDS, fetch_previews
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# ── Anti-abus : limite quotidienne d'analyses /preview par IP ────────────────
+# L'outil est public et chaque mot-clé déclenche des appels DataForSEO (payants).
+# On limite le nombre de requêtes /preview par IP et par jour (UTC). Compteur en
+# mémoire (le conteneur tourne avec UVICORN_WORKERS=1) ; remis à zéro au
+# redémarrage. Ajustable via l'env SERP_PREVIEW_DAILY_LIMIT (défaut 20).
+try:
+    PREVIEW_DAILY_LIMIT = int(os.getenv("SERP_PREVIEW_DAILY_LIMIT", "20"))
+except ValueError:
+    PREVIEW_DAILY_LIMIT = 20
+_preview_hits: dict = {}  # ip -> [jour "YYYY-MM-DD", count]
+
+
+def _client_ip(request: Request) -> str:
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _rate_limited(ip: str) -> bool:
+    """Incrémente le compteur du jour pour cette IP ; renvoie True si la limite
+    est déjà atteinte (sans incrémenter au-delà)."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if len(_preview_hits) > 5000:  # purge des entrées des jours précédents
+        for k in [k for k, v in _preview_hits.items() if v[0] != today]:
+            _preview_hits.pop(k, None)
+    entry = _preview_hits.get(ip)
+    if not entry or entry[0] != today:
+        entry = [today, 0]
+    if entry[1] >= PREVIEW_DAILY_LIMIT:
+        _preview_hits[ip] = entry
+        return True
+    entry[1] += 1
+    _preview_hits[ip] = entry
+    return False
 
 
 class SerpQuery(BaseModel):
@@ -59,7 +97,13 @@ class SerpPreviewResponse(BaseModel):
 # Endpoint volontairement PUBLIC (pas de verify_api_key) : l'outil AI Overview
 # Preview est accessible sans connexion.
 @router.post("/preview", response_model=SerpPreviewResponse)
-async def serp_preview(req: SerpPreviewRequest):
+async def serp_preview(req: SerpPreviewRequest, request: Request):
+    if _rate_limited(_client_ip(request)):
+        raise HTTPException(
+            status_code=429,
+            detail=f"Limite quotidienne atteinte ({PREVIEW_DAILY_LIMIT} analyses par jour). "
+            "Réessayez demain.",
+        )
     device = req.device if req.device in ("desktop", "mobile") else "desktop"
     queries = [(q.keyword, q.geo) for q in req.queries[:MAX_KEYWORDS]]
     results = await fetch_previews(queries, device)
