@@ -26,53 +26,57 @@ def extract_domain(url: str) -> str:
         return url
 
 
+def _collect_search_queries(obj, out: list, seen: set) -> None:
+    """Recursively collect every metadata.search_model_queries.queries string
+    from a parsed streaming payload, deduped and in first-seen order.
+
+    ChatGPT nests search_model_queries under different wrappers depending on the
+    event (v.message.metadata, message.metadata, patch ops, …) and emits one set
+    per search turn. Walking the whole structure catches them all instead of
+    guessing a single path (the previous version missed the common
+    message.metadata shape, so web_search_query fell back to the prompt).
+    """
+    if isinstance(obj, dict):
+        smq = obj.get('search_model_queries')
+        if isinstance(smq, dict):
+            for q in (smq.get('queries') or []):
+                if isinstance(q, str):
+                    q = q.strip()
+                    if q and q not in seen:
+                        seen.add(q)
+                        out.append(q)
+        for v in obj.values():
+            _collect_search_queries(v, out, seen)
+    elif isinstance(obj, list):
+        for item in obj:
+            _collect_search_queries(item, out, seen)
+
+
 def extract_search_queries(raw_response: list) -> list:
-    """
-    Extracts search queries from raw_response.
-    Looks for metadata.search_model_queries.queries in streaming events.
-    Returns list of query strings.
-    """
-    queries = []
+    """Extract the model's web-search queries from a ChatGPT streaming response.
 
-    for line in raw_response:
-        if not isinstance(line, str):
-            continue
-
-        if line.startswith('data: '):
-            json_str = line[6:].strip()
-            if not json_str:
+    Returns the deduped list of query strings across all search turns. Handles
+    both SSE `data:` string lines and already-parsed dict/list events.
+    """
+    out: list = []
+    seen: set = set()
+    for line in (raw_response or []):
+        payload = None
+        if isinstance(line, str):
+            s = line.strip()
+            if s.startswith('data:'):
+                s = s[5:].strip()
+            if not s or s == '[DONE]':
                 continue
-
             try:
-                data = json.loads(json_str)
+                payload = json.loads(s)
             except json.JSONDecodeError:
                 continue
-
-            if not isinstance(data, dict):
-                continue
-
-            # Look for metadata in various structures
-            metadata = None
-
-            # Format 1: {"v": {"message": {"metadata": {...}}}}
-            if isinstance(data.get('v'), dict):
-                msg = data['v'].get('message', {})
-                if isinstance(msg, dict):
-                    metadata = msg.get('metadata', {})
-
-            # Format 2: Direct metadata in data
-            if metadata is None and 'metadata' in data:
-                metadata = data.get('metadata', {})
-
-            if metadata and isinstance(metadata, dict):
-                search_model_queries = metadata.get('search_model_queries', {})
-                if isinstance(search_model_queries, dict):
-                    found_queries = search_model_queries.get('queries', [])
-                    if isinstance(found_queries, list) and found_queries:
-                        # Return the first set of queries found
-                        return found_queries
-
-    return queries
+        elif isinstance(line, (dict, list)):
+            payload = line
+        if payload is not None:
+            _collect_search_queries(payload, out, seen)
+    return out
 
 
 def extract_all_sources(raw_response: list) -> list:
@@ -273,7 +277,10 @@ def convert_record(prompt: str, response_data: dict, timestamp: str = None, coun
         'answer_section_html': '',
         'answer_text_markdown': markdown_text,
         'web_search_triggered': len(source_citations) > 0 or len(search_queries) > 0,
-        'web_search_query': search_queries if search_queries else (prompt if len(source_citations) > 0 else None),
+        # Only the model's real search queries — never fall back to the sent
+        # prompt (it carries the "(use web search to answer)" suffix and isn't a
+        # query). None when the model didn't web-search / no queries parsed.
+        'web_search_query': search_queries if search_queries else None,
         'search_sources': [],
         'recommendations': [],
         'additional_prompt': '',
@@ -363,27 +370,16 @@ def extract_all_sources_from_bd_events(events: list) -> list:
 
 
 def extract_search_queries_from_bd_events(events: list) -> list:
-    """
-    Extracts search queries from BrightData response_raw events.
-    Looks for search_model_queries in message metadata.
-    """
-    for evt in events:
-        if not isinstance(evt, dict):
-            continue
+    """Extract web-search queries from BrightData response_raw events.
 
-        v = evt.get('v')
-        if isinstance(v, dict):
-            msg = v.get('message', {})
-            if isinstance(msg, dict):
-                metadata = msg.get('metadata', {})
-                if isinstance(metadata, dict):
-                    smq = metadata.get('search_model_queries', {})
-                    if isinstance(smq, dict):
-                        queries = smq.get('queries', [])
-                        if isinstance(queries, list) and queries:
-                            return queries
-
-    return []
+    Recursively finds every search_model_queries.queries (any nesting, all
+    turns), deduped in order — same logic as the SSE extractor.
+    """
+    out: list = []
+    seen: set = set()
+    for evt in (events or []):
+        _collect_search_queries(evt, out, seen)
+    return out
 
 
 def convert_brightdata_record(item: dict, country: str = "") -> dict:
