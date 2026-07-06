@@ -357,7 +357,7 @@ export const TeamPage: React.FC = () => {
         const projectAssignments = createForm.selectedProjects.map(projectId => ({
           project_id: projectId,
           user_id: newUserId,
-          role: 'viewer'
+          role: 'client'
         }));
 
         console.log('📝 Project assignments to insert:', projectAssignments);
@@ -386,7 +386,7 @@ export const TeamPage: React.FC = () => {
           const groupProjectAssignments = groupProjects.map(project => ({
             project_id: project.id,
             user_id: newUserId,
-            role: 'viewer'
+            role: 'client'
           }));
 
           console.log('📝 Group project assignments to insert:', groupProjectAssignments);
