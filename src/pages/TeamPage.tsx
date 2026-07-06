@@ -28,7 +28,18 @@ interface Project {
   name: string;
   domain: string;
   group_id?: string;
+  project_groups?: { group_id: string }[];
 }
+
+// A project's group IDs — junction table (many-to-many) first, falling back to
+// the legacy single group_id. Mirrors how the Groups/Projects pages resolve
+// membership, so a group here maps to the same projects shown on the Groups page
+// (which uses project_groups). Previously TeamPage used only group_id, so a
+// group with N projects assigned only the 1 whose legacy group_id happened to match.
+const projectGroupIds = (p: Project): string[] => {
+  const fromJunction = (p.project_groups || []).map(pg => pg.group_id).filter(Boolean);
+  return fromJunction.length > 0 ? fromJunction : (p.group_id ? [p.group_id] : []);
+};
 
 interface Group {
   id: string;
@@ -119,7 +130,7 @@ export const TeamPage: React.FC = () => {
   const fetchProjects = async () => {
     const { data } = await supabase
       .from('projects')
-      .select('id, name, domain, group_id')
+      .select('id, name, domain, group_id, project_groups (group_id)')
       .order('name');
 
     setProjects(data || []);
@@ -377,7 +388,10 @@ export const TeamPage: React.FC = () => {
       // Assign projects from selected groups
       if (createForm.selectedGroups.length > 0) {
         const groupProjects = projects.filter(p =>
-          p.group_id && createForm.selectedGroups.includes(p.group_id)
+          // Skip projects already inserted via direct selection, else the
+          // UNIQUE(project_id, user_id) on project_members would trip.
+          !createForm.selectedProjects.includes(p.id) &&
+          projectGroupIds(p).some(gid => createForm.selectedGroups.includes(gid))
         );
 
         console.log('➡️ Found', groupProjects.length, 'projects in selected groups');
@@ -1149,7 +1163,7 @@ export const TeamPage: React.FC = () => {
                     />
                     <span className="text-sm text-gray-700 dark:text-gray-300">{group.name}</span>
                     <span className="text-xs text-gray-500">
-                      ({projects.filter(p => p.group_id === group.id).length} projects)
+                      ({projects.filter(p => projectGroupIds(p).includes(group.id)).length} projects)
                     </span>
                   </div>
                 </label>
