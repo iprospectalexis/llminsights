@@ -121,6 +121,13 @@ def collect_citations(result: dict, response: dict) -> list[dict]:
     elif llm == "gemini" and result.get("links_attached"):
         for i, link in enumerate(result["links_attached"]):
             _add(link.get("url", ""), link.get("text"), link.get("position", i + 1))
+    elif llm == "bing-copilot" and result.get("all_sources"):
+        # Bing Copilot (BrightData) returns its sources in the streaming
+        # events → all_sources, never a `citations` field, so the generic
+        # fallback below never fires. Build citations from all_sources the
+        # same way Perplexity builds them from `sources`.
+        for i, src in enumerate(result["all_sources"]):
+            _add(src.get("url", ""), src.get("title") or src.get("snippet"), i + 1)
     elif llm in ("searchgpt", "chatgpt") and result.get("citations"):
         for i, cit in enumerate(result["citations"]):
             _add(cit.get("url", ""), cit.get("text") or cit.get("title"), i + 1, cit.get("cited"))
