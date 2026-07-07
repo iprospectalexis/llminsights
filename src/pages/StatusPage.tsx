@@ -77,6 +77,9 @@ interface PipelineLog {
 
 export function StatusPage() {
   const [audits, setAudits] = useState<Audit[]>([]);
+  // Real collected-vs-total per audit (responses_received overstates it — it
+  // counts terminal failures too). Keyed by audit id.
+  const [responseStats, setResponseStats] = useState<Record<string, { total: number; answered: number }>>({});
   const [loading, setLoading] = useState(true);
   const [deletingAudit, setDeletingAudit] = useState<string | null>(null);
   const [deleteModalOpen, setDeleteModalOpen] = useState(false);
@@ -127,7 +130,21 @@ export function StatusPage() {
       }
 
       const { audits: auditsWithMetrics } = await response.json();
-      setAudits(auditsWithMetrics || []);
+      const auditsList: Audit[] = auditsWithMetrics || [];
+      setAudits(auditsList);
+
+      // Fetch the real collected counts (see responseStats above).
+      const ids = auditsList.map((a) => a.id);
+      if (ids.length > 0) {
+        const { data: stats } = await supabase.rpc('audit_response_stats', { p_audit_ids: ids });
+        if (Array.isArray(stats)) {
+          const map: Record<string, { total: number; answered: number }> = {};
+          for (const s of stats as { audit_id: string; total: number; answered: number }[]) {
+            map[s.audit_id] = { total: Number(s.total), answered: Number(s.answered) };
+          }
+          setResponseStats(map);
+        }
+      }
     } catch (error) {
       console.error('Error fetching audits:', error);
       setAudits([]);
@@ -688,6 +705,12 @@ export function StatusPage() {
                   const responsesSent = audit.responses_sent || 0;
                   const responsesReceived = audit.responses_received || 0;
                   const processedPrompts = responsesReceived;
+                  // Real collected vs no-answer (falls back to the audit-row
+                  // counters until the stats RPC resolves).
+                  const stats = responseStats[audit.id];
+                  const collected = stats?.answered ?? responsesReceived;
+                  const totalResponses = stats?.total ?? audit.responses_expected ?? 0;
+                  const noAnswer = Math.max(0, totalResponses - collected);
                   const failedCount = audit.status === 'running'
                     ? 0
                     : Math.max(0, responsesSent - responsesReceived);
@@ -926,10 +949,15 @@ export function StatusPage() {
                               {/* Counters row */}
                               <div className="grid grid-cols-3 gap-4">
                                 <div className="bg-white dark:bg-gray-800 rounded-lg p-3 border border-gray-200 dark:border-gray-700">
-                                  <div className="text-xs text-gray-500 dark:text-gray-400">Responses</div>
+                                  <div className="text-xs text-gray-500 dark:text-gray-400">Responses collected</div>
                                   <div className="text-lg font-semibold text-gray-900 dark:text-gray-100">
-                                    {audit.responses_received || 0} / {audit.responses_expected || '—'}
+                                    {collected} / {totalResponses || '—'}
                                   </div>
+                                  {noAnswer > 0 && (
+                                    <div className="text-xs text-amber-600 dark:text-amber-400 mt-0.5">
+                                      {noAnswer} no response
+                                    </div>
+                                  )}
                                 </div>
                                 <div className="bg-white dark:bg-gray-800 rounded-lg p-3 border border-gray-200 dark:border-gray-700">
                                   <div className="text-xs text-gray-500 dark:text-gray-400">Competitors Extracted</div>
