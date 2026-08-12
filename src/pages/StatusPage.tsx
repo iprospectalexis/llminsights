@@ -83,6 +83,9 @@ interface LlmStat {
   answered: number;
   pending: number;
   failed: number;
+  // Scraped successfully but the results page has no AI answer (e.g. Google
+  // shows no AI Overview for the query) — collected data, not a failure.
+  scraped_empty: number;
   reasons: Record<string, number> | null;
 }
 
@@ -171,6 +174,7 @@ export function StatusPage() {
               answered: Number(s.answered),
               pending: Number(s.pending),
               failed: Number(s.failed),
+              scraped_empty: Number(s.scraped_empty ?? 0),
               reasons: s.reasons,
             });
           }
@@ -290,7 +294,9 @@ export function StatusPage() {
   const handleRetryLlm = async (audit: Audit, llm: string) => {
     if (retryingLlm) return;
     const missing = llmStats[audit.id]?.find(s => s.llm === llm);
-    const count = missing ? missing.total - missing.answered : 0;
+    const count = missing
+      ? missing.total - missing.answered - (missing.scraped_empty || 0)
+      : 0;
     if (!window.confirm(
       `Re-run ${getLlmDisplayName(llm)} for this audit?\n` +
       `${count} prompt(s) without a response will be scraped again (this uses provider credits).`
@@ -814,24 +820,36 @@ export function StatusPage() {
                               // Color the chip by that LLM's real collection state.
                               const s = llmStats[audit.id]?.find(x => x.llm === llm);
                               const running = audit.status === 'running' || audit.status === 'pending';
+                              // scraped_empty rows (scraped, but no AI answer on the page —
+                              // e.g. no Google AI Overview for the query) count as collected.
+                              const collectedOk = s ? s.answered + (s.scraped_empty || 0) : 0;
                               const cls = !s
                                 ? 'bg-blue-100 dark:bg-blue-900/30 text-blue-800 dark:text-blue-200'
                                 : running && s.pending > 0
                                 ? 'bg-blue-100 dark:bg-blue-900/30 text-blue-800 dark:text-blue-200'
-                                : s.total > 0 && s.answered === s.total
+                                : s.total > 0 && collectedOk === s.total
                                 ? 'bg-green-100 dark:bg-green-900/30 text-green-800 dark:text-green-200'
-                                : s.answered > 0
+                                : collectedOk > 0
                                 ? 'bg-amber-100 dark:bg-amber-900/30 text-amber-800 dark:text-amber-200'
                                 : 'bg-red-100 dark:bg-red-900/30 text-red-800 dark:text-red-200';
+                              const chipTitle = s
+                                ? `${s.answered}/${s.total} with an AI answer` +
+                                  ((s.scraped_empty || 0) > 0
+                                    ? `, ${s.scraped_empty} scraped with no AI answer on the page`
+                                    : '') +
+                                  (s.total - collectedOk > 0
+                                    ? `, ${s.total - collectedOk} not collected`
+                                    : '')
+                                : undefined;
                               return (
                                 <span
                                   key={llm}
-                                  title={s ? `${s.answered}/${s.total} responses collected` : undefined}
+                                  title={chipTitle}
                                   className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${cls}`}
                                 >
                                   {llm}
-                                  {s && s.answered < s.total && !running && (
-                                    <span className="ml-1 opacity-75">{s.answered}/{s.total}</span>
+                                  {s && collectedOk < s.total && !running && (
+                                    <span className="ml-1 opacity-75">{collectedOk}/{s.total}</span>
                                   )}
                                 </span>
                               );
@@ -1028,9 +1046,13 @@ export function StatusPage() {
                                   <div className="space-y-1.5">
                                     {llmStats[audit.id].map((s) => {
                                       const isRunning = audit.status === 'running' || audit.status === 'pending';
-                                      const missing = s.total - s.answered;
+                                      // scraped_empty = the scrape worked but the results page has
+                                      // no AI answer (Google shows no AI Overview for that query).
+                                      // Counted as collected, not as a failure.
+                                      const scrapedEmpty = s.scraped_empty || 0;
+                                      const realMissing = s.total - s.answered - scrapedEmpty;
                                       const collecting = isRunning && s.pending > 0;
-                                      const complete = s.total > 0 && s.answered === s.total;
+                                      const complete = s.total > 0 && realMissing <= 0 && !collecting;
                                       const reasonsText = s.reasons
                                         ? Object.entries(s.reasons).map(([r, n]) => `${r}: ${n}`).join(', ')
                                         : '';
@@ -1056,13 +1078,13 @@ export function StatusPage() {
                                               <CheckCircle className="w-3 h-3" />
                                               complete
                                             </span>
-                                          ) : s.answered > 0 ? (
+                                          ) : s.answered + scrapedEmpty > 0 ? (
                                             <span
                                               title={reasonsText}
                                               className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-amber-100 dark:bg-amber-900/30 text-amber-800 dark:text-amber-200"
                                             >
                                               <AlertTriangle className="w-3 h-3" />
-                                              {missing} no response
+                                              {realMissing} no response
                                             </span>
                                           ) : (
                                             <span
@@ -1073,7 +1095,15 @@ export function StatusPage() {
                                               no data
                                             </span>
                                           )}
-                                          {!isRunning && missing > 0 && (
+                                          {!collecting && scrapedEmpty > 0 && (
+                                            <span
+                                              title="Scraped successfully — the results page shows no AI answer for these queries (e.g. Google has no AI Overview there)"
+                                              className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300"
+                                            >
+                                              {scrapedEmpty} no AI answer
+                                            </span>
+                                          )}
+                                          {!isRunning && realMissing > 0 && (
                                             <button
                                               onClick={(e) => {
                                                 e.stopPropagation();
@@ -1081,7 +1111,7 @@ export function StatusPage() {
                                               }}
                                               disabled={retryingLlm !== null}
                                               className="ml-auto inline-flex items-center gap-1 px-2 py-1 rounded-lg text-xs font-medium text-brand-primary hover:bg-brand-primary/10 disabled:opacity-50 disabled:cursor-not-allowed"
-                                              title={`Re-scrape the ${missing} missing ${getLlmDisplayName(s.llm)} prompt(s)`}
+                                              title={`Re-scrape the ${realMissing} missing ${getLlmDisplayName(s.llm)} prompt(s)`}
                                             >
                                               {retryingLlm === retryKey ? (
                                                 <RefreshCw className="w-3.5 h-3.5 animate-spin" />

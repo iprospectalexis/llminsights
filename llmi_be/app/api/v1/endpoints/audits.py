@@ -810,18 +810,27 @@ async def retry_audit_llm(audit_id: str, req: RetryLlmRequest):
     from sqlalchemy import text as sql_text
 
     async with AsyncSessionLocal() as s:
+        # Only truly-empty rows: rows that DID scrape but legitimately have no
+        # AI answer (e.g. Google shows no AI Overview for the query — payload
+        # columns populated) are data, not failures; re-scraping them wastes
+        # provider credits.
         rows = (await s.execute(sql_text("""
             SELECT id::text AS id, prompt_id::text AS prompt_id, run_index
             FROM llm_responses
             WHERE audit_id = :aid
               AND llm = :llm
               AND (answer_text IS NULL OR answer_text = '')
+              AND raw_response_data IS NULL
+              AND organic_results IS NULL
         """), {"aid": audit_id, "llm": llm})).mappings().all()
 
     if not rows:
         raise HTTPException(
             status_code=400,
-            detail=f"Nothing to retry — all {display} responses are collected",
+            detail=(
+                f"Nothing to retry — every {display} prompt was either collected "
+                f"or scraped with no AI answer on the results page"
+            ),
         )
 
     prompt_ids = [r["prompt_id"] for r in rows if r["prompt_id"]]

@@ -197,6 +197,19 @@ class DataForSeoClient:
                         })
                         citations.append({"url": url, "title": ref.get("title"), "domain": dom})
 
+        # Empty ai_overview block: the SERP HAS an AI Overview, but it came
+        # back without content — typically the asynchronously-rendered AIO
+        # didn't finish inside DataForSEO's live window. Unlike "no AIO on
+        # this SERP" (aio is None), this is retryable.
+        aio_placeholder = False
+        if aio and not answer_text and not all_sources and not links_attached:
+            aio_placeholder = True
+            logger.warning(
+                f"DataForSEO: empty ai_overview block for '{keyword[:60]}' "
+                f"(async={aio.get('asynchronous_ai_overview')!r}, "
+                f"keys={list(aio.keys())[:8]})"
+            )
+
         # Organic results → compact list (stored in organic_results column).
         organic: list[dict] = []
         for it in items:
@@ -240,6 +253,8 @@ class DataForSeoClient:
             "additional_answer_text": None,
             "all_sources": all_sources,
             "organic": organic,
+            # Internal marker — popped by process_all_prompts, never persisted.
+            "_aio_placeholder": aio_placeholder,
         }
 
     # ── Gemini (ai_optimization/gemini/llm_responses/live) ───────────
@@ -516,12 +531,17 @@ class DataForSeoClient:
 
         batches = [prompts[i:i + self.batch_size] for i in range(0, len(prompts), self.batch_size)]
 
+        # Keywords whose SERP returned an EMPTY ai_overview block (async AIO
+        # didn't render inside the live window) — re-scraped once below.
+        async_retry: list[str] = []
+
         async with httpx.AsyncClient(timeout=timeout) as client:
-            async def run_batch(batch: list[str]) -> None:
+            async def run_batch(batch: list[str], allow_async_retry: bool) -> None:
                 nonlocal processed
                 async with sem:
                     batch_results: list[dict] = []
                     batch_failed: list[str] = []
+                    batch_async: list[str] = []
                     try:
                         data = await self._post_batch(
                             client, batch, location_code, language_code, max_retries
@@ -531,7 +551,13 @@ class DataForSeoClient:
                         for task in tasks:
                             self.total_cost += float(task.get("cost") or 0)
                             record = self._convert_task(task, country)
-                            if record and (record.get("answer_text") or record.get("organic")):
+                            placeholder = bool(record) and record.pop("_aio_placeholder", False)
+                            if record and placeholder and allow_async_retry:
+                                # AIO block present but empty — queue one retry
+                                # instead of persisting a no-answer record.
+                                batch_async.append(record["prompt"])
+                                seen.add(record["prompt"])
+                            elif record and (record.get("answer_text") or record.get("organic")):
                                 batch_results.append(record)
                                 seen.add(record["prompt"])
                             else:
@@ -558,14 +584,29 @@ class DataForSeoClient:
                     async with lock:
                         results.extend(batch_results)
                         failed.extend(batch_failed)
-                        processed += len(batch)
+                        async_retry.extend(batch_async)
+                        # Async-queued keywords aren't final yet — they count
+                        # toward progress when their retry round completes.
+                        processed += len(batch) - len(batch_async)
                         if progress_callback:
                             try:
                                 await progress_callback(processed, total, results)
                             except Exception:
                                 pass
 
-            await asyncio.gather(*[run_batch(b) for b in batches])
+            await asyncio.gather(*[run_batch(b, True) for b in batches])
+
+            if async_retry:
+                logger.info(
+                    f"DataForSEO: {len(async_retry)} keyword(s) returned an empty "
+                    f"ai_overview block — retrying once after a short delay"
+                )
+                await asyncio.sleep(8)
+                retry_batches = [
+                    async_retry[i:i + self.batch_size]
+                    for i in range(0, len(async_retry), self.batch_size)
+                ]
+                await asyncio.gather(*[run_batch(b, False) for b in retry_batches])
 
         logger.info(
             f"DataForSEO: done — {len(results)} ok, {len(failed)} failed, "
