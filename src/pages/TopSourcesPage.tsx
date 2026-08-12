@@ -44,10 +44,19 @@ interface PaginationInfo {
   totalPages: number;
 }
 
+const DATE_FRAMES = [
+  { id: 'all', label: 'All time' },
+  { id: '30', label: 'Last 30 days' },
+  { id: '90', label: 'Last 90 days' },
+] as const;
+
+type DateFrame = (typeof DATE_FRAMES)[number]['id'];
+
 export function TopSourcesPage() {
   const [domainCitations, setDomainCitations] = useState<DomainCitation[]>([]);
   const [domainLoading, setDomainLoading] = useState(true);
   const [selectedLLM, setSelectedLLM] = useState<string>('all');
+  const [dateFrame, setDateFrame] = useState<DateFrame>('all');
   const [domainSearch, setDomainSearch] = useState('');
   const [sortBy, setSortBy] = useState<'cited_count' | 'more_count' | 'total_citations'>('total_citations');
   const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('desc');
@@ -64,134 +73,54 @@ export function TopSourcesPage() {
     }, 300);
 
     return () => clearTimeout(timeoutId);
-  }, [selectedLLM, domainSearch, sortBy, sortOrder, pagination.page]);
+  }, [selectedLLM, dateFrame, domainSearch, sortBy, sortOrder, pagination.page]);
 
   const fetchDomainCitations = async () => {
     setDomainLoading(true);
 
     try {
-      // Query the materialized view directly via Supabase client
-      // (GRANT SELECT ON domain_citations_mv TO authenticated)
-      // When "all" LLMs, we aggregate across all LLMs client-side
-      const ascending = sortOrder === 'asc';
+      // Aggregation lives in the top_source_domains RPC: it sums the live
+      // citations table by domain across ALL projects (the old
+      // domain_citations_mv rows were per project×domain×llm, so the
+      // single-LLM view showed the same domain fragmented per project),
+      // applies the LLM / date-frame / search filters, sorts and paginates
+      // server-side, and respects citations RLS.
+      const { data, error } = await supabase.rpc('top_source_domains', {
+        p_llm: selectedLLM !== 'all' ? selectedLLM : null,
+        p_days: dateFrame === 'all' ? null : parseInt(dateFrame, 10),
+        p_search: domainSearch || null,
+        p_sort: sortBy,
+        p_asc: sortOrder === 'asc',
+        p_limit: pagination.pageSize,
+        p_offset: (pagination.page - 1) * pagination.pageSize,
+      });
 
-      if (selectedLLM && selectedLLM !== 'all') {
-        // Specific LLM: query directly with pagination
-        let query = supabase
-          .from('domain_citations_mv' as any)
-          .select('*', { count: 'exact' })
-          .eq('llm', selectedLLM);
-
-        if (domainSearch) {
-          query = query.ilike('domain', `%${domainSearch}%`);
-        }
-
-        query = query
-          .order(sortBy, { ascending })
-          .order('domain', { ascending: true })
-          .range(
-            (pagination.page - 1) * pagination.pageSize,
-            pagination.page * pagination.pageSize - 1
-          );
-
-        const { data, count, error } = await query;
-
-        if (error) {
-          console.error('Error fetching domain citations:', error);
-          throw error;
-        }
-
-        setDomainCitations(data || []);
-        setPagination({
-          ...pagination,
-          total: count || 0,
-          totalPages: Math.ceil((count || 0) / pagination.pageSize),
-        });
-      } else {
-        // All LLMs: fetch all rows, aggregate by domain, then paginate client-side
-        const batchSize = 1000;
-        let allData: any[] = [];
-        let currentPage = 0;
-        let hasMore = true;
-
-        while (hasMore) {
-          let query = supabase
-            .from('domain_citations_mv' as any)
-            .select('*')
-            .range(currentPage * batchSize, (currentPage + 1) * batchSize - 1);
-
-          if (domainSearch) {
-            query = query.ilike('domain', `%${domainSearch}%`);
-          }
-
-          const { data: batch, error } = await query;
-
-          if (error) {
-            console.error('Error fetching batch:', error);
-            break;
-          }
-
-          if (batch && batch.length > 0) {
-            allData = allData.concat(batch);
-            currentPage++;
-            hasMore = batch.length === batchSize;
-          } else {
-            hasMore = false;
-          }
-        }
-
-        // Aggregate by domain across all LLMs
-        const aggregated = new Map<string, any>();
-        for (const row of allData) {
-          const key = row.domain;
-          if (!aggregated.has(key)) {
-            aggregated.set(key, {
-              domain: row.domain,
-              llm: 'all',
-              cited_count: 0,
-              more_count: 0,
-              total_citations: 0,
-              first_seen: row.first_seen,
-              last_seen: row.last_seen,
-            });
-          }
-          const agg = aggregated.get(key);
-          agg.cited_count += row.cited_count || 0;
-          agg.more_count += row.more_count || 0;
-          agg.total_citations += row.total_citations || 0;
-          if (row.first_seen && (!agg.first_seen || row.first_seen < agg.first_seen)) {
-            agg.first_seen = row.first_seen;
-          }
-          if (row.last_seen && (!agg.last_seen || row.last_seen > agg.last_seen)) {
-            agg.last_seen = row.last_seen;
-          }
-        }
-
-        // Sort
-        let sorted = Array.from(aggregated.values());
-        sorted.sort((a, b) => {
-          const aVal = a[sortBy];
-          const bVal = b[sortBy];
-          if (typeof aVal === 'string' && typeof bVal === 'string') {
-            return ascending ? aVal.localeCompare(bVal) : bVal.localeCompare(aVal);
-          }
-          return ascending ? (aVal || 0) - (bVal || 0) : (bVal || 0) - (aVal || 0);
-        });
-
-        const total = sorted.length;
-        const offset = (pagination.page - 1) * pagination.pageSize;
-        const paginated = sorted.slice(offset, offset + pagination.pageSize);
-
-        setDomainCitations(paginated);
-        setPagination({
-          ...pagination,
-          total,
-          totalPages: Math.ceil(total / pagination.pageSize),
-        });
+      if (error) {
+        console.error('Error fetching domain citations:', error);
+        throw error;
       }
+
+      const rows = (data || []) as any[];
+      setDomainCitations(rows.map((r) => ({
+        domain: r.domain,
+        llm: selectedLLM,
+        cited_count: Number(r.cited_count),
+        more_count: Number(r.more_count),
+        total_citations: Number(r.total_citations),
+        first_seen: r.first_seen,
+        last_seen: r.last_seen,
+      })));
+
+      const total = rows.length > 0 ? Number(rows[0].total_count) : 0;
+      setPagination(prev => ({
+        ...prev,
+        total,
+        totalPages: Math.ceil(total / prev.pageSize),
+      }));
     } catch (error) {
       console.error('Error fetching domain citations:', error);
       setDomainCitations([]);
+      setPagination(prev => ({ ...prev, total: 0, totalPages: 0 }));
     } finally {
       setDomainLoading(false);
     }
@@ -276,6 +205,32 @@ export function TopSourcesPage() {
                           alt={LLM_NAMES[llm as keyof typeof LLM_NAMES]}
                           className="w-8 h-8 object-contain"
                         />
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Date frame */}
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+                    Date range
+                  </label>
+                  <div className="flex items-center gap-2">
+                    {DATE_FRAMES.map(frame => (
+                      <button
+                        key={frame.id}
+                        type="button"
+                        onClick={() => {
+                          setDateFrame(frame.id);
+                          setPagination(prev => ({ ...prev, page: 1 }));
+                        }}
+                        className={`px-4 py-2 rounded-lg font-medium text-sm transition-all ${
+                          dateFrame === frame.id
+                            ? 'bg-brand-primary text-white shadow-md'
+                            : 'bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-300 border border-gray-300 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-700'
+                        }`}
+                      >
+                        {frame.label}
                       </button>
                     ))}
                   </div>
