@@ -136,13 +136,14 @@ async def _dispatch_scheduled_audits():
     from app.database import AsyncSessionLocal
     from sqlalchemy import text
     from fastapi import BackgroundTasks
-    from app.api.v1.endpoints.audits import run_audit, RunAuditRequest
+    from app.api.v1.endpoints.audits import run_audit, RunAuditRequest, LLM_NAME_MAP
 
     async with AsyncSessionLocal() as s:
         # Find due projects, skip those that already have a running audit.
         rows = (await s.execute(text("""
             SELECT p.id, p.name, p.schedule_frequency, p.schedule_time,
-                   p.schedule_day_of_week, p.schedule_day_of_month, p.schedule_timezone
+                   p.schedule_day_of_week, p.schedule_day_of_month, p.schedule_timezone,
+                   p.schedule_llms
             FROM projects p
             WHERE p.scheduled_audits_enabled = true
               AND p.next_scheduled_audit_at IS NOT NULL
@@ -163,7 +164,15 @@ async def _dispatch_scheduled_audits():
     for proj in rows:
         proj_id = str(proj["id"])
         try:
-            req = RunAuditRequest(projectId=proj_id, isScheduled=True)
+            # Per-project LLM selection (schedule_llms). Filter to known ids so
+            # a stale/garbage value can't silently map to chatgpt downstream;
+            # NULL/empty → None → run_audit's default (searchgpt + perplexity).
+            schedule_llms = [
+                llm for llm in (proj.get("schedule_llms") or []) if llm in LLM_NAME_MAP
+            ]
+            req = RunAuditRequest(
+                projectId=proj_id, isScheduled=True, llms=schedule_llms or None
+            )
             bg = BackgroundTasks()
             result = await run_audit(req, bg)
             # Manually run the background task chain (we're not in a request scope).

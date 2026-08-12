@@ -15,9 +15,25 @@ interface ScheduleConfig {
   schedule_day_of_week: number | null;
   schedule_day_of_month: number | null;
   schedule_timezone: string;
+  schedule_llms: string[];
   next_scheduled_audit_at: string | null;
   last_scheduled_audit_at: string | null;
 }
+
+// Same catalogue as the Run Audit modal. Kept in sync manually — if an LLM is
+// added there, add it here too.
+const LLM_OPTIONS = [
+  { id: 'searchgpt', name: 'SearchGPT', iconUrl: 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/SearchGPT.PNG' },
+  { id: 'perplexity', name: 'Perplexity', iconUrl: 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/Perplexity.png' },
+  { id: 'gemini', name: 'Gemini', iconUrl: 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/Gemini.png' },
+  { id: 'google-ai-overview', name: 'Google AI Overview', iconUrl: 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/Google.png' },
+  { id: 'google-ai-mode', name: 'Google AI Mode', iconUrl: 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/Google.png' },
+  { id: 'bing-copilot', name: 'Bing Copilot', iconUrl: 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/bing_copilot.png' },
+  { id: 'grok', name: 'Grok', iconUrl: 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/Grok-icon.png' },
+];
+
+// Historical default used when the column is NULL (pre-feature projects).
+const DEFAULT_SCHEDULE_LLMS = ['searchgpt', 'perplexity'];
 
 const DAYS_OF_WEEK = [
   { value: 0, label: 'Sunday' },
@@ -106,6 +122,7 @@ export const ProjectScheduledAuditsSettings: React.FC<ProjectScheduledAuditsSett
     schedule_day_of_week: 1,
     schedule_day_of_month: 1,
     schedule_timezone: 'UTC',
+    schedule_llms: DEFAULT_SCHEDULE_LLMS,
     next_scheduled_audit_at: null,
     last_scheduled_audit_at: null,
   });
@@ -121,7 +138,7 @@ export const ProjectScheduledAuditsSettings: React.FC<ProjectScheduledAuditsSett
 
       const { data, error: fetchError } = await supabase
         .from('projects')
-        .select('scheduled_audits_enabled, schedule_frequency, schedule_time, schedule_day_of_week, schedule_day_of_month, schedule_timezone, next_scheduled_audit_at, last_scheduled_audit_at')
+        .select('scheduled_audits_enabled, schedule_frequency, schedule_time, schedule_day_of_week, schedule_day_of_month, schedule_timezone, schedule_llms, next_scheduled_audit_at, last_scheduled_audit_at')
         .eq('id', projectId)
         .single();
 
@@ -135,6 +152,8 @@ export const ProjectScheduledAuditsSettings: React.FC<ProjectScheduledAuditsSett
           schedule_day_of_week: data.schedule_day_of_week ?? 1,
           schedule_day_of_month: data.schedule_day_of_month ?? 1,
           schedule_timezone: data.schedule_timezone || 'UTC',
+          // NULL / empty = pre-feature project → historical default.
+          schedule_llms: data.schedule_llms?.length ? data.schedule_llms : DEFAULT_SCHEDULE_LLMS,
           next_scheduled_audit_at: data.next_scheduled_audit_at,
           last_scheduled_audit_at: data.last_scheduled_audit_at,
         });
@@ -153,6 +172,12 @@ export const ProjectScheduledAuditsSettings: React.FC<ProjectScheduledAuditsSett
       setError(null);
       setSuccessMessage(null);
 
+      if (config.scheduled_audits_enabled && config.schedule_llms.length === 0) {
+        setError('Select at least one LLM for the scheduled audit.');
+        setSaving(false);
+        return;
+      }
+
       const nextRun = config.scheduled_audits_enabled
         ? calculateNextScheduledRun(config).toISOString()
         : null;
@@ -166,6 +191,7 @@ export const ProjectScheduledAuditsSettings: React.FC<ProjectScheduledAuditsSett
           schedule_day_of_week: config.schedule_day_of_week,
           schedule_day_of_month: config.schedule_day_of_month,
           schedule_timezone: config.schedule_timezone,
+          schedule_llms: config.schedule_llms,
           next_scheduled_audit_at: nextRun,
         })
         .eq('id', projectId);
@@ -327,6 +353,47 @@ export const ProjectScheduledAuditsSettings: React.FC<ProjectScheduledAuditsSett
                   ))}
                 </select>
               </div>
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+                LLMs to audit
+              </label>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                {LLM_OPTIONS.map(llm => (
+                  <label
+                    key={llm.id}
+                    className="flex items-center p-3 rounded-2xl border border-gray-200 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-700 cursor-pointer transition-colors"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={config.schedule_llms.includes(llm.id)}
+                      onChange={() => {
+                        setConfig(prev => ({
+                          ...prev,
+                          schedule_llms: prev.schedule_llms.includes(llm.id)
+                            ? prev.schedule_llms.filter(id => id !== llm.id)
+                            : [...prev.schedule_llms, llm.id],
+                        }));
+                      }}
+                      className="w-4 h-4 text-brand-primary border-gray-300 rounded focus:ring-brand-primary"
+                    />
+                    <img
+                      src={llm.iconUrl}
+                      alt={`${llm.name} icon`}
+                      className="w-5 h-5 ml-3 mr-2 object-contain"
+                    />
+                    <span className="text-sm font-medium text-gray-900 dark:text-gray-100">
+                      {llm.name}
+                    </span>
+                  </label>
+                ))}
+              </div>
+              {config.schedule_llms.length === 0 && (
+                <p className="text-xs text-red-600 dark:text-red-400 mt-2">
+                  Select at least one LLM.
+                </p>
+              )}
             </div>
 
             <div className="bg-gray-50 dark:bg-gray-700/50 rounded-lg p-4 space-y-2">
