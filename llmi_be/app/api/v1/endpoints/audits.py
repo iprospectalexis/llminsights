@@ -58,6 +58,14 @@ class RunAuditRequest(BaseModel):
     #   True  → DataForSEO Gemini (web-search grounded)
     #   False → BrightData Gemini  (default)
     geminiWebSearch: Optional[bool] = False
+    # Avalanche mode: send every prompt AVALANCHE_RUNS times to each selected
+    # LLM (separate provider jobs per run) for a more objective visibility
+    # picture across generative answers that differ run to run.
+    avalanche: Optional[bool] = False
+
+
+# Runs per prompt when Avalanche mode is on.
+AVALANCHE_RUNS = 3
 
 
 class AuditStatusResponse(BaseModel):
@@ -92,6 +100,8 @@ def collect_citations(result: dict, response: dict) -> list[dict]:
         "audit_id": response["audit_id"],
         "prompt_id": response["prompt_id"],
         "llm": llm,
+        # Avalanche: citations live per run so runs can't overwrite each other.
+        "run_index": response.get("run_index") or 1,
         "checked_at": datetime.now(timezone.utc),
     }
 
@@ -355,7 +365,8 @@ async def run_audit(req: RunAuditRequest, background_tasks: BackgroundTasks):
 
     # Create audit with pipeline_state
     now = datetime.now(timezone.utc)
-    total_responses = len(project["prompts"]) * len(audit_llms)
+    runs_per_prompt = AVALANCHE_RUNS if req.avalanche else 1
+    total_responses = len(project["prompts"]) * len(audit_llms) * runs_per_prompt
     audit = await db.create_audit({
         "project_id": req.projectId,
         "llms": audit_llms,
@@ -367,6 +378,7 @@ async def run_audit(req: RunAuditRequest, background_tasks: BackgroundTasks):
         "started_at": now,
         "data_provider": provider_map.get(audit_llms[0], "BrightData"),
         "responses_expected": total_responses,
+        "runs_per_prompt": runs_per_prompt,
     })
     audit_id = str(audit["id"])
 
@@ -384,7 +396,11 @@ async def run_audit(req: RunAuditRequest, background_tasks: BackgroundTasks):
             prompt_texts = [p["prompt_text"] for p in prompts]
             llm_responses = []
 
-            async def _trigger_llm(llm):
+            async def _trigger_llm(llm, run_ix):
+                # One provider job per (llm, run): submitting the same prompt
+                # N times inside a single batch risks provider-side dedupe;
+                # separate jobs keep the polling matcher unambiguous (rows are
+                # matched within their own job's results).
                 try:
                     job_id = await trigger_onesearch_job(
                         llm, prompt_texts, project.get("country", "FR"),
@@ -398,22 +414,28 @@ async def run_audit(req: RunAuditRequest, background_tasks: BackgroundTasks):
                             "prompt_id": str(p["id"]),
                             "llm": llm,
                             "job_id": job_id,
+                            "run_index": run_ix,
                             "country": project.get("country", "FR"),
                             "data_provider": provider_map.get(llm, "BrightData"),
                         })
                 except Exception as e:
-                    logger.error(f"[run-audit] Failed to trigger {llm}: {e}")
+                    logger.error(f"[run-audit] Failed to trigger {llm} (run {run_ix}): {e}")
                     for p in prompts:
                         llm_responses.append({
                             "audit_id": audit_id,
                             "prompt_id": str(p["id"]),
                             "llm": llm,
+                            "run_index": run_ix,
                             "country": project.get("country", "FR"),
                             "data_provider": provider_map.get(llm, "BrightData"),
                             "raw_response_data": {"error": str(e)},
                         })
 
-            await asyncio.gather(*[_trigger_llm(llm) for llm in audit_llms])
+            await asyncio.gather(*[
+                _trigger_llm(llm, run_ix)
+                for llm in audit_llms
+                for run_ix in range(1, runs_per_prompt + 1)
+            ])
 
             # Insert in chunks
             await db.insert_llm_responses_chunked(llm_responses, chunk_size=50)
@@ -789,7 +811,7 @@ async def retry_audit_llm(audit_id: str, req: RetryLlmRequest):
 
     async with AsyncSessionLocal() as s:
         rows = (await s.execute(sql_text("""
-            SELECT id::text AS id, prompt_id::text AS prompt_id
+            SELECT id::text AS id, prompt_id::text AS prompt_id, run_index
             FROM llm_responses
             WHERE audit_id = :aid
               AND llm = :llm
@@ -804,11 +826,6 @@ async def retry_audit_llm(audit_id: str, req: RetryLlmRequest):
 
     prompt_ids = [r["prompt_id"] for r in rows if r["prompt_id"]]
     prompts_map = await db.get_prompt_texts(prompt_ids)
-    prompt_texts = [prompts_map[pid] for pid in prompt_ids if prompts_map.get(pid)]
-    if not prompt_texts:
-        raise HTTPException(
-            status_code=500, detail="Could not resolve prompt texts for the rows to retry"
-        )
 
     country = await db.execute_scalar(
         "SELECT country FROM projects WHERE id = :pid",
@@ -820,19 +837,45 @@ async def retry_audit_llm(audit_id: str, req: RetryLlmRequest):
     data_provider = (setting or {}).get("data_provider", "BrightData")
     provider_config = (setting or {}).get("provider_config")
 
-    try:
-        new_job_id = await trigger_onesearch_job(
-            llm, prompt_texts, country or "FR", True, provider_config,
-            audit_id=audit_id, project_id=str(audit["project_id"]),
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=502, detail=f"Failed to trigger a new {display} job: {e}"
+    # One job per run_index: an Avalanche audit has the same prompt N times
+    # for this LLM, and duplicated prompts inside one batch risk provider-side
+    # dedupe. Grouping by run keeps every job's prompt list unique.
+    rows_by_run: dict[int, list] = {}
+    for r in rows:
+        rows_by_run.setdefault(int(r.get("run_index") or 1), []).append(r)
+
+    rows_reset = 0
+    job_ids: list[str] = []
+    for run_ix, run_rows in sorted(rows_by_run.items()):
+        run_prompts = [
+            prompts_map[r["prompt_id"]]
+            for r in run_rows
+            if r["prompt_id"] and prompts_map.get(r["prompt_id"])
+        ]
+        if not run_prompts:
+            continue
+        try:
+            new_job_id = await trigger_onesearch_job(
+                llm, run_prompts, country or "FR", True, provider_config,
+                audit_id=audit_id, project_id=str(audit["project_id"]),
+            )
+        except Exception as e:
+            if not job_ids:
+                raise HTTPException(
+                    status_code=502, detail=f"Failed to trigger a new {display} job: {e}"
+                )
+            logger.error(f"[retry-llm] {audit_id}: run {run_ix} re-trigger failed: {e}")
+            continue
+        job_ids.append(new_job_id)
+        rows_reset += await db.reassign_responses_for_fallback(
+            [r["id"] for r in run_rows], new_job_id, data_provider
         )
 
-    rows_reset = await db.reassign_responses_for_fallback(
-        [r["id"] for r in rows], new_job_id, data_provider
-    )
+    if not job_ids:
+        raise HTTPException(
+            status_code=500, detail="Could not resolve prompt texts for the rows to retry"
+        )
+    new_job_id = job_ids[0]
 
     # Back into polling. pipeline_state_entered_at anchors the 90-min polling
     # deadline (see handle_polling), so an old audit isn't instantly swept.
@@ -855,7 +898,7 @@ async def retry_audit_llm(audit_id: str, req: RetryLlmRequest):
 
     logger.info(
         f"[retry-llm] {audit_id}: {rows_reset} {llm} rows re-triggered "
-        f"on new job {new_job_id} (provider={data_provider})"
+        f"on {len(job_ids)} new job(s) (provider={data_provider})"
     )
     return {
         "success": True,

@@ -748,6 +748,7 @@ async def handle_polling(audit_id: str, worker_id: str) -> None:
                     "audit_id": str(resp["audit_id"]),
                     "prompt_id": str(resp["prompt_id"]),
                     "llm": resp["llm"],
+                    "run_index": resp.get("run_index") or 1,
                 })
                 all_citations.extend(collect_citations(r["result"], resp))
             await db.delete_citations_batch(delete_keys)

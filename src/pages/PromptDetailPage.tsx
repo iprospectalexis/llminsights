@@ -68,6 +68,7 @@ interface LLMResponse {
   sentiment_score?: number | null;
   sentiment_label?: 'positive' | 'neutral' | 'negative' | null;
   poll_terminal_reason?: string | null;
+  run_index?: number | null;
   created_at: string;
   audits: {
     id: string;
@@ -246,6 +247,7 @@ export const PromptDetailPage: React.FC = () => {
           sentiment_score,
           sentiment_label,
           poll_terminal_reason,
+          run_index,
           created_at,
           audits!inner (
             id,
@@ -255,7 +257,9 @@ export const PromptDetailPage: React.FC = () => {
         `)
         .eq('prompt_id', promptId)
         .order('created_at', { ascending: false })
-        .limit(50);
+        // Avalanche audits carry up to 3 rows per (audit × llm) — a 50-row
+        // window would truncate to a couple of audits.
+        .limit(150);
 
       setLlmResponses(responsesData || []);
     } catch (error) {
@@ -841,6 +845,11 @@ export const PromptDetailPage: React.FC = () => {
                                       <FileText className="w-4 h-4 mr-1" />
                                       {citations.length} citations
                                     </div>
+                                    {(response.run_index ?? 1) > 1 && (
+                                      <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300">
+                                        Run {response.run_index}
+                                      </span>
+                                    )}
                                     {response.sentiment_label && (
                                       <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium ${getSentimentColor(response.sentiment_label)}`}>
                                         {getSentimentIcon(response.sentiment_label)}

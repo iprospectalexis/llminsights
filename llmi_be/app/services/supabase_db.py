@@ -795,6 +795,12 @@ class SupabaseDB:
         Idempotent: skips responses that already have any row in
         response_brand_sentiment for this audit, so a crashed batch
         resumes cleanly on the next pipeline tick.
+
+        Avalanche audits: sentiment runs on run 1 only (run_index = 1) —
+        it is the expensive gpt-5-mini call, and cross-run sentiment
+        stability isn't a tracked metric. Competitor extraction, by
+        contrast, runs on every run (cheap nano + uniform mention metrics).
+        Normal audits are unaffected (all their rows are run 1).
         """
         async with AsyncSessionLocal() as s:
             rows = (await s.execute(
@@ -804,6 +810,7 @@ class SupabaseDB:
                     JOIN prompts p ON lr.prompt_id = p.id
                     WHERE lr.audit_id = :aid
                       AND lr.answer_text IS NOT NULL
+                      AND lr.run_index = 1
                       AND NOT EXISTS (
                           SELECT 1 FROM response_brand_sentiment rbs
                           WHERE rbs.response_id = lr.id
@@ -915,12 +922,16 @@ class SupabaseDB:
             conditions = []
             params = {}
             for i, k in enumerate(keys):
+                # run_index in the key: Avalanche runs persist citations per
+                # run — without it, run k's delete would wipe run j's rows.
                 conditions.append(
-                    f"(audit_id = :aid_{i} AND prompt_id = :pid_{i} AND llm = :llm_{i})"
+                    f"(audit_id = :aid_{i} AND prompt_id = :pid_{i} "
+                    f"AND llm = :llm_{i} AND run_index = :run_{i})"
                 )
                 params[f"aid_{i}"] = k["audit_id"]
                 params[f"pid_{i}"] = k["prompt_id"]
                 params[f"llm_{i}"] = k["llm"]
+                params[f"run_{i}"] = k.get("run_index") or 1
             where = " OR ".join(conditions)
             await s.execute(text(f"DELETE FROM citations WHERE {where}"), params)
             await s.commit()
@@ -930,7 +941,7 @@ class SupabaseDB:
         if not citations:
             return
         _COLS = [
-            "audit_id", "prompt_id", "llm", "page_url", "domain",
+            "audit_id", "prompt_id", "llm", "run_index", "page_url", "domain",
             "citation_text", "position", "checked_at", "cited",
         ]
         CHUNK = 100
@@ -943,7 +954,11 @@ class SupabaseDB:
                     placeholders = ", ".join(f":{col}_{j}" for col in _COLS)
                     values_parts.append(f"({placeholders})")
                     for col in _COLS:
-                        params[f"{col}_{j}"] = c.get(col)
+                        # run_index is NOT NULL — default legacy callers to run 1.
+                        if col == "run_index":
+                            params[f"{col}_{j}"] = c.get("run_index") or 1
+                        else:
+                            params[f"{col}_{j}"] = c.get(col)
                 sql = f"""
                     INSERT INTO citations ({', '.join(_COLS)})
                     VALUES {', '.join(values_parts)}

@@ -71,6 +71,8 @@ export const RunAuditModal: React.FC<RunAuditModalProps> = ({
   // Gemini: when checked, route this audit through DataForSEO Gemini
   // (web-search grounded); when unchecked (default), use BrightData.
   const [geminiWebSearch, setGeminiWebSearch] = useState(false);
+  // Avalanche: every prompt is sent 3× to each selected LLM.
+  const [avalanche, setAvalanche] = useState(false);
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
@@ -126,6 +128,7 @@ export const RunAuditModal: React.FC<RunAuditModalProps> = ({
         enableSentiment,
         forceWebSearch,
         geminiWebSearch,
+        avalanche,
       });
 
       console.log('RunAuditModal: Backend API response:', data);
@@ -212,6 +215,25 @@ export const RunAuditModal: React.FC<RunAuditModalProps> = ({
               </div>
             ))}
           </div>
+        </div>
+
+        <div>
+          <label className="flex items-center p-3 rounded-2xl border border-gray-200 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-700 cursor-pointer transition-colors">
+            <input
+              type="checkbox"
+              checked={avalanche}
+              onChange={(e) => setAvalanche(e.target.checked)}
+              className="w-4 h-4 text-brand-primary border-gray-300 rounded focus:ring-brand-primary"
+            />
+            <Sparkles className="w-4 h-4 text-brand-primary ml-3" />
+            <span className="text-sm font-medium text-gray-900 dark:text-gray-100 ml-2">
+              Avalanche mode (×3 runs)
+            </span>
+          </label>
+          <p className="text-xs text-gray-500 dark:text-gray-400 mt-1 ml-3">
+            Sends every prompt 3 times to each selected LLM for a more objective
+            visibility picture across varying generative answers. Scraping volume ×3.
+          </p>
         </div>
 
         <div>

@@ -109,6 +109,8 @@ export interface RunAuditPayload {
   isScheduled?: boolean;
   // Gemini only: true → DataForSEO Gemini (web-search), false → BrightData.
   geminiWebSearch?: boolean;
+  // Avalanche mode: every prompt is sent 3× to each selected LLM.
+  avalanche?: boolean;
 }
 
 export interface AuditStatusResponse {
