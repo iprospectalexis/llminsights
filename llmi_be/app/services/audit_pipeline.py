@@ -494,7 +494,17 @@ async def handle_polling(audit_id: str, worker_id: str) -> None:
         # ── Branch 2: global safety-net deadline ────────────────────────
         phase = "deadline_check"
         audit_row = await db.get_audit(audit_id)
-        anchor = (audit_row or {}).get("started_at") or (audit_row or {}).get("created_at")
+        # Anchor on when polling was (re-)entered, not on audit birth:
+        # recover-polling / retry-llm put finished audits back into polling
+        # hours later — anchoring on started_at would trip the 90-min sweep
+        # on their first tick and kill the retry as polling_timeout. Normal
+        # runs enter polling within a minute of started_at, so the deadline
+        # semantics there are unchanged.
+        anchor = (
+            (audit_row or {}).get("pipeline_state_entered_at")
+            or (audit_row or {}).get("started_at")
+            or (audit_row or {}).get("created_at")
+        )
         if isinstance(anchor, str):
             try:
                 anchor = datetime.fromisoformat(anchor.replace("Z", "+00:00"))

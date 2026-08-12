@@ -25,7 +25,8 @@ import {
 import { Button } from '../components/ui/Button';
 import { Modal } from '../components/ui/Modal';
 import { LoadingSpinner } from '../components/ui/LoadingSpinner';
-import { recoverPollingAudit } from '../lib/backendApi';
+import { recoverPollingAudit, retryAuditLlm } from '../lib/backendApi';
+import { LLM_ICONS, getLlmDisplayName } from '../lib/llm-display';
 
 // Prefix used by the backend when an audit fails because the polling stage
 // gave up before the provider returned any data. The Recover button is
@@ -75,11 +76,25 @@ interface PipelineLog {
   created_at: string;
 }
 
+// Per-LLM collection stats for one audit (audit_llm_response_stats RPC).
+interface LlmStat {
+  llm: string;
+  total: number;
+  answered: number;
+  pending: number;
+  failed: number;
+  reasons: Record<string, number> | null;
+}
+
 export function StatusPage() {
   const [audits, setAudits] = useState<Audit[]>([]);
   // Real collected-vs-total per audit (responses_received overstates it — it
   // counts terminal failures too). Keyed by audit id.
   const [responseStats, setResponseStats] = useState<Record<string, { total: number; answered: number }>>({});
+  // Per-LLM breakdown per audit id (which LLMs collected fully / partially / failed).
+  const [llmStats, setLlmStats] = useState<Record<string, LlmStat[]>>({});
+  // `${auditId}:${llm}` while a per-LLM retry request is in flight.
+  const [retryingLlm, setRetryingLlm] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [deletingAudit, setDeletingAudit] = useState<string | null>(null);
   const [deleteModalOpen, setDeleteModalOpen] = useState(false);
@@ -143,6 +158,26 @@ export function StatusPage() {
             map[s.audit_id] = { total: Number(s.total), answered: Number(s.answered) };
           }
           setResponseStats(map);
+        }
+
+        // Per-LLM breakdown for the same audits.
+        const { data: perLlm } = await supabase.rpc('audit_llm_response_stats', { p_audit_ids: ids });
+        if (Array.isArray(perLlm)) {
+          const byAudit: Record<string, LlmStat[]> = {};
+          for (const s of perLlm as (LlmStat & { audit_id: string })[]) {
+            (byAudit[s.audit_id] = byAudit[s.audit_id] || []).push({
+              llm: s.llm,
+              total: Number(s.total),
+              answered: Number(s.answered),
+              pending: Number(s.pending),
+              failed: Number(s.failed),
+              reasons: s.reasons,
+            });
+          }
+          for (const list of Object.values(byAudit)) {
+            list.sort((a, b) => a.llm.localeCompare(b.llm));
+          }
+          setLlmStats(byAudit);
         }
       }
     } catch (error) {
@@ -250,6 +285,28 @@ export function StatusPage() {
   const confirmDeleteAudit = (audit: Audit) => {
     setSelectedAuditForDelete(audit);
     setDeleteModalOpen(true);
+  };
+
+  const handleRetryLlm = async (audit: Audit, llm: string) => {
+    if (retryingLlm) return;
+    const missing = llmStats[audit.id]?.find(s => s.llm === llm);
+    const count = missing ? missing.total - missing.answered : 0;
+    if (!window.confirm(
+      `Re-run ${getLlmDisplayName(llm)} for this audit?\n` +
+      `${count} prompt(s) without a response will be scraped again (this uses provider credits).`
+    )) return;
+
+    const key = `${audit.id}:${llm}`;
+    setRetryingLlm(key);
+    try {
+      await retryAuditLlm(audit.id, llm);
+      // Status flips to running; realtime + refetch pick up the new state.
+      await fetchAudits();
+    } catch (e: any) {
+      alert(`Failed to retry ${getLlmDisplayName(llm)}: ${e?.message || e}`);
+    } finally {
+      setRetryingLlm(null);
+    }
   };
 
   const handleDeleteAudit = async () => {
@@ -753,14 +810,32 @@ export function StatusPage() {
                         </td>
                         <td className="px-6 py-4">
                           <div className="flex flex-wrap gap-1">
-                            {audit.llms?.map((llm) => (
-                              <span
-                                key={llm}
-                                className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-blue-100 dark:bg-blue-900/30 text-blue-800 dark:text-blue-200"
-                              >
-                                {llm}
-                              </span>
-                            ))}
+                            {audit.llms?.map((llm) => {
+                              // Color the chip by that LLM's real collection state.
+                              const s = llmStats[audit.id]?.find(x => x.llm === llm);
+                              const running = audit.status === 'running' || audit.status === 'pending';
+                              const cls = !s
+                                ? 'bg-blue-100 dark:bg-blue-900/30 text-blue-800 dark:text-blue-200'
+                                : running && s.pending > 0
+                                ? 'bg-blue-100 dark:bg-blue-900/30 text-blue-800 dark:text-blue-200'
+                                : s.total > 0 && s.answered === s.total
+                                ? 'bg-green-100 dark:bg-green-900/30 text-green-800 dark:text-green-200'
+                                : s.answered > 0
+                                ? 'bg-amber-100 dark:bg-amber-900/30 text-amber-800 dark:text-amber-200'
+                                : 'bg-red-100 dark:bg-red-900/30 text-red-800 dark:text-red-200';
+                              return (
+                                <span
+                                  key={llm}
+                                  title={s ? `${s.answered}/${s.total} responses collected` : undefined}
+                                  className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${cls}`}
+                                >
+                                  {llm}
+                                  {s && s.answered < s.total && !running && (
+                                    <span className="ml-1 opacity-75">{s.answered}/{s.total}</span>
+                                  )}
+                                </span>
+                              );
+                            })}
                           </div>
                         </td>
                         <td className="px-6 py-4 whitespace-nowrap">
@@ -942,6 +1017,83 @@ export function StatusPage() {
                                   <div className="flex items-start gap-2">
                                     <AlertTriangle className="w-4 h-4 text-red-500 mt-0.5 flex-shrink-0" />
                                     <p className="text-sm text-red-700 dark:text-red-300 whitespace-pre-wrap">{audit.error_message}</p>
+                                  </div>
+                                </div>
+                              )}
+
+                              {/* Per-LLM collection status */}
+                              {(llmStats[audit.id]?.length ?? 0) > 0 && (
+                                <div className="bg-white dark:bg-gray-800 rounded-lg p-3 border border-gray-200 dark:border-gray-700">
+                                  <div className="text-xs text-gray-500 dark:text-gray-400 mb-2">Collection by LLM</div>
+                                  <div className="space-y-1.5">
+                                    {llmStats[audit.id].map((s) => {
+                                      const isRunning = audit.status === 'running' || audit.status === 'pending';
+                                      const missing = s.total - s.answered;
+                                      const collecting = isRunning && s.pending > 0;
+                                      const complete = s.total > 0 && s.answered === s.total;
+                                      const reasonsText = s.reasons
+                                        ? Object.entries(s.reasons).map(([r, n]) => `${r}: ${n}`).join(', ')
+                                        : '';
+                                      const retryKey = `${audit.id}:${s.llm}`;
+                                      return (
+                                        <div key={s.llm} className="flex items-center gap-3">
+                                          {LLM_ICONS[s.llm] && (
+                                            <img src={LLM_ICONS[s.llm]} alt="" className="w-4 h-4 object-contain flex-shrink-0" />
+                                          )}
+                                          <span className="text-sm text-gray-900 dark:text-gray-100 w-36 truncate">
+                                            {getLlmDisplayName(s.llm)}
+                                          </span>
+                                          <span className="text-sm font-medium text-gray-700 dark:text-gray-300 w-16">
+                                            {s.answered}/{s.total}
+                                          </span>
+                                          {collecting ? (
+                                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-blue-100 dark:bg-blue-900/30 text-blue-800 dark:text-blue-200">
+                                              <RefreshCw className="w-3 h-3 animate-spin" />
+                                              collecting…
+                                            </span>
+                                          ) : complete ? (
+                                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-green-100 dark:bg-green-900/30 text-green-800 dark:text-green-200">
+                                              <CheckCircle className="w-3 h-3" />
+                                              complete
+                                            </span>
+                                          ) : s.answered > 0 ? (
+                                            <span
+                                              title={reasonsText}
+                                              className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-amber-100 dark:bg-amber-900/30 text-amber-800 dark:text-amber-200"
+                                            >
+                                              <AlertTriangle className="w-3 h-3" />
+                                              {missing} no response
+                                            </span>
+                                          ) : (
+                                            <span
+                                              title={reasonsText}
+                                              className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-red-100 dark:bg-red-900/30 text-red-800 dark:text-red-200"
+                                            >
+                                              <XCircle className="w-3 h-3" />
+                                              no data
+                                            </span>
+                                          )}
+                                          {!isRunning && missing > 0 && (
+                                            <button
+                                              onClick={(e) => {
+                                                e.stopPropagation();
+                                                handleRetryLlm(audit, s.llm);
+                                              }}
+                                              disabled={retryingLlm !== null}
+                                              className="ml-auto inline-flex items-center gap-1 px-2 py-1 rounded-lg text-xs font-medium text-brand-primary hover:bg-brand-primary/10 disabled:opacity-50 disabled:cursor-not-allowed"
+                                              title={`Re-scrape the ${missing} missing ${getLlmDisplayName(s.llm)} prompt(s)`}
+                                            >
+                                              {retryingLlm === retryKey ? (
+                                                <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                                              ) : (
+                                                <RotateCcw className="w-3.5 h-3.5" />
+                                              )}
+                                              Retry
+                                            </button>
+                                          )}
+                                        </div>
+                                      );
+                                    })}
                                   </div>
                                 </div>
                               )}

@@ -153,6 +153,25 @@ export function recoverPollingAudit(auditId: string) {
   });
 }
 
+export interface RetryLlmResponse {
+  success: boolean;
+  audit_id: string;
+  llm: string;
+  rows_reset: number;
+  job_id?: string;
+  message: string;
+}
+
+// Re-run collection for ONE LLM of a finished audit: triggers a fresh
+// provider job for the prompts that have no answer and puts the audit
+// back into polling. Rows that already have answers are untouched.
+export function retryAuditLlm(auditId: string, llm: string) {
+  return request<RetryLlmResponse>(`/v1/audits/${auditId}/retry-llm`, {
+    method: 'POST',
+    body: { llm },
+  });
+}
+
 // ── SERP / AI Overview Preview ───────────────────────────────
 
 export interface SerpSource {
@@ -222,5 +241,6 @@ export default {
   pollAudit,
   getAuditStatus,
   recoverPollingAudit,
+  retryAuditLlm,
   checkHealth,
 };

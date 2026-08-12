@@ -750,6 +750,123 @@ async def recover_polling_audit(audit_id: str):
     }
 
 
+# ── POST /audits/{audit_id}/retry-llm ────────────────────────────────
+
+class RetryLlmRequest(BaseModel):
+    llm: str
+
+
+@router.post("/{audit_id}/retry-llm")
+async def retry_audit_llm(audit_id: str, req: RetryLlmRequest):
+    """Re-run collection for ONE LLM of a finished audit.
+
+    For the rows of this audit×LLM that have no answer, trigger a fresh
+    provider job (provider comes from the current llm_data_provider_settings,
+    same as a new run), re-point the rows at it — same mechanics as the
+    polling auto-fallback — and put the audit back into
+    pipeline_state='polling'. The scheduler re-polls the new job; extraction
+    and sentiment then run idempotently for the newly answered rows only
+    (already-processed rows are skipped by their IS NULL selections).
+
+    Rows that already have an answer are never touched.
+    """
+    llm = (req.llm or "").strip()
+    if llm not in LLM_NAME_MAP:
+        raise HTTPException(status_code=400, detail=f"Unknown LLM '{llm}'")
+    display = LLM_NAME_MAP[llm]
+
+    audit = await db.get_audit(audit_id)
+    if not audit:
+        raise HTTPException(status_code=404, detail="Audit not found")
+    if audit.get("status") in ("pending", "running"):
+        raise HTTPException(
+            status_code=400,
+            detail="Audit is still running — per-LLM retry is only available for finished audits",
+        )
+
+    from app.database import AsyncSessionLocal
+    from sqlalchemy import text as sql_text
+
+    async with AsyncSessionLocal() as s:
+        rows = (await s.execute(sql_text("""
+            SELECT id::text AS id, prompt_id::text AS prompt_id
+            FROM llm_responses
+            WHERE audit_id = :aid
+              AND llm = :llm
+              AND (answer_text IS NULL OR answer_text = '')
+        """), {"aid": audit_id, "llm": llm})).mappings().all()
+
+    if not rows:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Nothing to retry — all {display} responses are collected",
+        )
+
+    prompt_ids = [r["prompt_id"] for r in rows if r["prompt_id"]]
+    prompts_map = await db.get_prompt_texts(prompt_ids)
+    prompt_texts = [prompts_map[pid] for pid in prompt_ids if prompts_map.get(pid)]
+    if not prompt_texts:
+        raise HTTPException(
+            status_code=500, detail="Could not resolve prompt texts for the rows to retry"
+        )
+
+    country = await db.execute_scalar(
+        "SELECT country FROM projects WHERE id = :pid",
+        {"pid": str(audit["project_id"])},
+    ) or "FR"
+
+    provider_settings = await db.get_llm_provider_settings([display])
+    setting = next((p for p in provider_settings if p["llm_name"] == display), None)
+    data_provider = (setting or {}).get("data_provider", "BrightData")
+    provider_config = (setting or {}).get("provider_config")
+
+    try:
+        new_job_id = await trigger_onesearch_job(
+            llm, prompt_texts, country or "FR", True, provider_config,
+            audit_id=audit_id, project_id=str(audit["project_id"]),
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=502, detail=f"Failed to trigger a new {display} job: {e}"
+        )
+
+    rows_reset = await db.reassign_responses_for_fallback(
+        [r["id"] for r in rows], new_job_id, data_provider
+    )
+
+    # Back into polling. pipeline_state_entered_at anchors the 90-min polling
+    # deadline (see handle_polling), so an old audit isn't instantly swept.
+    async with AsyncSessionLocal() as s:
+        await s.execute(sql_text("""
+            UPDATE audits
+            SET status = 'running',
+                pipeline_state = 'polling',
+                progress = 10,
+                current_step = 'getting_results',
+                finished_at = NULL,
+                error_message = NULL,
+                locked_by = NULL,
+                locked_at = NULL,
+                last_activity_at = now(),
+                pipeline_state_entered_at = now()
+            WHERE id = :aid
+        """), {"aid": audit_id})
+        await s.commit()
+
+    logger.info(
+        f"[retry-llm] {audit_id}: {rows_reset} {llm} rows re-triggered "
+        f"on new job {new_job_id} (provider={data_provider})"
+    )
+    return {
+        "success": True,
+        "audit_id": audit_id,
+        "llm": llm,
+        "rows_reset": rows_reset,
+        "job_id": new_job_id,
+        "message": f"{rows_reset} {display} prompt(s) re-triggered — collection restarted",
+    }
+
+
 # ── BrightData legacy fetch ──────────────────────────────────────────
 
 async def _fetch_brightdata_result(llm: str, snapshot_id: str, api_key: str) -> Optional[dict]:
