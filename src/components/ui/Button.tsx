@@ -14,6 +14,11 @@ export const Button: React.FC<ButtonProps> = ({
   size = 'md',
   loading = false,
   disabled,
+  // Native buttons default to type="submit" INSIDE a form, so a typeless
+  // "Cancel" button in a modal form would submit it (run the audit, create
+  // the project, …) while closing. Default to "button"; submit buttons all
+  // pass type="submit" explicitly.
+  type = 'button',
   children,
   className = '',
   ...props
@@ -37,6 +42,7 @@ export const Button: React.FC<ButtonProps> = ({
     <motion.button
       whileHover={{ scale: 1.02 }}
       whileTap={{ scale: 0.98 }}
+      type={type}
       className={`${baseClasses} ${variants[variant]} ${sizes[size]} ${className}`}
       disabled={disabled || loading}
       {...props}
