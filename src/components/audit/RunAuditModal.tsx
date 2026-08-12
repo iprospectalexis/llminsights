@@ -217,24 +217,29 @@ export const RunAuditModal: React.FC<RunAuditModalProps> = ({
           </div>
         </div>
 
-        <div>
-          <label className="flex items-center p-3 rounded-2xl border border-gray-200 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-700 cursor-pointer transition-colors">
-            <input
-              type="checkbox"
-              checked={avalanche}
-              onChange={(e) => setAvalanche(e.target.checked)}
-              className="w-4 h-4 text-brand-primary border-gray-300 rounded focus:ring-brand-primary"
-            />
-            <Sparkles className="w-4 h-4 text-brand-primary ml-3" />
-            <span className="text-sm font-medium text-gray-900 dark:text-gray-100 ml-2">
-              Avalanche mode (×3 runs)
-            </span>
-          </label>
-          <p className="text-xs text-gray-500 dark:text-gray-400 mt-1 ml-3">
-            Sends every prompt 3 times to each selected LLM for a more objective
-            visibility picture across varying generative answers. Scraping volume ×3.
-          </p>
-        </div>
+        <label className="flex items-center justify-between gap-4 p-3 rounded-2xl border border-gray-200 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-700 cursor-pointer transition-colors">
+          <div className="flex items-start">
+            <Sparkles className="w-4 h-4 text-brand-primary mt-0.5 flex-shrink-0" />
+            <div className="ml-2">
+              <span className="text-sm font-medium text-gray-900 dark:text-gray-100">
+                Avalanche mode (×3 runs)
+              </span>
+              <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                Sends every prompt 3 times to each selected LLM for a more objective
+                visibility picture across varying generative answers. Scraping volume ×3.
+              </p>
+            </div>
+          </div>
+          {/* Toggle switch — sr-only checkbox drives the track via `peer`;
+              no <button> here so the form can't be submitted by it. */}
+          <input
+            type="checkbox"
+            checked={avalanche}
+            onChange={(e) => setAvalanche(e.target.checked)}
+            className="sr-only peer"
+          />
+          <div className="relative w-11 h-6 flex-shrink-0 rounded-full bg-gray-300 dark:bg-gray-600 peer-checked:bg-brand-primary peer-focus:ring-2 peer-focus:ring-brand-primary/40 transition-colors after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:h-5 after:w-5 after:rounded-full after:bg-white after:shadow after:transition-transform peer-checked:after:translate-x-5" />
+        </label>
 
         <div>
           <label className="flex items-center p-3 rounded-2xl border border-gray-200 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-700 cursor-pointer transition-colors">
