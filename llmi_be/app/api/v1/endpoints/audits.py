@@ -307,6 +307,17 @@ async def scheduler_health():
     return health
 
 
+@router.get("/provider-health")
+async def provider_health_status():
+    """Scraping-provider health registry: circuits, credentials, last errors.
+
+    `status: open` means the provider is currently skipped by routing
+    (reason: billing = account out of funds, errors = repeated failures).
+    """
+    from app.services import provider_health
+    return provider_health.snapshot()
+
+
 # ── POST /audits/run ──────────────────────────────────────────────────
 
 @router.post("/run")
@@ -362,6 +373,24 @@ async def run_audit(req: RunAuditRequest, background_tasks: BackgroundTasks):
         provider_config_map["gemini"] = {
             "provider": "dataforseo" if req.geminiWebSearch else "brightdata"
         }
+
+    # Health-aware start: if the configured provider's circuit is open
+    # (out of funds / outage) or its credentials are missing, start this
+    # audit on the next capable provider in the chain instead of knowingly
+    # sending jobs into a wall. The user's choice stays first priority.
+    from app.services import provider_health
+    for llm in audit_llms:
+        preferred = (provider_config_map.get(llm) or {}).get("provider") or (
+            "brightdata" if provider_map.get(llm, "BrightData") == "BrightData" else "serp"
+        )
+        chosen = provider_health.pick_provider(llm, preferred=preferred)
+        if chosen and chosen != preferred:
+            logger.warning(
+                f"[run-audit] {llm}: provider '{preferred}' unavailable "
+                f"({provider_health.reason(preferred)}) → starting on '{chosen}'"
+            )
+            provider_config_map[llm] = {"provider": chosen}
+            provider_map[llm] = provider_health.label(chosen)
 
     # Create audit with pipeline_state
     now = datetime.now(timezone.utc)
@@ -845,6 +874,21 @@ async def retry_audit_llm(audit_id: str, req: RetryLlmRequest):
     setting = next((p for p in provider_settings if p["llm_name"] == display), None)
     data_provider = (setting or {}).get("data_provider", "BrightData")
     provider_config = (setting or {}).get("provider_config")
+
+    # Health-aware retry: skip a provider whose circuit is open (billing /
+    # outage) and use the next capable one in the chain.
+    from app.services import provider_health
+    preferred = (provider_config or {}).get("provider") or (
+        "brightdata" if data_provider == "BrightData" else "serp"
+    )
+    chosen = provider_health.pick_provider(llm, preferred=preferred)
+    if chosen and chosen != preferred:
+        logger.warning(
+            f"[retry-llm] {llm}: provider '{preferred}' unavailable "
+            f"({provider_health.reason(preferred)}) → retrying on '{chosen}'"
+        )
+        provider_config = {"provider": chosen}
+        data_provider = provider_health.label(chosen)
 
     # One job per run_index: an Avalanche audit has the same prompt N times
     # for this LLM, and duplicated prompts inside one batch risk provider-side

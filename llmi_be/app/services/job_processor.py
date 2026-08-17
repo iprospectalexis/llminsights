@@ -13,6 +13,7 @@ from app.services.brightdata_client import BrightDataClient
 from app.services.dataforseo_client import DataForSeoClient
 from app.services.webhook import webhook_service
 from app.services.results_processor import results_processor
+from app.services import provider_health
 from app.config import get_settings
 from app.services.geo_utils import extract_country_code
 
@@ -189,6 +190,14 @@ class JobProcessor:
                     job.status = JobStatus.FAILED.value
                     job.error_message = f"All {len(failed_queries)} prompts failed"
 
+                # Feed the provider-health registry (failover circuits): a job
+                # with any results proves the provider works; a fully-failed
+                # job counts against it.
+                if job.status == JobStatus.FAILED.value:
+                    provider_health.record_failure(provider, job.error_message or "")
+                elif results:
+                    provider_health.record_success(provider)
+
                 # CRITICAL: Commit status NOW before file processing
                 # This ensures status is persisted even if file operations fail
                 logger.info(f"Job {job_id}: Committing status={job.status} to database (before file processing)...")
@@ -338,6 +347,8 @@ class JobProcessor:
                         job.error_message = str(e)
                         job.completed_at = datetime.utcnow()
                         await session.commit()
+
+                        provider_health.record_failure(job.provider or "serp", str(e))
                         
                         # Send webhook for failure
                         if job.webhook_url:

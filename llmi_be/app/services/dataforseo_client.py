@@ -563,11 +563,18 @@ class DataForSeoClient:
                             else:
                                 kw = ((task.get("data") or {}).get("keyword")) or ""
                                 # Surface the real reason instead of swallowing it.
+                                status_msg = task.get("status_message") or ""
                                 logger.warning(
                                     f"DataForSEO task not usable for '{kw[:60]}': "
                                     f"status={task.get('status_code')} "
-                                    f"msg={task.get('status_message')!r}"
+                                    f"msg={status_msg!r}"
                                 )
+                                # Billing errors (insufficient funds…) open the
+                                # provider circuit right away so routing shifts
+                                # to the alternate supplier.
+                                from app.services import provider_health
+                                if provider_health.classify_error(status_msg) == "billing":
+                                    provider_health.record_failure("dataforseo", status_msg)
                                 if kw:
                                     batch_failed.append(kw)
                                     seen.add(kw)
@@ -579,6 +586,8 @@ class DataForSeoClient:
                             f"DataForSEO request failed for {batch[:1]}"
                             f"{'…' if len(batch) > 1 else ''}: {type(e).__name__}: {e}"
                         )
+                        from app.services import provider_health
+                        provider_health.record_failure("dataforseo", str(e))
                         batch_failed.extend(batch)
 
                     async with lock:
