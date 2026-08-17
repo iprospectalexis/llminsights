@@ -18,6 +18,14 @@ services:
       - "127.0.0.1:${PORT:-8080}:80"
     env_file:
       - .env.production
+    # Cap container logs: the pipeline logs every 15s tick, and Docker's
+    # json-file driver is unbounded by default — a month of logs is gigabytes
+    # of disk. 3 × 50 MB keeps plenty of recent history for debugging.
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     environment:
       # MUST stay at 1: the audit scheduler and pool monitor run as
       # in-process asyncio tasks. Multiple workers spawn duplicate
