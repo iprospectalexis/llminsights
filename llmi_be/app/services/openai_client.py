@@ -142,6 +142,111 @@ async def _call_openai(messages: list[dict], max_tokens: int = 2048,
             raise
 
 
+# ── OpenAI Batch API (50% pricing, async completion window) ──────────
+# Used by the pipeline for SCHEDULED audits: extraction/sentiment requests are
+# packed into a JSONL batch, submitted once, then polled by the tick-based
+# handlers until completed. Same prompts/schemas as the live path (built via
+# build_competitors_messages / build_sentiment_messages).
+
+def batch_request_line(
+    custom_id: str,
+    messages: list[dict],
+    model: str,
+    max_tokens: int,
+    schema: dict,
+) -> dict:
+    """One JSONL line for POST /v1/batches input."""
+    return {
+        "custom_id": custom_id,
+        "method": "POST",
+        "url": "/v1/chat/completions",
+        "body": {
+            "model": model,
+            "messages": messages,
+            "max_completion_tokens": max_tokens,
+            "response_format": {"type": "json_schema", "json_schema": schema},
+        },
+    }
+
+
+async def create_batch(lines: list[dict]) -> str:
+    """Upload a JSONL input file and create a 24h-window batch. Returns id."""
+    payload = "\n".join(json.dumps(l, ensure_ascii=False) for l in lines).encode("utf-8")
+    file = await _client.files.create(
+        file=("audit_batch.jsonl", payload), purpose="batch"
+    )
+    batch = await _client.batches.create(
+        input_file_id=file.id,
+        endpoint="/v1/chat/completions",
+        completion_window="24h",
+    )
+    logger.info(
+        f"OpenAI batch created: {batch.id} ({len(lines)} requests, "
+        f"input file {file.id}, {len(payload) // 1024} KB)"
+    )
+    return batch.id
+
+
+async def retrieve_batch(batch_id: str):
+    """Current batch object (status, request_counts, output/error file ids)."""
+    return await _client.batches.retrieve(batch_id)
+
+
+async def download_batch_results(
+    batch,
+    _ctx: Optional[dict] = None,
+    _operation: Optional[str] = None,
+) -> tuple[dict, dict]:
+    """Parse a finished batch's output (and error) files.
+
+    Returns (ok, errors): custom_id → message content for HTTP-200 lines with
+    content; custom_id → short error string otherwise. Token usage of each
+    successful line is fed to the cost tracker under `_operation` (batch
+    lines are billed at 50%).
+    """
+    from types import SimpleNamespace
+
+    ok: dict = {}
+    errors: dict = {}
+    for fid in (getattr(batch, "output_file_id", None), getattr(batch, "error_file_id", None)):
+        if not fid:
+            continue
+        resp = await _client.files.content(fid)
+        for line in resp.text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            cid = obj.get("custom_id")
+            r = obj.get("response") or {}
+            body = r.get("body") or {}
+            if r.get("status_code") == 200 and body.get("choices"):
+                content = (body["choices"][0].get("message") or {}).get("content")
+                if content:
+                    ok[cid] = content
+                    usage = body.get("usage")
+                    if usage and _operation:
+                        try:
+                            await cost_tracker.record_openai_call(
+                                ctx=_ctx,
+                                model=body.get("model") or "",
+                                operation=_operation,
+                                usage=SimpleNamespace(**usage),
+                                metadata={"batch": True},
+                            )
+                        except Exception as ce:
+                            logger.warning(f"cost_tracker: batch event not recorded: {ce}")
+                    continue
+            err = obj.get("error") or body.get("error") or {
+                "message": f"status {r.get('status_code')}"
+            }
+            errors[cid] = str(err)[:200]
+    return ok, errors
+
+
 def _extract_json(text: str) -> dict:
     """Extract JSON from OpenAI response, handling markdown code blocks."""
     # Direct parse
@@ -179,27 +284,25 @@ def _has_proper_nouns(text: str) -> bool:
     return len(mid_caps) >= 1 or len(model_patterns) >= 1
 
 
-async def extract_competitors(
+def competitors_prefilter_skip(answer_text: str, known: list[str]) -> bool:
+    """True when the text can't contain brands (no proper nouns, no known
+    brands) — callers skip the OpenAI call entirely."""
+    text_lower = answer_text.lower()
+    has_known = any(b.lower() in text_lower for b in known if b)
+    return not has_known and not _has_proper_nouns(answer_text)
+
+
+def build_competitors_messages(
     prompt_text: str,
     answer_text: str,
     industry: str = "",
     known_brands: list[str] | None = None,
     known_competitors: list[str] | None = None,
-    _ctx: Optional[dict] = None,
-) -> dict:
-    """
-    Extract brand/company names from an LLM response.
-    Returns {"brands": [...]} dict.
-    """
+) -> list[dict]:
+    """Chat messages for competitor extraction — shared by the live call and
+    the Batch API path so both run the identical prompt."""
     known_brands = known_brands or []
     known_competitors = known_competitors or []
-
-    # Pre-filter: skip API call if text has no proper nouns and no known brands
-    text_lower = answer_text.lower()
-    all_known = known_brands + known_competitors
-    has_known = any(b.lower() in text_lower for b in all_known if b)
-    if not has_known and not _has_proper_nouns(answer_text):
-        return {"brands": [], "_skipped": True}
 
     # Build context-aware system prompt
     context_lines = []
@@ -260,6 +363,34 @@ async def extract_competitors(
             ),
         },
     ]
+    return messages
+
+
+async def extract_competitors(
+    prompt_text: str,
+    answer_text: str,
+    industry: str = "",
+    known_brands: list[str] | None = None,
+    known_competitors: list[str] | None = None,
+    _ctx: Optional[dict] = None,
+) -> dict:
+    """
+    Extract brand/company names from an LLM response.
+    Returns {"brands": [...]} dict.
+    """
+    known_brands = known_brands or []
+    known_competitors = known_competitors or []
+
+    # Pre-filter: skip API call if text has no proper nouns and no known brands
+    if competitors_prefilter_skip(answer_text, known_brands + known_competitors):
+        return {"brands": [], "_skipped": True}
+
+    messages = build_competitors_messages(
+        prompt_text, answer_text,
+        industry=industry,
+        known_brands=known_brands,
+        known_competitors=known_competitors,
+    )
 
     for attempt in range(2):  # Retry once on empty output / transient errors
         try:
@@ -345,30 +476,14 @@ SENTIMENT_SCHEMA = {
 }
 
 
-async def analyze_response_sentiment(
+def build_sentiment_messages(
     prompt_text: str,
     answer_text: str,
     brands_to_score: list[str],
     industry: str = "",
-    _ctx: Optional[dict] = None,
-) -> dict:
-    """
-    Score every brand in `brands_to_score` against a single LLM answer in one call.
-    Uses OpenAI structured outputs (json_schema) so the response is guaranteed valid.
-
-    Returns:
-        {
-            "brands": [
-                {"brand": str, "label": str, "score": float,
-                 "confidence": float, "reasoning": str},
-                ...
-            ],
-            "_fallback": bool   # only set on hard failure
-        }
-    """
-    if not brands_to_score:
-        return {"brands": []}
-
+) -> list[dict]:
+    """Chat messages for sentiment scoring — shared by the live call and the
+    Batch API path so both run the identical prompt."""
     industry_line = f"Industry context: {industry}\n" if industry else ""
     brands_json = json.dumps(brands_to_score, ensure_ascii=False)
 
@@ -415,13 +530,77 @@ async def analyze_response_sentiment(
         f"Answer:\n{answer_text}\n\n"
         f"Brands to score: {brands_json}"
     )
+    return [
+        {"role": "system", "content": system_msg},
+        {"role": "user", "content": user_msg},
+    ]
+
+
+def normalize_sentiment_result(parsed: dict, brands_to_score: list[str]) -> dict:
+    """Normalize a raw model JSON into the canonical result: every requested
+    brand gets an entry, labels validated, scores/confidence clamped."""
+    by_brand = {b["brand"]: b for b in parsed.get("brands", []) if isinstance(b, dict)}
+    out = []
+    for brand in brands_to_score:
+        entry = by_brand.get(brand)
+        if not entry:
+            out.append({
+                "brand": brand, "label": "mention_only", "score": 0.0,
+                "confidence": 0.0, "reasoning": "Model did not return an entry for this brand.",
+            })
+            continue
+        label = entry.get("label", "mention_only")
+        if label not in ("positive", "neutral", "negative", "mention_only"):
+            label = "mention_only"
+        try:
+            score = float(entry.get("score", 0.0))
+        except (TypeError, ValueError):
+            score = 0.0
+        score = max(-1.0, min(1.0, score))
+        try:
+            confidence = float(entry.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        confidence = max(0.0, min(1.0, confidence))
+        out.append({
+            "brand": brand,
+            "label": label,
+            "score": score,
+            "confidence": confidence,
+            "reasoning": str(entry.get("reasoning", ""))[:500],
+        })
+    return {"brands": out}
+
+
+async def analyze_response_sentiment(
+    prompt_text: str,
+    answer_text: str,
+    brands_to_score: list[str],
+    industry: str = "",
+    _ctx: Optional[dict] = None,
+) -> dict:
+    """
+    Score every brand in `brands_to_score` against a single LLM answer in one call.
+    Uses OpenAI structured outputs (json_schema) so the response is guaranteed valid.
+
+    Returns:
+        {
+            "brands": [
+                {"brand": str, "label": str, "score": float,
+                 "confidence": float, "reasoning": str},
+                ...
+            ],
+            "_fallback": bool   # only set on hard failure
+        }
+    """
+    if not brands_to_score:
+        return {"brands": []}
+
+    messages = build_sentiment_messages(prompt_text, answer_text, brands_to_score, industry)
 
     try:
         raw = await _call_openai(
-            [
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg},
-            ],
+            messages,
             # gpt-5-mini reserves a large slice of this budget for invisible
             # reasoning tokens, so allocate generously.
             max_tokens=16384,
@@ -433,39 +612,7 @@ async def analyze_response_sentiment(
         if not raw:
             return _sentiment_fallback(brands_to_score, "empty_response")
 
-        parsed = json.loads(raw)
-        # Normalize: ensure every requested brand has an entry; clamp scores
-        by_brand = {b["brand"]: b for b in parsed.get("brands", []) if isinstance(b, dict)}
-        out = []
-        for brand in brands_to_score:
-            entry = by_brand.get(brand)
-            if not entry:
-                out.append({
-                    "brand": brand, "label": "mention_only", "score": 0.0,
-                    "confidence": 0.0, "reasoning": "Model did not return an entry for this brand.",
-                })
-                continue
-            label = entry.get("label", "mention_only")
-            if label not in ("positive", "neutral", "negative", "mention_only"):
-                label = "mention_only"
-            try:
-                score = float(entry.get("score", 0.0))
-            except (TypeError, ValueError):
-                score = 0.0
-            score = max(-1.0, min(1.0, score))
-            try:
-                confidence = float(entry.get("confidence", 0.0))
-            except (TypeError, ValueError):
-                confidence = 0.0
-            confidence = max(0.0, min(1.0, confidence))
-            out.append({
-                "brand": brand,
-                "label": label,
-                "score": score,
-                "confidence": confidence,
-                "reasoning": str(entry.get("reasoning", ""))[:500],
-            })
-        return {"brands": out}
+        return normalize_sentiment_result(json.loads(raw), brands_to_score)
 
     except Exception as e:
         logger.error(f"analyze_response_sentiment failed: {e}")

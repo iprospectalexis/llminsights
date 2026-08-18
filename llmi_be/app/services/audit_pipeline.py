@@ -958,6 +958,337 @@ async def _get_audit_run_by(audit_id: str) -> Optional[str]:
         return None
 
 
+# ── OpenAI Batch API for scheduled audits (50% pricing) ──────────────
+# Scheduled audits run extraction + sentiment through the Batch API instead of
+# live calls. The tick-based handlers stay resumable: submit the batch once
+# (id stored on the audit row), heartbeat while polling each tick, apply the
+# results on completion, then mark the stage BATCH_APPLIED so any stragglers
+# (parse failures, error lines) fall through to the normal live path.
+
+BATCH_APPLIED = "applied"
+
+
+def _use_openai_batch(audit_row: dict) -> bool:
+    return bool(
+        getattr(settings, "openai_batch_for_scheduled", True)
+        and audit_row.get("is_scheduled")
+    )
+
+
+async def _competitors_via_batch(audit_id: str, audit: dict, pending: list[dict]) -> bool:
+    """Batch sub-flow for the extraction stage. Returns True when the handler
+    should yield (batch submitted / still running / just applied)."""
+    batch_id = audit.get("competitors_batch_id")
+
+    own_brands, project_id, _ = await db.get_own_brands(audit_id)
+    competitor_brands = await db.get_competitor_brands(audit_id)
+    project_name = await db.get_project_name(audit_id)
+    user_id = await _get_audit_run_by(audit_id)
+    cost_ctx = {"audit_id": audit_id, "project_id": project_id, "user_id": user_id}
+
+    if not batch_id:
+        # Submit: prefilter locally (same rule as live), batch the rest.
+        prefilter_updates: list[dict] = []
+        lines: list[dict] = []
+        for r in pending:
+            answer = r.get("answer_text") or ""
+            if openai_client.competitors_prefilter_skip(
+                answer, (own_brands or []) + (competitor_brands or [])
+            ):
+                prefilter_updates.append({
+                    "id": r["id"],
+                    "competitors": json.dumps({"brands": [], "_skipped": True}),
+                })
+                continue
+            messages = openai_client.build_competitors_messages(
+                r.get("prompt_text") or "", answer,
+                industry=project_name or "",
+                known_brands=own_brands,
+                known_competitors=competitor_brands,
+            )
+            lines.append(openai_client.batch_request_line(
+                f"comp:{r['id']}", messages,
+                openai_client.MODEL_COMPETITORS, 4096,
+                openai_client.COMPETITORS_SCHEMA,
+            ))
+        if prefilter_updates:
+            await db.update_competitors_batch(prefilter_updates)
+        if not lines:
+            await db.update_audit(audit_id, {"competitors_batch_id": BATCH_APPLIED})
+            return True
+        new_id = await openai_client.create_batch(lines)
+        await db.update_audit(audit_id, {"competitors_batch_id": new_id})
+        await update_progress_counters(
+            audit_id,
+            competitors_total=len(pending),
+            competitors_processed=len(prefilter_updates),
+        )
+        await db.update_audit_step(audit_id, "competitors", {
+            "status": "running",
+            "message": f"OpenAI batch submitted: {len(lines)} extraction request(s) (50% pricing)",
+        })
+        await _heartbeat(audit_id)
+        logger.info(
+            f"[pipeline] {audit_id}: competitors → OpenAI batch {new_id} "
+            f"({len(lines)} requests, {len(prefilter_updates)} prefiltered)"
+        )
+        return True
+
+    if batch_id == BATCH_APPLIED:
+        return False
+
+    try:
+        batch = await openai_client.retrieve_batch(batch_id)
+    except Exception as e:
+        logger.error(
+            f"[pipeline] {audit_id}: competitors batch retrieve failed "
+            f"({batch_id}): {e} — falling back to live"
+        )
+        await db.update_audit(audit_id, {"competitors_batch_id": BATCH_APPLIED})
+        return True
+
+    status = getattr(batch, "status", "unknown")
+    if status in ("validating", "in_progress", "finalizing", "cancelling"):
+        counts = getattr(batch, "request_counts", None)
+        done = getattr(counts, "completed", 0) if counts else 0
+        total_reqs = getattr(counts, "total", 0) if counts else 0
+        await db.update_audit_step(audit_id, "competitors", {
+            "status": "running",
+            "message": f"OpenAI batch {status}: {done}/{total_reqs}",
+        })
+        await _heartbeat(audit_id)
+        return True
+
+    ok: dict = {}
+    errs: dict = {}
+    if status in ("completed", "expired"):
+        # An expired batch still carries partial results in its output file.
+        try:
+            ok, errs = await openai_client.download_batch_results(
+                batch, _ctx=cost_ctx, _operation="competitors_extract_batch"
+            )
+        except Exception as e:
+            logger.error(f"[pipeline] {audit_id}: competitors batch download failed: {e}")
+    else:
+        logger.warning(
+            f"[pipeline] {audit_id}: competitors batch {batch_id} ended "
+            f"'{status}' — all rows fall back to live"
+        )
+
+    updates: list[dict] = []
+    for r in pending:
+        content = ok.get(f"comp:{r['id']}")
+        if not content:
+            continue  # missing / error line → live path retries next ticks
+        try:
+            data = json.loads(content)
+            if not isinstance(data.get("brands"), list):
+                continue
+        except Exception:
+            continue
+        updates.append({"id": r["id"], "competitors": json.dumps(data)})
+
+    CHUNK = 100
+    for i in range(0, len(updates), CHUNK):
+        await db.update_competitors_batch(updates[i:i + CHUNK])
+
+    await db.update_audit(audit_id, {"competitors_batch_id": BATCH_APPLIED})
+    total = audit.get("competitors_total") or len(pending)
+    await update_progress_counters(
+        audit_id,
+        competitors_total=total,
+        competitors_processed=min(total, (audit.get("competitors_processed") or 0) + len(updates)),
+    )
+    await _heartbeat(audit_id)
+    logger.info(
+        f"[pipeline] {audit_id}: competitors batch applied — {len(updates)} ok, "
+        f"{len(errs)} error line(s), {len(pending) - len(updates)} to live path"
+    )
+    return True
+
+
+async def _sentiment_via_batch(
+    audit_id: str,
+    audit: dict,
+    pending: list[dict],
+    all_specs: list,
+    own_set: set,
+    project_name: str,
+    cost_ctx: dict,
+) -> bool:
+    """Batch sub-flow for the sentiment stage. No-brand sentinels and cache
+    hits are written immediately; only cache misses go into the batch."""
+    batch_id = audit.get("sentiment_batch_id")
+
+    def _rows_from_result(rid: str, result: dict) -> tuple[list[dict], list[dict]]:
+        rbs = [{
+            "response_id": rid,
+            "audit_id": audit_id,
+            "brand": b["brand"],
+            "brand_kind": "own" if b["brand"] in own_set else "competitor",
+            "label": b["label"],
+            "score": b["score"],
+            "confidence": b.get("confidence"),
+            "reasoning": b.get("reasoning"),
+            "is_fallback": False,
+            "model": openai_client.MODEL,
+            "prompt_version": openai_client.SENTIMENT_PROMPT_VERSION,
+        } for b in result.get("brands", [])]
+        score, label = _legacy_summary_label(rbs)
+        return rbs, [{"id": rid, "score": score, "label": label}]
+
+    if not batch_id:
+        immediate_rbs: list[dict] = []
+        immediate_legacy: list[dict] = []
+        lines: list[dict] = []
+        for resp in pending:
+            rid = str(resp["id"])
+            answer = resp.get("answer_text") or ""
+            detected = detect_brands_in_text(answer, all_specs)
+            if not detected:
+                immediate_rbs.append({
+                    "response_id": rid, "audit_id": audit_id,
+                    "brand": "__none__", "brand_kind": "none",
+                    "label": "mention_only", "score": 0.0, "confidence": 1.0,
+                    "reasoning": "No brands detected in response text",
+                    "is_fallback": True,
+                    "model": openai_client.MODEL_SENTIMENT,
+                    "prompt_version": openai_client.SENTIMENT_PROMPT_VERSION,
+                })
+                immediate_legacy.append({"id": rid, "score": 0.0, "label": "neutral"})
+                continue
+            cache_key = _sentiment_cache_key(
+                answer, detected, openai_client.MODEL, openai_client.SENTIMENT_PROMPT_VERSION,
+            )
+            cached = await db.get_sentiment_cache(cache_key)
+            if cached and isinstance(cached, dict) and "brands" in cached:
+                rbs, legacy = _rows_from_result(rid, cached)
+                immediate_rbs.extend(rbs)
+                immediate_legacy.extend(legacy)
+                continue
+            messages = openai_client.build_sentiment_messages(
+                resp.get("prompt_text") or "", answer, detected, industry=project_name,
+            )
+            lines.append(openai_client.batch_request_line(
+                f"sent:{rid}", messages,
+                openai_client.MODEL_SENTIMENT, 16384,
+                openai_client.SENTIMENT_SCHEMA,
+            ))
+        if immediate_rbs:
+            await db.upsert_response_brand_sentiment(immediate_rbs)
+        if immediate_legacy:
+            await db.update_sentiment_batch(immediate_legacy)
+        if not lines:
+            await db.update_audit(audit_id, {"sentiment_batch_id": BATCH_APPLIED})
+            return True
+        new_id = await openai_client.create_batch(lines)
+        await db.update_audit(audit_id, {"sentiment_batch_id": new_id})
+        await update_progress_counters(
+            audit_id,
+            sentiment_total=len(pending),
+            sentiment_processed=len(pending) - len(lines),
+        )
+        await db.update_audit_step(audit_id, "sentiment", {
+            "status": "running",
+            "message": f"OpenAI batch submitted: {len(lines)} sentiment request(s) (50% pricing)",
+        })
+        await _heartbeat(audit_id)
+        logger.info(
+            f"[pipeline] {audit_id}: sentiment → OpenAI batch {new_id} "
+            f"({len(lines)} requests, {len(pending) - len(lines)} cached/no-brand)"
+        )
+        return True
+
+    if batch_id == BATCH_APPLIED:
+        return False
+
+    try:
+        batch = await openai_client.retrieve_batch(batch_id)
+    except Exception as e:
+        logger.error(
+            f"[pipeline] {audit_id}: sentiment batch retrieve failed "
+            f"({batch_id}): {e} — falling back to live"
+        )
+        await db.update_audit(audit_id, {"sentiment_batch_id": BATCH_APPLIED})
+        return True
+
+    status = getattr(batch, "status", "unknown")
+    if status in ("validating", "in_progress", "finalizing", "cancelling"):
+        counts = getattr(batch, "request_counts", None)
+        done = getattr(counts, "completed", 0) if counts else 0
+        total_reqs = getattr(counts, "total", 0) if counts else 0
+        await db.update_audit_step(audit_id, "sentiment", {
+            "status": "running",
+            "message": f"OpenAI batch {status}: {done}/{total_reqs}",
+        })
+        await _heartbeat(audit_id)
+        return True
+
+    ok: dict = {}
+    errs: dict = {}
+    if status in ("completed", "expired"):
+        try:
+            ok, errs = await openai_client.download_batch_results(
+                batch, _ctx=cost_ctx, _operation="sentiment_analyze_batch"
+            )
+        except Exception as e:
+            logger.error(f"[pipeline] {audit_id}: sentiment batch download failed: {e}")
+    else:
+        logger.warning(
+            f"[pipeline] {audit_id}: sentiment batch {batch_id} ended "
+            f"'{status}' — all rows fall back to live"
+        )
+
+    flat_rbs: list[dict] = []
+    flat_legacy: list[dict] = []
+    applied = 0
+    for resp in pending:
+        rid = str(resp["id"])
+        content = ok.get(f"sent:{rid}")
+        if not content:
+            continue
+        answer = resp.get("answer_text") or ""
+        detected = detect_brands_in_text(answer, all_specs)
+        try:
+            parsed = json.loads(content)
+        except Exception:
+            continue
+        result = openai_client.normalize_sentiment_result(parsed, detected)
+        try:
+            await db.put_sentiment_cache(
+                _sentiment_cache_key(
+                    answer, detected, openai_client.MODEL, openai_client.SENTIMENT_PROMPT_VERSION,
+                ),
+                result,
+            )
+        except Exception:
+            pass
+        rbs, legacy = _rows_from_result(rid, result)
+        flat_rbs.extend(rbs)
+        flat_legacy.extend(legacy)
+        applied += 1
+
+    CHUNK = 200
+    for i in range(0, len(flat_rbs), CHUNK):
+        await db.upsert_response_brand_sentiment(flat_rbs[i:i + CHUNK])
+    for i in range(0, len(flat_legacy), CHUNK):
+        await db.update_sentiment_batch(flat_legacy[i:i + CHUNK])
+
+    await db.update_audit(audit_id, {"sentiment_batch_id": BATCH_APPLIED})
+    total = audit.get("sentiment_total") or len(pending)
+    await update_progress_counters(
+        audit_id,
+        sentiment_total=total,
+        sentiment_processed=min(total, (audit.get("sentiment_processed") or 0) + applied),
+    )
+    await _heartbeat(audit_id)
+    logger.info(
+        f"[pipeline] {audit_id}: sentiment batch applied — {applied} ok, "
+        f"{len(errs)} error line(s), {len(pending) - applied} to live path"
+    )
+    return True
+
+
 async def handle_competitors(audit_id: str, worker_id: str) -> None:
     """Extract competitors with per-batch checkpointing.
 
@@ -1000,6 +1331,14 @@ async def handle_competitors(audit_id: str, worker_id: str) -> None:
         return
 
     pending_count = len(pending)
+
+    # ── OpenAI Batch API path (scheduled audits, 50% pricing) ────────
+    audit_row0 = await db.get_audit(audit_id) or {}
+    if _use_openai_batch(audit_row0) and audit_row0.get("competitors_batch_id") != BATCH_APPLIED:
+        min_rows = getattr(settings, "openai_batch_min_rows", 8)
+        if audit_row0.get("competitors_batch_id") or pending_count >= min_rows:
+            if await _competitors_via_batch(audit_id, audit_row0, pending):
+                return
 
     # ── Force-skip guard (NULL-only) ─────────────────────────────────
     # Only force-skip rows where answer_competitors is still NULL after a
@@ -1296,6 +1635,15 @@ async def handle_sentiment(audit_id: str, worker_id: str) -> None:
     _, project_id, _ = await db.get_own_brands(audit_id)
     user_id = await _get_audit_run_by(audit_id)
     cost_ctx = {"audit_id": audit_id, "project_id": project_id, "user_id": user_id}
+
+    # ── OpenAI Batch API path (scheduled audits, 50% pricing) ────────
+    if _use_openai_batch(audit) and audit.get("sentiment_batch_id") != BATCH_APPLIED:
+        min_rows = getattr(settings, "openai_batch_min_rows", 8)
+        if audit.get("sentiment_batch_id") or pending_count >= min_rows:
+            if await _sentiment_via_batch(
+                audit_id, audit, pending, all_specs, own_set, project_name, cost_ctx
+            ):
+                return
 
     # Cumulative total/processed across invocations (mirrors handle_competitors).
     total = audit.get("sentiment_total") or 0

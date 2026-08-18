@@ -57,6 +57,12 @@ class Settings(BaseSettings):
 
     # OpenAI API
     openai_api_key: str = ""
+    # Scheduled audits run competitor extraction + sentiment through the
+    # OpenAI Batch API (50% pricing, async completion window). Manual audits
+    # keep live calls for fast feedback.
+    openai_batch_for_scheduled: bool = True
+    # Below this many pending rows a batch isn't worth the latency — use live.
+    openai_batch_min_rows: int = 8
 
     # OneSearch API (self or remote backend)
     onesearch_api_url: str = "http://localhost:8000"

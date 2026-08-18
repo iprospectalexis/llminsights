@@ -408,6 +408,9 @@ async def run_audit(req: RunAuditRequest, background_tasks: BackgroundTasks):
         "data_provider": provider_map.get(audit_llms[0], "BrightData"),
         "responses_expected": total_responses,
         "runs_per_prompt": runs_per_prompt,
+        # Scheduled audits run extraction/sentiment via the OpenAI Batch API
+        # (50% pricing) — see audit_pipeline._use_openai_batch.
+        "is_scheduled": bool(req.isScheduled),
     })
     audit_id = str(audit["id"])
 
