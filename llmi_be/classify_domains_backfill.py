@@ -18,6 +18,7 @@ from sqlalchemy import text
 
 from app.database import AsyncSessionLocal
 from app.services import domain_classifier
+from app.services.supabase_db import db
 
 
 async def _purge_fallback_rows() -> int:
@@ -29,11 +30,31 @@ async def _purge_fallback_rows() -> int:
         return res.rowcount or 0
 
 
+async def _reapply_rules() -> int:
+    """Upgrade previously LLM-classified domains that a (newer) curated rule
+    now covers — rules are authoritative over nano guesses."""
+    async with AsyncSessionLocal() as s:
+        domains = (await s.execute(text(
+            "SELECT domain FROM domain_categories WHERE source = 'llm'"
+        ))).scalars().all()
+    upserts = [
+        {"domain": d, "category": cat, "source": "rule", "confidence": 1.0}
+        for d in domains
+        if (cat := domain_classifier.classify_by_rules(d))
+    ]
+    if upserts:
+        await db.upsert_domain_categories(upserts)
+    return len(upserts)
+
+
 async def main() -> None:
     per_loop = int(sys.argv[1]) if len(sys.argv) > 1 else 300
     purged = await _purge_fallback_rows()
     if purged:
         print(f"purged {purged} low-confidence fallback rows for re-classification", flush=True)
+    upgraded = await _reapply_rules()
+    if upgraded:
+        print(f"re-applied curated rules to {upgraded} previously LLM-classified domains", flush=True)
     total = {"rules": 0, "llm": 0, "failed": 0}
     loops = 0
     while True:

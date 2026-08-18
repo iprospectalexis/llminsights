@@ -969,7 +969,9 @@ class SupabaseDB:
     async def get_unclassified_citation_domains(
         self, limit: int = 300, audit_id: Optional[str] = None
     ) -> list[str]:
-        """Distinct citation domains with no domain_categories row yet."""
+        """Distinct citation domains with no domain_categories row yet,
+        most-cited first — so a capped/interrupted backfill spends the LLM
+        budget on the domains users actually see."""
         aud = "AND c.audit_id = :aid" if audit_id else ""
         params: dict[str, Any] = {"lim": limit}
         if audit_id:
@@ -977,12 +979,14 @@ class SupabaseDB:
         async with AsyncSessionLocal() as s:
             rows = (await s.execute(
                 text(f"""
-                    SELECT DISTINCT c.domain
+                    SELECT c.domain
                     FROM citations c
                     LEFT JOIN domain_categories dc ON dc.domain = c.domain
                     WHERE c.domain IS NOT NULL AND c.domain <> ''
                       AND dc.domain IS NULL
                       {aud}
+                    GROUP BY c.domain
+                    ORDER BY count(*) DESC
                     LIMIT :lim
                 """),
                 params,
