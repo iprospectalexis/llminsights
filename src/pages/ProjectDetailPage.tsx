@@ -282,7 +282,19 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
   const [domainCategoryFilter, setDomainCategoryFilter] = useState<string>('all');
 
   useEffect(() => {
-    const domains = Array.from(new Set(citations.map(c => c.domain).filter(Boolean)));
+    // processedCitations is what the Domains tab actually renders: citation
+    // table rows PLUS citations extracted client-side from llm_responses
+    // JSON (all_sources / links_attached). Keying the fetch on `citations`
+    // alone left every JSON-derived domain Unknown.
+    const domainSet = new Set<string>();
+    processedCitations.forEach(c => {
+      if (!c.domain) return;
+      domainSet.add(c.domain);
+      // domain_categories keys are backend-normalized (lowercase, no www),
+      // so query the normalized variant of client-extracted domains too.
+      domainSet.add(String(c.domain).toLowerCase().replace(/^www\./, ''));
+    });
+    const domains = Array.from(domainSet);
     if (domains.length === 0) {
       setDomainCategoryMap({});
       return;
@@ -290,21 +302,23 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     let cancelled = false;
     (async () => {
       const map: Record<string, string> = {};
-      for (let i = 0; i < domains.length; i += 500) {
+      // Small chunks keep the PostgREST in.() URL well under gateway
+      // limits; one failed chunk must not abort the rest.
+      for (let i = 0; i < domains.length; i += 150) {
         const { data, error } = await supabase
           .from('domain_categories')
           .select('domain, category')
-          .in('domain', domains.slice(i, i + 500));
+          .in('domain', domains.slice(i, i + 150));
         if (error) {
           console.error('Error fetching domain categories:', error);
-          break;
+          continue;
         }
         (data || []).forEach((r: any) => { map[r.domain] = r.category; });
       }
       if (!cancelled) setDomainCategoryMap(map);
     })();
     return () => { cancelled = true; };
-  }, [citations]);
+  }, [processedCitations]);
 
 
   useEffect(() => {
