@@ -7,6 +7,10 @@
 # --------------- Stage 1: Frontend Build ---------------
 FROM node:20-alpine AS frontend-build
 
+# git: vite.config.ts derives the app version / last-update date from the
+# repository at build time (sidebar footer).
+RUN apk add --no-cache git
+
 WORKDIR /app
 
 # Install dependencies first (cache layer)
@@ -17,6 +21,10 @@ RUN npm ci
 COPY index.html vite.config.ts tsconfig*.json tailwind.config.js postcss.config.js ./
 COPY src/ ./src/
 COPY public/ ./public/
+
+# Git metadata for the build-time version stamp (~4 MB; .dockerignore no
+# longer excludes .git). Placed last so it doesn't bust the npm ci cache.
+COPY .git/ ./.git/
 
 # Build-time env vars (injected via --build-arg or .env.production)
 ARG VITE_SUPABASE_URL

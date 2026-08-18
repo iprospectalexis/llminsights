@@ -9,7 +9,8 @@ dist/
 dist-ssr/
 
 # Dev files
-.git/
+# (.git is intentionally NOT ignored: the frontend build stamps the app
+# version / last-update date from git metadata — see Dockerfile + vite.config)
 .vscode/
 .idea/
 *.local

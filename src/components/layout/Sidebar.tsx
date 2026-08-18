@@ -955,11 +955,20 @@ export const Sidebar: React.FC<SidebarProps> = ({ user, userProfile, isOpen, onT
         </div>
       </div>
 
-      {/* Version Number */}
+      {/* Version / last update — injected at build time from git
+          (vite.config define), refreshes automatically on every deploy. */}
       {!effectiveCollapsed && (
-        <div className="px-5 pb-4">
+        <div className="px-5 pb-4" title={__APP_COMMIT__ ? `commit ${__APP_COMMIT__}` : undefined}>
           <p className="text-xs text-gray-400 dark:text-gray-600 text-center">
-            v1.5.2
+            v{__APP_VERSION__}
+          </p>
+          <p className="text-[11px] text-gray-400 dark:text-gray-600 text-center mt-0.5">
+            Updated {new Date(__APP_UPDATED_AT__).toLocaleDateString('fr-FR', {
+              day: '2-digit', month: '2-digit', year: 'numeric',
+            })}{' '}
+            {new Date(__APP_UPDATED_AT__).toLocaleTimeString('fr-FR', {
+              hour: '2-digit', minute: '2-digit',
+            })}
           </p>
         </div>
       )}
