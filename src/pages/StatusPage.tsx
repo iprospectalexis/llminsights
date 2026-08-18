@@ -149,7 +149,22 @@ export function StatusPage() {
 
       const { audits: auditsWithMetrics } = await response.json();
       const auditsList: Audit[] = auditsWithMetrics || [];
-      setAudits(auditsList);
+      // Merge the snapshot instead of replacing state. The edge function
+      // takes seconds (it loops queries per audit), so its rows are often
+      // OLDER than what realtime UPDATE events already applied — a wholesale
+      // replace made the pipeline stepper bounce backwards on every poll
+      // (Competitors → Fetching → Sentiment → Fetching…). Per audit, keep
+      // whichever row is fresher by last_activity_at.
+      setAudits(prev => {
+        const prevById = new Map(prev.map(a => [a.id, a]));
+        return auditsList.map(incoming => {
+          const cur = prevById.get(incoming.id);
+          if (!cur) return incoming;
+          const curTs = cur.last_activity_at ? Date.parse(cur.last_activity_at) : 0;
+          const incTs = incoming.last_activity_at ? Date.parse(incoming.last_activity_at) : 0;
+          return incTs < curTs ? cur : { ...cur, ...incoming };
+        });
+      });
 
       // Fetch the real collected counts (see responseStats above).
       const ids = auditsList.map((a) => a.id);
@@ -231,9 +246,14 @@ export function StatusPage() {
         schema: 'public',
         table: 'audits',
       }, (payload) => {
-        setAudits(prev => prev.map(a =>
-          a.id === payload.new.id ? { ...a, ...payload.new } : a
-        ));
+        setAudits(prev => prev.map(a => {
+          if (a.id !== payload.new.id) return a;
+          // Same freshness guard as the snapshot merge — never apply an
+          // update older than what's already displayed.
+          const curTs = a.last_activity_at ? Date.parse(a.last_activity_at) : 0;
+          const incTs = payload.new.last_activity_at ? Date.parse(payload.new.last_activity_at) : 0;
+          return incTs < curTs ? a : { ...a, ...payload.new };
+        }));
       })
       .subscribe();
     realtimeChannelRef.current = channel;
@@ -591,8 +611,26 @@ export function StatusPage() {
     { key: 'finalizing', label: 'Finalizing', icon: Flag },
   ] as const;
 
+  // Normalize both pipeline_state values and legacy current_step values to
+  // stepper keys. Without this, a row where only current_step is available
+  // (e.g. 'getting_results') resolved to index -1 and the stepper collapsed
+  // to "Fetching" — one of the two causes of the jumping-steps bug.
+  const STATE_TO_STEP_KEY: Record<string, string> = {
+    created: 'fetching',
+    fetching: 'fetching',
+    polling: 'polling',
+    getting_results: 'polling',
+    extracting_competitors: 'extracting_competitors',
+    processing_results: 'extracting_competitors',
+    analyzing_sentiment: 'analyzing_sentiment',
+    sentiment_analysis: 'analyzing_sentiment',
+    finalizing: 'finalizing',
+    completing: 'finalizing',
+  };
+
   const getStepStatus = (stepKey: string, audit: Audit): 'done' | 'running' | 'pending' | 'error' => {
-    const state = audit.pipeline_state || audit.current_step || '';
+    const raw = audit.pipeline_state || audit.current_step || '';
+    const state = STATE_TO_STEP_KEY[raw] ?? raw;
     if (audit.status === 'failed') {
       const stepIdx = PIPELINE_STEPS.findIndex(s => s.key === stepKey);
       const currentIdx = PIPELINE_STEPS.findIndex(s => s.key === state);
