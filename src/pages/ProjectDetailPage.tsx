@@ -9,6 +9,7 @@ import { Modal } from '../components/ui/Modal';
 import { Input } from '../components/ui/Input';
 import { Progress } from '../components/ui/Progress';
 import { supabase } from '../lib/supabase';
+import { DOMAIN_CATEGORIES, categoryChipClass } from '../lib/domainCategories';
 import { queryCache } from '../lib/queryCache';
 import { Calendar, FileText, ChartBar as BarChart3, Globe, Users, Play, ArrowLeft, Brain, Download, Settings as SettingsIcon, PencilLine, X, MessageSquare, Crown, TrendingUp, Lightbulb, Trash2, Info, Settings, CalendarCheck, ArrowUpDown, ArrowUp, ArrowDown, BadgeCheck, MessageCircle, List, ChevronDown, Smile } from 'lucide-react';
 import { SentimentDashboard } from '../components/sentiment/SentimentDashboard';
@@ -274,6 +275,36 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     column: 'mentions',
     direction: 'desc'
   });
+
+  // Global domain → category map (from domain_categories) + filter for the
+  // Domains tab. Own Brand / Competitor are computed per project on top.
+  const [domainCategoryMap, setDomainCategoryMap] = useState<Record<string, string>>({});
+  const [domainCategoryFilter, setDomainCategoryFilter] = useState<string>('all');
+
+  useEffect(() => {
+    const domains = Array.from(new Set(citations.map(c => c.domain).filter(Boolean)));
+    if (domains.length === 0) {
+      setDomainCategoryMap({});
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      const map: Record<string, string> = {};
+      for (let i = 0; i < domains.length; i += 500) {
+        const { data, error } = await supabase
+          .from('domain_categories')
+          .select('domain, category')
+          .in('domain', domains.slice(i, i + 500));
+        if (error) {
+          console.error('Error fetching domain categories:', error);
+          break;
+        }
+        (data || []).forEach((r: any) => { map[r.domain] = r.category; });
+      }
+      if (!cancelled) setDomainCategoryMap(map);
+    })();
+    return () => { cancelled = true; };
+  }, [citations]);
 
 
   useEffect(() => {
@@ -2281,6 +2312,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
   const exportDomainsToExcel = () => {
     const exportData = getFilteredDomainStats().map((domain: any) => ({
       'Domain': domain.domain,
+      'Category': domain.category || 'Unknown',
       'Citations (Cited)': domain.mentions,
       'Cited Prompts': domain.citedPrompts || 0,
       '% of Cited Prompts': `${domain.citedPromptsPercentage}%`,
@@ -2667,6 +2699,35 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     });
   };
 
+  // Project-relative overlay on top of the global category: the project's own
+  // domain (and domains matching own-brand names) show as "Own Brand", domains
+  // matching competitor brand names as "Competitor". Falls back to the stored
+  // global category, then "Unknown".
+  const getDomainDisplayCategory = (rawDomain: string): string => {
+    const domain = (rawDomain || '').toLowerCase().replace(/^www\./, '');
+    if (!domain) return 'Unknown';
+
+    if (project?.domain) {
+      const projectDomain = project.domain.toLowerCase().replace(/^www\./, '');
+      if (domain === projectDomain || domain.endsWith(`.${projectDomain}`)) {
+        return 'Own Brand';
+      }
+    }
+
+    // Match the registrable label ("credit-agricole" in credit-agricole.fr)
+    // against normalized brand names ("Crédit Agricole" → "creditagricole").
+    const normalize = (s: string) =>
+      s.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9]/g, '');
+    const labels = domain.split('.');
+    const secondLevel = normalize(labels.length >= 2 ? labels[labels.length - 2] : labels[0]);
+    if (secondLevel.length >= 3) {
+      if (brands.some(b => normalize(b.brand_name || '') === secondLevel)) return 'Own Brand';
+      if (competitors.some(b => normalize(b.brand_name || '') === secondLevel)) return 'Competitor';
+    }
+
+    return domainCategoryMap[rawDomain] || domainCategoryMap[domain] || 'Unknown';
+  };
+
   const getFilteredDomainStats = () => {
     const domainStats = filteredCitations.reduce((acc, citation) => {
       if (!citation.domain) return acc;
@@ -2788,6 +2849,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
 
       return {
         ...domain,
+        category: getDomainDisplayCategory(domain.domain),
         citedPrompts,
         citedPromptsPercentage,
         citedPages,
@@ -2799,6 +2861,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
           : 'N/A',
       };
     })
+    .filter((d: any) => domainCategoryFilter === 'all' || d.category === domainCategoryFilter)
     .sort((a: any, b: any) => {
       let aValue = a[domainSortConfig.column];
       let bValue = b[domainSortConfig.column];
@@ -5349,13 +5412,28 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
             <div>
               <div className="flex items-center justify-between mb-4">
                 <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100">Domain Performance</h3>
-                <button
-                  onClick={exportDomainsToExcel}
-                  className="inline-flex items-center gap-2 px-3 py-2 bg-brand-primary hover:bg-brand-primary/90 text-white rounded-lg transition-colors text-sm"
-                >
-                  <Download className="w-4 h-4" />
-                  Export to Excel
-                </button>
+                <div className="flex items-center gap-3">
+                  <select
+                    value={domainCategoryFilter}
+                    onChange={(e) => setDomainCategoryFilter(e.target.value)}
+                    className="px-3 py-2 rounded-lg text-sm bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-300 border border-gray-300 dark:border-gray-600 focus:outline-none focus:ring-2 focus:ring-brand-primary"
+                  >
+                    <option value="all">All categories</option>
+                    <option value="Own Brand">Own Brand</option>
+                    <option value="Competitor">Competitor</option>
+                    {DOMAIN_CATEGORIES.map(cat => (
+                      <option key={cat} value={cat}>{cat}</option>
+                    ))}
+                    <option value="Unknown">Unknown</option>
+                  </select>
+                  <button
+                    onClick={exportDomainsToExcel}
+                    className="inline-flex items-center gap-2 px-3 py-2 bg-brand-primary hover:bg-brand-primary/90 text-white rounded-lg transition-colors text-sm"
+                  >
+                    <Download className="w-4 h-4" />
+                    Export to Excel
+                  </button>
+                </div>
               </div>
               <div className="overflow-x-auto">
                 <table className="w-full text-sm">
@@ -5368,6 +5446,15 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                         >
                           Domain
                           {renderSortIcon('domain', domainSortConfig)}
+                        </button>
+                      </th>
+                      <th className="text-left py-3 px-2 text-gray-900 dark:text-gray-100">
+                        <button
+                          onClick={() => handleDomainSort('category')}
+                          className="flex items-center gap-1 hover:text-brand-primary transition-colors"
+                        >
+                          Category
+                          {renderSortIcon('category', domainSortConfig)}
                         </button>
                       </th>
                       <th className="text-center py-3 px-2 text-gray-900 dark:text-gray-100">
@@ -5456,6 +5543,11 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                               {domain.domain}
                             </button>
                           </div>
+                        </td>
+                        <td className="py-3 px-2">
+                          <span className={categoryChipClass(domain.category)}>
+                            {domain.category}
+                          </span>
                         </td>
                         <td className="py-3 px-2 text-center text-gray-900 dark:text-gray-100">{domain.mentions}</td>
                         <td className="py-3 px-2 text-center text-gray-900 dark:text-gray-100">

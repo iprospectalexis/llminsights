@@ -966,6 +966,56 @@ class SupabaseDB:
                 await s.execute(text(sql), params)
             await s.commit()
 
+    async def get_unclassified_citation_domains(
+        self, limit: int = 300, audit_id: Optional[str] = None
+    ) -> list[str]:
+        """Distinct citation domains with no domain_categories row yet."""
+        aud = "AND c.audit_id = :aid" if audit_id else ""
+        params: dict[str, Any] = {"lim": limit}
+        if audit_id:
+            params["aid"] = audit_id
+        async with AsyncSessionLocal() as s:
+            rows = (await s.execute(
+                text(f"""
+                    SELECT DISTINCT c.domain
+                    FROM citations c
+                    LEFT JOIN domain_categories dc ON dc.domain = c.domain
+                    WHERE c.domain IS NOT NULL AND c.domain <> ''
+                      AND dc.domain IS NULL
+                      {aud}
+                    LIMIT :lim
+                """),
+                params,
+            )).scalars().all()
+            return [r for r in rows if r]
+
+    async def upsert_domain_categories(self, rows: list[dict]) -> None:
+        """Upsert domain → category rows. A 'manual' row is never overwritten
+        by rule/llm re-classification."""
+        if not rows:
+            return
+        async with AsyncSessionLocal() as s:
+            for r in rows:
+                await s.execute(
+                    text("""
+                        INSERT INTO domain_categories (domain, category, source, confidence, updated_at)
+                        VALUES (:domain, :category, :source, :confidence, now())
+                        ON CONFLICT (domain) DO UPDATE SET
+                            category   = EXCLUDED.category,
+                            source     = EXCLUDED.source,
+                            confidence = EXCLUDED.confidence,
+                            updated_at = now()
+                        WHERE domain_categories.source <> 'manual'
+                    """),
+                    {
+                        "domain": r["domain"],
+                        "category": r["category"],
+                        "source": r.get("source", "llm"),
+                        "confidence": r.get("confidence"),
+                    },
+                )
+            await s.commit()
+
     # ── Brands ────────────────────────────────────────────────────────
 
     async def get_own_brands(self, audit_id: str) -> tuple[list[str], Optional[str], Optional[str]]:

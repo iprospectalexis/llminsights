@@ -1938,6 +1938,13 @@ async def handle_finalize(audit_id: str, worker_id: str) -> None:
     except Exception as e:
         logger.warning(f"[pipeline] {audit_id}: audit metrics refresh warning: {e}")
 
+    # Categorize any citation domains this audit introduced (best-effort).
+    try:
+        from app.services import domain_classifier
+        await domain_classifier.classify_new_domains(audit_id=audit_id)
+    except Exception as e:
+        logger.warning(f"[pipeline] {audit_id}: domain categorization warning: {e}")
+
     try:
         await db.update_audit_step(audit_id, "persist", {
             "status": "done", "message": "Results saved"

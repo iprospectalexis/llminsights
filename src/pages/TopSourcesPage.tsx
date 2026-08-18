@@ -5,6 +5,7 @@ import { Button } from '../components/ui/Button';
 import { LoadingSpinner } from '../components/ui/LoadingSpinner';
 import { Input } from '../components/ui/Input';
 import { supabase } from '../lib/supabase';
+import { DOMAIN_CATEGORIES, categoryChipClass } from '../lib/domainCategories';
 import { Search, ChevronLeft, ChevronRight, ArrowUpDown, Trophy } from 'lucide-react';
 
 const LLM_NAMES = {
@@ -35,6 +36,7 @@ interface DomainCitation {
   total_citations: number;
   first_seen: string;
   last_seen: string;
+  category: string;
 }
 
 interface PaginationInfo {
@@ -57,6 +59,7 @@ export function TopSourcesPage() {
   const [domainLoading, setDomainLoading] = useState(true);
   const [selectedLLM, setSelectedLLM] = useState<string>('all');
   const [dateFrame, setDateFrame] = useState<DateFrame>('all');
+  const [categoryFilter, setCategoryFilter] = useState<string>('all');
   const [domainSearch, setDomainSearch] = useState('');
   const [sortBy, setSortBy] = useState<'cited_count' | 'more_count' | 'total_citations'>('total_citations');
   const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('desc');
@@ -73,7 +76,7 @@ export function TopSourcesPage() {
     }, 300);
 
     return () => clearTimeout(timeoutId);
-  }, [selectedLLM, dateFrame, domainSearch, sortBy, sortOrder, pagination.page]);
+  }, [selectedLLM, dateFrame, categoryFilter, domainSearch, sortBy, sortOrder, pagination.page]);
 
   const fetchDomainCitations = async () => {
     setDomainLoading(true);
@@ -93,6 +96,7 @@ export function TopSourcesPage() {
         p_asc: sortOrder === 'asc',
         p_limit: pagination.pageSize,
         p_offset: (pagination.page - 1) * pagination.pageSize,
+        p_category: categoryFilter !== 'all' ? categoryFilter : null,
       });
 
       if (error) {
@@ -109,6 +113,7 @@ export function TopSourcesPage() {
         total_citations: Number(r.total_citations),
         first_seen: r.first_seen,
         last_seen: r.last_seen,
+        category: r.category || 'Unknown',
       })));
 
       const total = rows.length > 0 ? Number(rows[0].total_count) : 0;
@@ -236,6 +241,27 @@ export function TopSourcesPage() {
                   </div>
                 </div>
 
+                {/* Category */}
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+                    Category
+                  </label>
+                  <select
+                    value={categoryFilter}
+                    onChange={(e) => {
+                      setCategoryFilter(e.target.value);
+                      setPagination(prev => ({ ...prev, page: 1 }));
+                    }}
+                    className="px-3 py-2 rounded-lg text-sm font-medium bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-300 border border-gray-300 dark:border-gray-600 focus:outline-none focus:ring-2 focus:ring-brand-primary"
+                  >
+                    <option value="all">All categories</option>
+                    {DOMAIN_CATEGORIES.map(cat => (
+                      <option key={cat} value={cat}>{cat}</option>
+                    ))}
+                    <option value="Unknown">Unknown</option>
+                  </select>
+                </div>
+
                 {/* Domain Search */}
                 <div className="flex-1">
                   <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
@@ -271,6 +297,9 @@ export function TopSourcesPage() {
                         <tr>
                           <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
                             Domain
+                          </th>
+                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
+                            Category
                           </th>
                           <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
                             LLM
@@ -344,6 +373,11 @@ export function TopSourcesPage() {
                                 />
                                 {citation.domain}
                               </div>
+                            </td>
+                            <td className="px-6 py-4 whitespace-nowrap text-sm">
+                              <span className={categoryChipClass(citation.category)}>
+                                {citation.category}
+                              </span>
                             </td>
                             <td className="px-6 py-4 whitespace-nowrap text-sm">
                               {citation.llm === 'all' ? (
