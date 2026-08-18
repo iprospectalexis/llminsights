@@ -2303,8 +2303,10 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
 
   const exportPagesToExcel = () => {
     const exportData = getFilteredPageStats().map(page => ({
+      'Title': page.title || '',
       'Page URL': page.page_url,
       'Domain': page.domain,
+      'Category': page.category || 'Unknown',
       'Citations (Cited)': page.mentions,
       'Citations (More)': page.more_count || 0,
       'Total Citations': page.mentions + (page.more_count || 0),
@@ -2616,6 +2618,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
         acc[normalizedUrl] = {
           page_url: citation.page_url, // Keep one original URL for display
           domain: citation.domain,
+          title: null,
           mentions: 0,
           more_count: 0,
           all_sources_count: 0,
@@ -2624,6 +2627,16 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
           firstSeen: citation.checked_at,
           lastSeen: citation.checked_at,
         };
+      }
+
+      // citation_text usually carries the cited page's title — keep the
+      // first real one (skip placeholders and raw URLs) for display.
+      if (!acc[normalizedUrl].title) {
+        const text = citation.citation_text;
+        if (text && text !== 'No description available' && text !== 'No description'
+            && !/^https?:\/\//i.test(text)) {
+          acc[normalizedUrl].title = text;
+        }
       }
 
       // Apply counting logic based on current filter
@@ -2694,7 +2707,10 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
       }
     });
 
-    const pages = Object.values(pageStats);
+    const pages = Object.values(pageStats).map((p: any) => ({
+      ...p,
+      category: getDomainDisplayCategory(p.domain),
+    }));
 
     // Apply sorting
     return pages.sort((a: any, b: any) => {
@@ -5350,6 +5366,15 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                           {renderSortIcon('domain', pageSortConfig)}
                         </button>
                       </th>
+                      <th className="text-left py-3 px-2 text-gray-900 dark:text-gray-100">
+                        <button
+                          onClick={() => handlePageSort('category')}
+                          className="flex items-center gap-1 hover:text-brand-primary transition-colors"
+                        >
+                          Category
+                          {renderSortIcon('category', pageSortConfig)}
+                        </button>
+                      </th>
                       <th className="text-center py-3 px-2 text-gray-900 dark:text-gray-100">
                         <button
                           onClick={() => handlePageSort('mentions')}
@@ -5391,25 +5416,48 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                   <tbody>
                     {getFilteredPageStats().map((page, index) => (
                       <tr key={index} className="border-b border-gray-100 dark:border-gray-800">
-                        <td className="py-3 px-2 font-medium max-w-xs truncate">
-                          <div className="flex items-center">
+                        <td className="py-3 px-2 max-w-md">
+                          <div className="flex items-start">
                             <img
                               src={`https://www.google.com/s2/favicons?domain=${extractDomain(page.page_url)}&sz=32`}
                               alt={`${extractDomain(page.page_url)} favicon`}
-                              className="w-4 h-4 mr-2 flex-shrink-0"
+                              className="w-4 h-4 mr-2 mt-0.5 flex-shrink-0"
                               onError={(e) => {
                                 const target = e.target as HTMLImageElement;
                                 target.style.display = 'none';
                               }}
                             />
-                            <div className="text-sm text-gray-900 dark:text-gray-100 max-w-md truncate">
-                              <a href={page.page_url} target="_blank" rel="noopener noreferrer" className="text-brand-primary hover:underline">
+                            <div className="min-w-0">
+                              {page.title && (
+                                <div
+                                  className="text-sm font-medium text-gray-900 dark:text-gray-100 truncate"
+                                  title={page.title}
+                                >
+                                  {page.title}
+                                </div>
+                              )}
+                              <a
+                                href={page.page_url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                title={page.page_url}
+                                className={`block truncate hover:underline ${
+                                  page.title
+                                    ? 'text-xs text-gray-500 dark:text-gray-400 hover:text-brand-primary'
+                                    : 'text-sm text-brand-primary'
+                                }`}
+                              >
                                 {page.page_url}
                               </a>
                             </div>
                           </div>
                         </td>
                         <td className="py-3 px-2 text-gray-900 dark:text-gray-100">{page.domain}</td>
+                        <td className="py-3 px-2">
+                          <span className={categoryChipClass(page.category)}>
+                            {page.category}
+                          </span>
+                        </td>
                         <td className="py-3 px-2 text-center text-gray-900 dark:text-gray-100">{page.mentions}</td>
                         <td className="py-3 px-2 text-center text-gray-900 dark:text-gray-100">{page.more_count || 0}</td>
                         <td className="py-3 px-2 text-center text-gray-900 dark:text-gray-100 font-semibold">{page.mentions + (page.more_count || 0)}</td>
