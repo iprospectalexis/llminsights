@@ -205,7 +205,14 @@ _CATEGORY_GUIDE = (
 
 
 async def _classify_batch_llm(domains: list) -> dict:
-    """Classify up to ~50 domains in one gpt-5-nano structured call."""
+    """Classify a batch of domains in one gpt-5-nano structured call.
+
+    Raises on empty/unparseable responses so the caller counts the batch as
+    failed instead of persisting fallback junk. gpt-5-nano is a reasoning
+    model: the completion budget must also cover hidden reasoning tokens
+    (4096 died with finish_reason=length, all 4096 spent on reasoning),
+    hence 16384 like the sentiment calls.
+    """
     messages = [
         {
             "role": "system",
@@ -223,23 +230,25 @@ async def _classify_batch_llm(domains: list) -> dict:
     ]
     raw = await openai_client._call_openai(
         messages,
-        max_tokens=4096,
+        max_tokens=16384,
         response_format={"type": "json_schema", "json_schema": DOMAIN_CATEGORY_SCHEMA},
         _operation="domain_categorize",
         model=openai_client.MODEL_COMPETITORS,
     )
     if not raw:
-        return {}
-    out: dict = {}
+        raise RuntimeError("empty model response")
     try:
         parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        return {}
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"unparseable model response: {e}")
+    out: dict = {}
     for entry in parsed.get("domains", []):
         d = _norm(entry.get("domain") or "")
         cat = entry.get("category")
         if d and cat in CATEGORIES:
             out[d] = cat
+    if not out:
+        raise RuntimeError("no valid domain entries in model response")
     return out
 
 
@@ -272,7 +281,9 @@ async def classify_new_domains(limit: int = 300, audit_id: Optional[str] = None)
 
     llm_count = 0
     failed = 0
-    BATCH = 50
+    # Small batches keep nano's reasoning short; 50 at once made it think
+    # itself past the token budget.
+    BATCH = 20
     for i in range(0, len(rest), BATCH):
         chunk = rest[i:i + BATCH]
         norms = sorted({nd for _, nd in chunk})
