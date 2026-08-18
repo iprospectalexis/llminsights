@@ -92,6 +92,19 @@ def extract_domain(url: str) -> str:
         return url
 
 
+def _is_google_internal(url: str) -> bool:
+    """True for Google's own URLs (google.com/search, *.google.fr...) —
+    never legitimate citation targets, but BrightData organic entries carry
+    the SERP's own URL in their `url` field."""
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return False
+    if host.startswith("www."):
+        host = host[4:]
+    return host.startswith("google.") or ".google." in host or host == "google"
+
+
 def collect_citations(result: dict, response: dict) -> list[dict]:
     """Collect citations from an LLM result — pure function, no DB ops."""
     citations = []
@@ -122,12 +135,31 @@ def collect_citations(result: dict, response: dict) -> list[dict]:
     elif llm == "perplexity" and result.get("sources"):
         for i, src in enumerate(result["sources"]):
             _add(src.get("url", ""), src.get("title") or src.get("description") or src.get("snippet"), i + 1)
-    elif llm in ("google-ai-overview", "google-ai-mode") and result.get("aio_citations"):
-        for i, cit in enumerate(result["aio_citations"]):
-            _add(cit.get("url") or cit.get("link", ""), cit.get("title") or cit.get("text") or cit.get("snippet"), i + 1)
-    elif llm in ("google-ai-overview", "google-ai-mode") and result.get("organic"):
-        for i, item in enumerate(result["organic"]):
-            _add(item.get("url") or item.get("link", ""), item.get("title") or item.get("description"), i + 1)
+    elif llm in ("google-ai-overview", "google-ai-mode"):
+        # Real AIO references live in `citations` (DataForSEO ai_overview
+        # references / BrightData page_html+aio_citations) → cited. Organic
+        # SERP results → cited=False ("More"), like SearchGPT's extra links.
+        # BrightData organic entries carry the SERP's own URL in `url` and
+        # the real target in `link` — prefer `link`, and drop Google
+        # self-links entirely (they used to flood citations as
+        # google.com/search?q=...).
+        seen: set = set()
+        pos = 0
+        for cit in result.get("citations") or []:
+            url = cit.get("url") or cit.get("link") or ""
+            if not url.startswith("http") or _is_google_internal(url) or url in seen:
+                continue
+            seen.add(url)
+            pos += 1
+            _add(url, cit.get("title") or cit.get("text") or cit.get("snippet"), pos)
+        pos = 0
+        for item in result.get("organic") or []:
+            url = item.get("link") or item.get("url") or ""
+            if not url.startswith("http") or _is_google_internal(url) or url in seen:
+                continue
+            seen.add(url)
+            pos += 1
+            _add(url, item.get("title") or item.get("description"), pos, cited=False)
     elif llm == "gemini" and result.get("links_attached"):
         for i, link in enumerate(result["links_attached"]):
             _add(link.get("url", ""), link.get("text"), link.get("position", i + 1))

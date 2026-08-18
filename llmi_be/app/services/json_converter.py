@@ -555,10 +555,48 @@ def extract_aio_ndngvf_citations(page_html: str) -> list:
     return results
 
 
+def normalize_native_aio_citations(raw) -> list:
+    """Normalize BrightData's native aio_citations field.
+
+    The dataset returns it in varying shapes (list of dicts with
+    url/link/source fields, or plain URL strings). Far more robust than
+    page_html class parsing — Google renames its CSS classes at will and
+    the KEVENd/NDNGvf extractors matched only a few percent of snapshots.
+    """
+    out = []
+    seen = set()
+    for entry in raw or []:
+        if isinstance(entry, str):
+            url, title = entry, ""
+        elif isinstance(entry, dict):
+            url = (entry.get("url") or entry.get("link")
+                   or entry.get("source_url") or entry.get("source") or "")
+            title = (entry.get("title") or entry.get("name")
+                     or entry.get("text") or "")
+        else:
+            continue
+        if not isinstance(url, str) or not url.startswith("http") or "google.com" in url:
+            continue
+        base_url = re.sub(r"#:~:text=.*$", "", url)
+        if base_url in seen:
+            continue
+        seen.add(base_url)
+        out.append({
+            "url": base_url,
+            "icon": None,
+            "cited": True,
+            "title": title if isinstance(title, str) else "",
+            "domain": extract_domain(base_url),
+            "description": None,
+        })
+    return out
+
+
 def convert_google_aio_record(item: dict, country: str = "") -> dict:
     """
     Converts a single Google AI Overview BrightData record to the target format.
-    answer_text comes from aio_text; all_sources are extracted from page_html NDNGvf anchors.
+    answer_text comes from aio_text; citations prefer the dataset's native
+    aio_citations, falling back to page_html NDNGvf/KEVENd anchor parsing.
     The organic field is preserved as requested.
     """
     keyword = item.get("keyword", "")
@@ -571,6 +609,16 @@ def convert_google_aio_record(item: dict, country: str = "") -> dict:
     all_sources = extract_aio_citations_from_page_html(page_html) if page_html else []
     # citations: compact list from //li[@class="CyMdWb"]//a[@class="NDNGvf"]
     citations = extract_aio_ndngvf_citations(page_html) if page_html else []
+
+    # Native aio_citations beat brittle HTML parsing whenever present.
+    native = normalize_native_aio_citations(item.get("aio_citations"))
+    if native and len(native) >= len(citations):
+        citations = native
+    if not all_sources and citations:
+        all_sources = [
+            {"domain": c.get("domain"), "url": c.get("url"), "title": c.get("title") or ""}
+            for c in citations
+        ]
 
     return {
         "map": None,
