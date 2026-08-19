@@ -53,6 +53,8 @@ async def _reextract_row(row: dict, ctx_cache: dict) -> tuple[str, dict | None]:
         response_format={"type": "json_schema", "json_schema": openai_client.COMPETITORS_SCHEMA},
         _operation="competitors_extract",
         model=openai_client.MODEL_COMPETITORS,
+        # 16384-budget calls reason for longer — 60s default times out.
+        timeout_s=150.0,
     )
     if not raw:
         return str(row["id"]), None
