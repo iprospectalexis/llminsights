@@ -86,6 +86,9 @@ interface LlmStat {
   // Scraped successfully but the results page has no AI answer (e.g. Google
   // shows no AI Overview for the query) — collected data, not a failure.
   scraped_empty: number;
+  // Answered rows whose competitor extraction failed (error sentinel or
+  // never ran) — the answer exists but Brand Leadership undercounts it.
+  competitors_missing: number;
   reasons: Record<string, number> | null;
 }
 
@@ -833,15 +836,36 @@ export function StatusPage() {
                               ? <ChevronDown className="w-4 h-4 text-gray-400" />
                               : <ChevronRight className="w-4 h-4 text-gray-400" />
                             }
-                            <div className={`inline-flex items-center px-3 py-1 rounded-full ${getStatusColor(audit.status)}`}>
-                              {getStatusIcon(audit.status)}
-                              <span className="ml-2 text-sm font-medium">
-                                {getStatusDisplay(audit)}
-                              </span>
-                              {staleness && (
-                                <span className={`ml-2 w-2 h-2 rounded-full ${staleness} inline-block`} title="Activity indicator" />
-                              )}
-                            </div>
+                            {(() => {
+                              // Transparency: a "completed" audit with answered
+                              // prompts that lack competitor analysis must not
+                              // look flawless-green.
+                              const analysisGaps = audit.status === 'completed'
+                                ? (llmStats[audit.id] || []).reduce(
+                                    (sum, s) => sum + (s.competitors_missing || 0), 0)
+                                : 0;
+                              const badgeCls = analysisGaps > 0
+                                ? 'text-amber-600 dark:text-amber-400 bg-amber-50 dark:bg-amber-900/20'
+                                : getStatusColor(audit.status);
+                              return (
+                                <div
+                                  className={`inline-flex items-center px-3 py-1 rounded-full ${badgeCls}`}
+                                  title={analysisGaps > 0
+                                    ? `${analysisGaps} answered prompt(s) missing competitor analysis — expand for details`
+                                    : undefined}
+                                >
+                                  {analysisGaps > 0
+                                    ? <AlertTriangle className="w-5 h-5 text-amber-500" />
+                                    : getStatusIcon(audit.status)}
+                                  <span className="ml-2 text-sm font-medium">
+                                    {getStatusDisplay(audit)}{analysisGaps > 0 ? ' · partial analysis' : ''}
+                                  </span>
+                                  {staleness && (
+                                    <span className={`ml-2 w-2 h-2 rounded-full ${staleness} inline-block`} title="Activity indicator" />
+                                  )}
+                                </div>
+                              );
+                            })()}
                           </div>
                         </td>
                         <td className="px-6 py-4">
@@ -1139,6 +1163,15 @@ export function StatusPage() {
                                               className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300"
                                             >
                                               {scrapedEmpty} no AI answer
+                                            </span>
+                                          )}
+                                          {!isRunning && (s.competitors_missing || 0) > 0 && (
+                                            <span
+                                              title="Answered prompts whose competitor extraction failed — Brand Leadership undercounts these until they are re-extracted"
+                                              className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-orange-100 dark:bg-orange-900/30 text-orange-800 dark:text-orange-200"
+                                            >
+                                              <AlertTriangle className="w-3 h-3" />
+                                              {s.competitors_missing} analysis failed
                                             </span>
                                           )}
                                           {!isRunning && realMissing > 0 && (
