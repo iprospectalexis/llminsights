@@ -13,7 +13,7 @@ import { DOMAIN_CATEGORIES, categoryChipClass } from '../lib/domainCategories';
 import { normalizeBrandKey, buildBrandDomainMapFromCitations } from '../lib/brandDomains';
 import { BrandFavicon } from '../components/ui/BrandFavicon';
 import { queryCache } from '../lib/queryCache';
-import { Calendar, FileText, ChartBar as BarChart3, Globe, Users, Play, ArrowLeft, Brain, Download, Settings as SettingsIcon, PencilLine, X, MessageSquare, Crown, TrendingUp, Lightbulb, Trash2, Info, Settings, CalendarCheck, ArrowUpDown, ArrowUp, ArrowDown, BadgeCheck, MessageCircle, List, ChevronDown, Smile } from 'lucide-react';
+import { Calendar, FileText, ChartBar as BarChart3, Globe, Users, Play, ArrowLeft, Brain, Download, Settings as SettingsIcon, PencilLine, X, MessageSquare, Crown, TrendingUp, Lightbulb, Trash2, Info, Settings, CalendarCheck, ArrowUpDown, ArrowUp, ArrowDown, BadgeCheck, MessageCircle, List, ChevronDown, Smile, ShoppingBag, Map as MapIcon, Megaphone } from 'lucide-react';
 import { SentimentDashboard } from '../components/sentiment/SentimentDashboard';
 import { PieChart, Pie, Cell, ResponsiveContainer, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, LineChart, Line, Legend } from 'recharts';
 import { RadarChart, Radar, PolarGrid, PolarAngleAxis, PolarRadiusAxis } from 'recharts';
@@ -1455,6 +1455,9 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
             sentiment_score,
             sentiment_label,
             answer_competitors,
+            shopping_visible,
+            is_map,
+            ad_name:ads->>name,
             created_at,
             prompts (prompt_text, prompt_group),
             audits (created_at, llms)
@@ -5004,6 +5007,8 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                 )}
               </div>
 
+              {/* Bottom row: web-search / AI result types / cited source categories */}
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
               {/* With or without web-search? */}
               <div className="bg-white dark:bg-gray-800 rounded-2xl border border-gray-200 dark:border-gray-700 p-6">
                 <h3 className="text-lg font-semibold mb-4 text-gray-900 dark:text-gray-100">With or without web-search ?</h3>
@@ -5114,6 +5119,207 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                     </div>
                   );
                 })()}
+              </div>
+
+              {/* Types of AI search results */}
+              <div className="bg-white dark:bg-gray-800 rounded-2xl border border-gray-200 dark:border-gray-700 p-6">
+                <div className="flex items-center gap-2 mb-4">
+                  <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100">Types of AI search results</h3>
+                  <div className="group relative">
+                    <Info className="w-4 h-4 text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300 cursor-help transition-colors" />
+                    <div className="absolute top-full left-0 mt-2 w-72 p-3 bg-gray-900 text-white text-xs rounded-lg shadow-xl opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 pointer-events-none z-10">
+                      <div className="font-semibold mb-1">Types of AI search results</div>
+                      <div>Share of responses containing each result block: answer text, shopping product cards, map/place results and sponsored ads (collected for ChatGPT/SearchGPT).</div>
+                    </div>
+                  </div>
+                </div>
+                {(() => {
+                  const total = filteredLlmResponses.length;
+                  const rows = [
+                    {
+                      key: 'Text answer',
+                      icon: <FileText className="w-4 h-4 text-gray-500 flex-shrink-0" />,
+                      count: filteredLlmResponses.filter(r => r.answer_text && r.answer_text !== '').length,
+                      bar: 'bg-gradient-to-r from-brand-primary to-brand-secondary',
+                    },
+                    {
+                      key: 'Shopping',
+                      icon: <ShoppingBag className="w-4 h-4 text-emerald-500 flex-shrink-0" />,
+                      count: filteredLlmResponses.filter(r => r.shopping_visible === true).length,
+                      bar: 'bg-emerald-500',
+                    },
+                    {
+                      key: 'Maps / places',
+                      icon: <MapIcon className="w-4 h-4 text-blue-500 flex-shrink-0" />,
+                      count: filteredLlmResponses.filter(r => r.is_map === true).length,
+                      bar: 'bg-blue-500',
+                    },
+                    {
+                      key: 'Sponsored ads',
+                      icon: <Megaphone className="w-4 h-4 text-amber-500 flex-shrink-0" />,
+                      count: filteredLlmResponses.filter(r => !!r.ad_name).length,
+                      bar: 'bg-amber-500',
+                    },
+                  ];
+                  if (total === 0) {
+                    return (
+                      <div className="flex items-center justify-center h-64 text-gray-500 dark:text-gray-400">
+                        <div className="text-center">
+                          <BarChart3 className="w-12 h-12 mx-auto mb-2 opacity-50" />
+                          <p className="text-sm">No response data available</p>
+                        </div>
+                      </div>
+                    );
+                  }
+                  return (
+                    <div className="space-y-4 pt-2">
+                      {rows.map(row => {
+                        const pct = total > 0 ? Math.round((row.count / total) * 100) : 0;
+                        return (
+                          <div key={row.key} className="flex items-center gap-3">
+                            {row.icon}
+                            <span className="text-sm font-medium text-gray-900 dark:text-gray-100 w-28 flex-shrink-0">
+                              {row.key}
+                            </span>
+                            <div className="relative flex-1 bg-gray-200 dark:bg-gray-700 rounded-full h-6 flex items-center">
+                              <div
+                                className={`h-6 rounded-full ${row.bar} transition-all duration-500 flex items-center justify-end px-2`}
+                                style={{ width: `${Math.max(pct, row.count > 0 ? 6 : 0)}%` }}
+                              >
+                                {row.count > 0 && (
+                                  <span className="text-[10px] font-semibold text-white whitespace-nowrap">
+                                    {row.count} ({pct}%)
+                                  </span>
+                                )}
+                              </div>
+                              {row.count === 0 && (
+                                <span className="text-[10px] font-medium text-gray-400 dark:text-gray-500 px-2">0</span>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
+                      <p className="text-xs text-gray-500 dark:text-gray-400 pt-2">
+                        Based on {total} responses in the selected filters. Shopping / maps / ads are detected for ChatGPT & SearchGPT.
+                      </p>
+                    </div>
+                  );
+                })()}
+              </div>
+
+              {/* Types of cited sources */}
+              <div className="bg-white dark:bg-gray-800 rounded-2xl border border-gray-200 dark:border-gray-700 p-6">
+                <div className="flex items-center gap-2 mb-4">
+                  <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100">Types of cited sources</h3>
+                  <div className="group relative">
+                    <Info className="w-4 h-4 text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300 cursor-help transition-colors" />
+                    <div className="absolute top-full right-0 mt-2 w-72 p-3 bg-gray-900 text-white text-xs rounded-lg shadow-xl opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 pointer-events-none z-10">
+                      <div className="font-semibold mb-1">Types of cited sources</div>
+                      <div>Distribution of cited domains by category (global categories plus your brand / competitor domains) across the citations in the selected filters.</div>
+                    </div>
+                  </div>
+                </div>
+                {(() => {
+                  const counts = new Map<string, number>();
+                  filteredCitations.forEach(c => {
+                    if (!c.domain || c.cited === false) return;
+                    const cat = getDomainDisplayCategory(c.domain);
+                    counts.set(cat, (counts.get(cat) || 0) + 1);
+                  });
+                  const totalCited = Array.from(counts.values()).reduce((a, b) => a + b, 0);
+                  const CATEGORY_CHART_COLORS: Record<string, string> = {
+                    'Own Brand': 'rgb(var(--brand-primary))',
+                    Competitor: '#f43f5e',
+                    Corporate: '#3b82f6',
+                    'News/Media': '#a855f7',
+                    'Review/Comparison': '#f59e0b',
+                    'Marketplace/Retail': '#f97316',
+                    'Social Media': '#ec4899',
+                    'Community/Forum': '#14b8a6',
+                    Video: '#ef4444',
+                    'Encyclopedia/Reference': '#6366f1',
+                    Education: '#06b6d4',
+                    'Government/NGO': '#10b981',
+                    'Blogs/Personal': '#84cc16',
+                    Other: '#9ca3af',
+                    Unknown: '#d1d5db',
+                  };
+                  const pieData = Array.from(counts.entries())
+                    .map(([name, value]) => ({
+                      name,
+                      value,
+                      percentage: totalCited > 0 ? Math.round((value / totalCited) * 100) : 0,
+                    }))
+                    .sort((a, b) => b.value - a.value);
+                  if (totalCited === 0) {
+                    return (
+                      <div className="flex items-center justify-center h-64 text-gray-500 dark:text-gray-400">
+                        <div className="text-center">
+                          <Globe className="w-12 h-12 mx-auto mb-2 opacity-50" />
+                          <p className="text-sm">No citation data available</p>
+                        </div>
+                      </div>
+                    );
+                  }
+                  return (
+                    <div>
+                      <div className="h-64">
+                        <ResponsiveContainer width="100%" height="100%">
+                          <PieChart>
+                            <Pie
+                              data={pieData}
+                              cx="50%"
+                              cy="50%"
+                              labelLine={false}
+                              innerRadius={55}
+                              outerRadius={90}
+                              dataKey="value"
+                              paddingAngle={2}
+                              cornerRadius={6}
+                            >
+                              {pieData.map((entry) => (
+                                <Cell
+                                  key={entry.name}
+                                  fill={CATEGORY_CHART_COLORS[entry.name] || '#9ca3af'}
+                                  stroke="rgb(var(--bg-surface))"
+                                  strokeWidth={2}
+                                />
+                              ))}
+                            </Pie>
+                            <Tooltip
+                              contentStyle={{
+                                backgroundColor: 'rgb(var(--bg-surface))',
+                                border: '1px solid rgb(var(--border))',
+                                borderRadius: '12px',
+                                boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)',
+                                fontFamily: 'Plus Jakarta Sans'
+                              }}
+                              formatter={(value: any, name: string, props: any) => [
+                                `${value} (${props.payload.percentage}%)`,
+                                name
+                              ]}
+                            />
+                          </PieChart>
+                        </ResponsiveContainer>
+                      </div>
+                      <div className="mt-3 flex flex-wrap gap-x-3 gap-y-1.5">
+                        {pieData.slice(0, 8).map(entry => (
+                          <span key={entry.name} className="inline-flex items-center gap-1.5 text-xs text-gray-700 dark:text-gray-300">
+                            <span
+                              className="w-2.5 h-2.5 rounded-full inline-block flex-shrink-0"
+                              style={{ backgroundColor: CATEGORY_CHART_COLORS[entry.name] || '#9ca3af' }}
+                            />
+                            {entry.name} · {entry.percentage}%
+                          </span>
+                        ))}
+                        {pieData.length > 8 && (
+                          <span className="text-xs text-gray-400 dark:text-gray-500">+{pieData.length - 8} more</span>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })()}
+              </div>
               </div>
             </div>
           )}
