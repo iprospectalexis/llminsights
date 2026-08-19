@@ -302,8 +302,8 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
   const [adsDash, setAdsDash] = useState<{
     loading: boolean; loaded: boolean;
     audits: any[]; searchgptStats: Record<string, { answered: number }>;
-    adRows: any[];
-  }>({ loading: false, loaded: false, audits: [], searchgptStats: {}, adRows: [] });
+    adRows: any[]; shoppingRows: any[]; advCategories: Record<string, string>;
+  }>({ loading: false, loaded: false, audits: [], searchgptStats: {}, adRows: [], shoppingRows: [], advCategories: {} });
 
   useEffect(() => {
     if (activeTab !== 'ads' || !id || adsDash.loaded || adsDash.loading) return;
@@ -322,6 +322,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
 
         const searchgptStats: Record<string, { answered: number }> = {};
         const adRows: any[] = [];
+        const shoppingRows: any[] = [];
         for (let i = 0; i < auditIds.length; i += 50) {
           const chunk = auditIds.slice(i, i + 50);
           const { data: stats } = await supabase.rpc('audit_llm_response_stats', { p_audit_ids: chunk });
@@ -337,9 +338,27 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
             .not('ads', 'is', null)
             .order('created_at', { ascending: false });
           (rows || []).forEach(r => { if ((r as any).ad_name) adRows.push(r); });
+          const { data: shopRows } = await supabase
+            .from('llm_responses')
+            .select('id, audit_id, created_at, shopping')
+            .in('audit_id', chunk)
+            .eq('shopping_visible', true);
+          (shopRows || []).forEach(r => { if (Array.isArray((r as any).shopping) && (r as any).shopping.length) shoppingRows.push(r); });
+        }
+
+        // Advertiser-domain categories (global domain_categories table).
+        const advDomains = Array.from(new Set(
+          adRows.map(r => r.ad_url ? extractDomain(r.ad_url) : '').filter(Boolean)));
+        const advCategories: Record<string, string> = {};
+        if (advDomains.length > 0) {
+          const { data: cats } = await supabase
+            .from('domain_categories')
+            .select('domain, category')
+            .in('domain', advDomains);
+          (cats || []).forEach((c: any) => { advCategories[c.domain] = c.category; });
         }
         if (!cancelled) {
-          setAdsDash({ loading: false, loaded: true, audits: allAudits || [], searchgptStats, adRows });
+          setAdsDash({ loading: false, loaded: true, audits: allAudits || [], searchgptStats, adRows, shoppingRows, advCategories });
         }
       } catch (e) {
         console.error('Error loading ads dashboard:', e);
@@ -6102,19 +6121,40 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
 
                 const ownKeys = new Set(brands.map(b => normalizeBrandKey(b.brand_name || '')));
                 const compKeys = new Set(competitors.map(b => normalizeBrandKey(b.brand_name || '')));
+
+                // Organic presence: is the advertiser/merchant also visible
+                // organically (cited domains or extracted brand mentions)?
+                // Window = the page's loaded data (recent audits).
+                const organicDomains = new Set<string>();
+                processedCitations.forEach(c => {
+                  if (c.domain) organicDomains.add(String(c.domain).toLowerCase().replace(/^www\./, ''));
+                });
+                const organicBrandKeys = new Set<string>();
+                llmResponses.forEach(r => {
+                  const bs = r.answer_competitors?.brands;
+                  if (Array.isArray(bs)) bs.forEach((b: any) => {
+                    if (b?.name) organicBrandKeys.add(normalizeBrandKey(b.name));
+                  });
+                });
+                const isOrganic = (name: string, domain: string) =>
+                  (domain && organicDomains.has(domain)) || organicBrandKeys.has(normalizeBrandKey(name));
+
                 const advMap = new Map<string, any>();
                 adRows.forEach(r => {
                   const key = r.ad_name;
                   let a = advMap.get(key);
                   if (!a) {
                     const nk = normalizeBrandKey(key);
+                    const domain = r.ad_url ? extractDomain(r.ad_url) : '';
                     a = {
                       name: key,
-                      domain: r.ad_url ? extractDomain(r.ad_url) : '',
+                      domain,
                       count: 0,
                       lastSeen: r.created_at,
                       isOwn: ownKeys.has(nk),
                       isCompetitor: compKeys.has(nk),
+                      organic: isOrganic(key, domain),
+                      category: domain ? adsDash.advCategories[domain] : undefined,
                     };
                     advMap.set(key, a);
                   }
@@ -6123,6 +6163,43 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                 });
                 const advertisers = Array.from(advMap.values()).sort((x, y) => y.count - x.count);
                 const competitorAds = advertisers.filter(a => a.isCompetitor).reduce((s, a) => s + a.count, 0);
+                const organicAdvertisers = advertisers.filter(a => a.organic).length;
+
+                // Shopping merchants: who sells in the product cards.
+                const merchMap = new Map<string, any>();
+                adsDash.shoppingRows.forEach(r => {
+                  const perResponse = new Set<string>();
+                  (r.shopping || []).forEach((card: any) => {
+                    const name = card?.merchants || (card?.link ? extractDomain(card.link) : '');
+                    if (!name || perResponse.has(name)) return; // once per answer
+                    perResponse.add(name);
+                    let m = merchMap.get(name);
+                    if (!m) {
+                      const nk = normalizeBrandKey(name);
+                      m = {
+                        name,
+                        domain: card?.link ? extractDomain(card.link) : '',
+                        count: 0,
+                        isOwn: ownKeys.has(nk),
+                        isCompetitor: compKeys.has(nk),
+                        examples: [] as string[],
+                      };
+                      merchMap.set(name, m);
+                    }
+                    m.count += 1;
+                    if (card?.title && m.examples.length < 2 && !m.examples.includes(card.title)) {
+                      m.examples.push(card.title);
+                    }
+                  });
+                });
+                const merchants = Array.from(merchMap.values()).sort((a, b) => b.count - a.count);
+
+                // Advertiser mix by domain category.
+                const advCatCounts = new Map<string, number>();
+                advertisers.forEach(a => {
+                  const cat = a.isCompetitor ? 'Competitor' : (a.category || 'Unknown');
+                  advCatCounts.set(cat, (advCatCounts.get(cat) || 0) + a.count);
+                });
 
                 const adsByAudit = new Map<string, number>();
                 adRows.forEach(r => adsByAudit.set(r.audit_id, (adsByAudit.get(r.audit_id) || 0) + 1));
@@ -6230,15 +6307,28 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                         {advertisers.length > 0 ? (
                           <div className="space-y-2.5">
                             {advertisers.slice(0, 10).map(a => (
-                              <div key={a.name} className="flex items-center gap-3">
+                              <div key={a.name} className="flex items-center gap-2">
                                 <BrandFavicon name={a.name} domain={a.domain || getBrandDomain(a.name)} size={18} />
                                 <span className="text-sm font-medium text-gray-900 dark:text-gray-100 truncate">{a.name}</span>
                                 {a.isCompetitor && (
-                                  <span className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-rose-100 dark:bg-rose-900/40 text-rose-700 dark:text-rose-300 uppercase">Competitor</span>
+                                  <span className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-rose-100 dark:bg-rose-900/40 text-rose-700 dark:text-rose-300 uppercase flex-shrink-0">Competitor</span>
                                 )}
                                 {a.isOwn && (
-                                  <span className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300 uppercase">You</span>
+                                  <span className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300 uppercase flex-shrink-0">You</span>
                                 )}
+                                {a.category && (
+                                  <span className={`${categoryChipClass(a.category)} flex-shrink-0`}>{a.category}</span>
+                                )}
+                                <span
+                                  title={a.organic
+                                    ? 'Also visible organically in this project (cited domain or extracted brand mention)'
+                                    : 'Buys placement but has no organic presence in the loaded data — pure paid play'}
+                                  className={`px-1.5 py-0.5 rounded text-[10px] font-semibold flex-shrink-0 ${a.organic
+                                    ? 'bg-violet-100 dark:bg-violet-900/40 text-violet-700 dark:text-violet-300'
+                                    : 'border border-amber-300 dark:border-amber-700 text-amber-700 dark:text-amber-400'}`}
+                                >
+                                  {a.organic ? 'Paid + cited' : 'Paid only'}
+                                </span>
                                 <div className="ml-auto flex items-center gap-3 flex-shrink-0">
                                   <span className="text-xs text-gray-500 dark:text-gray-400">
                                     {new Date(a.lastSeen).toLocaleDateString()}
@@ -6267,6 +6357,80 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                                 <span className="text-gray-700 dark:text-gray-300">{text}</span>
                               </div>
                             ))}
+                          </div>
+                        ) : (
+                          <p className="text-sm text-gray-500 dark:text-gray-400 py-6 text-center">No sponsored ads detected yet.</p>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                      {/* Top shopping merchants */}
+                      <div className="bg-white dark:bg-gray-800 rounded-2xl border border-gray-200 dark:border-gray-700 p-6">
+                        <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100 mb-1">Top shopping merchants</h3>
+                        <p className="text-xs text-gray-500 dark:text-gray-400 mb-4">
+                          Who sells in the product cards ChatGPT shows — commercial presence beyond classic citations.
+                        </p>
+                        {merchants.length > 0 ? (
+                          <div className="space-y-2.5">
+                            {merchants.slice(0, 10).map(m => (
+                              <div key={m.name} className="flex items-center gap-2">
+                                <BrandFavicon name={m.name} domain={m.domain || getBrandDomain(m.name)} size={18} />
+                                <div className="min-w-0">
+                                  <div className="flex items-center gap-2">
+                                    <span className="text-sm font-medium text-gray-900 dark:text-gray-100 truncate">{m.name}</span>
+                                    {m.isCompetitor && (
+                                      <span className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-rose-100 dark:bg-rose-900/40 text-rose-700 dark:text-rose-300 uppercase flex-shrink-0">Competitor</span>
+                                    )}
+                                    {m.isOwn && (
+                                      <span className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300 uppercase flex-shrink-0">You</span>
+                                    )}
+                                  </div>
+                                  {m.examples.length > 0 && (
+                                    <div className="text-xs text-gray-500 dark:text-gray-400 truncate">{m.examples.join(' · ')}</div>
+                                  )}
+                                </div>
+                                <span className="ml-auto text-sm font-semibold text-gray-900 dark:text-gray-100 flex-shrink-0">
+                                  {m.count}
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <p className="text-sm text-gray-500 dark:text-gray-400 py-6 text-center">No shopping cards detected yet.</p>
+                        )}
+                      </div>
+
+                      {/* Advertiser mix */}
+                      <div className="bg-white dark:bg-gray-800 rounded-2xl border border-gray-200 dark:border-gray-700 p-6">
+                        <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100 mb-1">Advertiser mix</h3>
+                        <p className="text-xs text-gray-500 dark:text-gray-400 mb-4">
+                          Who buys placement (by domain category) and how many also show up organically.
+                        </p>
+                        {advertisers.length > 0 ? (
+                          <div className="space-y-4">
+                            <div className="flex flex-wrap gap-2">
+                              {Array.from(advCatCounts.entries())
+                                .sort((a, b) => b[1] - a[1])
+                                .map(([cat, n]) => (
+                                  <span key={cat} className={`${categoryChipClass(cat)}`}>
+                                    {cat} · {n}
+                                  </span>
+                                ))}
+                            </div>
+                            <div className="grid grid-cols-2 gap-4 pt-2">
+                              <div className="text-center bg-violet-50 dark:bg-violet-900/20 rounded-xl p-3">
+                                <div className="text-2xl font-bold text-violet-700 dark:text-violet-300">{organicAdvertisers}</div>
+                                <div className="text-xs text-gray-600 dark:text-gray-400 mt-0.5">paid + organically cited</div>
+                              </div>
+                              <div className="text-center bg-amber-50 dark:bg-amber-900/20 rounded-xl p-3">
+                                <div className="text-2xl font-bold text-amber-700 dark:text-amber-300">{advertisers.length - organicAdvertisers}</div>
+                                <div className="text-xs text-gray-600 dark:text-gray-400 mt-0.5">paid only — no organic footprint</div>
+                              </div>
+                            </div>
+                            <p className="text-xs text-gray-500 dark:text-gray-400">
+                              «Paid only» advertisers compensate a weak organic GEO position with budget — a gap you can exploit organically.
+                            </p>
                           </div>
                         ) : (
                           <p className="text-sm text-gray-500 dark:text-gray-400 py-6 text-center">No sponsored ads detected yet.</p>

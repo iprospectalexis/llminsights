@@ -99,6 +99,8 @@ export function StatusPage() {
   const [responseStats, setResponseStats] = useState<Record<string, { total: number; answered: number }>>({});
   // Per-LLM breakdown per audit id (which LLMs collected fully / partially / failed).
   const [llmStats, setLlmStats] = useState<Record<string, LlmStat[]>>({});
+  // Sponsored ads bought by the project's competitors, per audit (alert).
+  const [competitorAds, setCompetitorAds] = useState<Record<string, string[]>>({});
   // `${auditId}:${llm}` while a per-LLM retry request is in flight.
   const [retryingLlm, setRetryingLlm] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -201,6 +203,17 @@ export function StatusPage() {
             list.sort((a, b) => a.llm.localeCompare(b.llm));
           }
           setLlmStats(byAudit);
+        }
+
+        // Competitor advertisers detected inside answers (sponsored ads
+        // bought by the project's competitors) — surfaced as an alert.
+        const { data: compAdRows } = await supabase.rpc('audit_competitor_ads', { p_audit_ids: ids });
+        if (Array.isArray(compAdRows)) {
+          const byAuditAds: Record<string, string[]> = {};
+          for (const r of compAdRows as { audit_id: string; advertiser: string }[]) {
+            (byAuditAds[r.audit_id] = byAuditAds[r.audit_id] || []).push(r.advertiser);
+          }
+          setCompetitorAds(byAuditAds);
         }
       }
     } catch (error) {
@@ -1105,6 +1118,15 @@ export function StatusPage() {
                               {/* Per-LLM collection status */}
                               {(llmStats[audit.id]?.length ?? 0) > 0 && (
                                 <div className="bg-white dark:bg-gray-800 rounded-lg p-3 border border-gray-200 dark:border-gray-700">
+                                  {competitorAds[audit.id]?.length > 0 && (
+                                    <div className="mb-3 flex items-start gap-2 px-3 py-2 rounded-lg bg-rose-50 dark:bg-rose-900/20 border border-rose-200 dark:border-rose-800/40">
+                                      <AlertTriangle className="w-4 h-4 text-rose-500 flex-shrink-0 mt-0.5" />
+                                      <div className="text-sm text-rose-800 dark:text-rose-200">
+                                        <span className="font-semibold">Competitor ads detected:</span>{' '}
+                                        {Array.from(new Set(competitorAds[audit.id])).join(', ')} — your competitor(s) bought sponsored placement in these answers.
+                                      </div>
+                                    </div>
+                                  )}
                                   <div className="text-xs text-gray-500 dark:text-gray-400 mb-2">Collection by LLM</div>
                                   <div className="space-y-1.5">
                                     {llmStats[audit.id].map((s) => {
