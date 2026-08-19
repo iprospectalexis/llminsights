@@ -31,7 +31,8 @@ import {
   Eye,
   X,
   DollarSign,
-  Inbox
+  Inbox,
+  Megaphone
 } from 'lucide-react';
 import { useProject } from '../../contexts/ProjectContext';
 import { useUnreadTicketsCount } from '../../lib/tickets';
@@ -446,6 +447,39 @@ export const Sidebar: React.FC<SidebarProps> = ({ user, userProfile, isOpen, onT
                       className="overflow-hidden whitespace-nowrap"
                     >
                       Domains
+                    </motion.span>
+                  )}
+                </AnimatePresence>
+              </NavLink>
+              <NavLink
+                to={`/projects/${selectedProject.id}/ads`}
+                className={`
+                  flex items-center py-2.5 text-sm font-medium rounded-xl transition-all duration-200 relative
+                  ${location.pathname === `/projects/${selectedProject.id}/ads`
+                    ? 'bg-[rgb(243,232,255)] text-[rgb(126,34,206)] dark:bg-purple-900/30 dark:text-purple-300'
+                    : 'text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800'
+                  }
+                  ${effectiveCollapsed ? 'justify-center px-3' : 'pl-9 pr-3'}
+                `}
+                title={effectiveCollapsed ? 'Ads' : ''}
+              >
+                {!effectiveCollapsed && (
+                  <div className="absolute left-3 top-0 bottom-0 flex items-center">
+                    <div className="w-px h-full bg-gray-300 dark:bg-gray-700"></div>
+                    <div className="absolute left-0 top-1/2 -translate-y-1/2 w-3 h-px bg-gray-300 dark:bg-gray-700"></div>
+                  </div>
+                )}
+                <Megaphone className={`w-4 h-4 ${effectiveCollapsed ? '' : 'mr-3'} flex-shrink-0 ${!effectiveCollapsed && 'relative z-10'}`} />
+                <AnimatePresence>
+                  {!effectiveCollapsed && (
+                    <motion.span
+                      initial={{ opacity: 0, width: 0 }}
+                      animate={{ opacity: 1, width: 'auto' }}
+                      exit={{ opacity: 0, width: 0 }}
+                      transition={{ duration: 0.2 }}
+                      className="overflow-hidden whitespace-nowrap"
+                    >
+                      Ads
                     </motion.span>
                   )}
                 </AnimatePresence>
