@@ -53,6 +53,16 @@ const LLM_ICONS = {
   'grok': 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/Grok-icon.png',
 };
 
+const LLM_DISPLAY_NAMES: Record<string, string> = {
+  searchgpt: 'SearchGPT',
+  perplexity: 'Perplexity',
+  gemini: 'Gemini',
+  'google-ai-overview': 'Google AI Overview',
+  'google-ai-mode': 'Google AI Mode',
+  'bing-copilot': 'Bing Copilot',
+  grok: 'Grok',
+};
+
 const SENTIMENT_COLORS = {
   positive: '#10B981',
   neutral: '#6B7280',
@@ -246,9 +256,9 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
   const [selectedReportType, setSelectedReportType] = useState<string | null>(null);
   const [insightConfig, setInsightConfig] = useState({
     targetBrand: '',
-    targetLlm: 'searchgpt' as 'searchgpt' | 'perplexity' | 'gemini',
+    targetLlm: 'searchgpt' as string,
     reportLanguage: 'en',
-    groupId: '' as string,
+    groupIds: [] as string[],
     customCompetitors: '' as string,
   });
   const [completedReports, setCompletedReports] = useState<any[]>([]);
@@ -296,6 +306,17 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     if (!key) return null;
     return citationBrandDomains[key] || brandDbDomains[key] || null;
   };
+
+  // LLMs that actually have data in this project (audit configs + collected
+  // responses) — drives the Insights Target LLM selector. All known LLMs
+  // when the project has no data yet.
+  const insightLlmOptions = useMemo(() => {
+    const seen = new Set<string>(availableLlms);
+    llmResponses.forEach((r: any) => { if (r.llm) seen.add(r.llm); });
+    const known = Object.keys(LLM_ICONS);
+    const opts = known.filter(l => seen.has(l));
+    return opts.length > 0 ? opts : known;
+  }, [availableLlms, llmResponses]);
 
   useEffect(() => {
     const names = [...brands, ...competitors].map(b => b.brand_name).filter(Boolean);
@@ -1681,7 +1702,8 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
           target_brand: insightConfig.targetBrand,
           target_llm: insightConfig.targetLlm,
           report_language: insightConfig.reportLanguage,
-          group_id: insightConfig.groupId || null,
+          // Text column; joined for display in the reports list.
+          group_id: insightConfig.groupIds.length > 0 ? insightConfig.groupIds.join(', ') : null,
           custom_competitors: competitorsArray,
           status: 'pending',
           created_by: user.id,
@@ -1707,7 +1729,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
             targetBrand: insightConfig.targetBrand,
             targetLlm: insightConfig.targetLlm,
             reportLanguage: insightConfig.reportLanguage,
-            groupId: insightConfig.groupId || null,
+            groupIds: insightConfig.groupIds.length > 0 ? insightConfig.groupIds : null,
             customCompetitors: competitorsArray,
           }),
         }
@@ -6361,73 +6383,30 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                       <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
                         Target LLM
                       </label>
-                      <div className="flex gap-2 h-[46px]">
-                        {(availableLlms.length === 0 || availableLlms.includes('searchgpt')) && (
+                      <div className="flex gap-2 min-h-[46px] flex-wrap">
+                        {insightLlmOptions.map((llm) => (
                           <button
+                            key={llm}
                             type="button"
-                            onClick={() => setInsightConfig({ ...insightConfig, targetLlm: 'searchgpt' })}
-                            className={`flex-1 flex items-center justify-center rounded-xl border-2 transition-all ${
-                              insightConfig.targetLlm === 'searchgpt'
+                            onClick={() => setInsightConfig({ ...insightConfig, targetLlm: llm })}
+                            className={`flex-1 min-w-[56px] h-[46px] flex items-center justify-center rounded-xl border-2 transition-all ${
+                              insightConfig.targetLlm === llm
                                 ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/20'
                                 : 'border-gray-200 dark:border-gray-700 hover:border-blue-300 dark:hover:border-blue-700'
                             }`}
-                            title="SearchGPT"
+                            title={LLM_DISPLAY_NAMES[llm] || llm}
                           >
                             <img
-                              src={LLM_ICONS.searchgpt}
-                              alt="SearchGPT"
+                              src={LLM_ICONS[llm as keyof typeof LLM_ICONS]}
+                              alt={LLM_DISPLAY_NAMES[llm] || llm}
                               className="w-8 h-8 object-contain"
                               onError={(e) => {
                                 e.currentTarget.style.display = 'none';
-                                e.currentTarget.parentElement!.innerHTML += '<span class="text-xs font-medium">SearchGPT</span>';
+                                e.currentTarget.parentElement!.innerHTML += `<span class="text-xs font-medium">${LLM_DISPLAY_NAMES[llm] || llm}</span>`;
                               }}
                             />
                           </button>
-                        )}
-                        {(availableLlms.length === 0 || availableLlms.includes('perplexity')) && (
-                          <button
-                            type="button"
-                            onClick={() => setInsightConfig({ ...insightConfig, targetLlm: 'perplexity' })}
-                            className={`flex-1 flex items-center justify-center rounded-xl border-2 transition-all ${
-                              insightConfig.targetLlm === 'perplexity'
-                                ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/20'
-                                : 'border-gray-200 dark:border-gray-700 hover:border-blue-300 dark:hover:border-blue-700'
-                            }`}
-                            title="Perplexity"
-                          >
-                            <img
-                              src={LLM_ICONS.perplexity}
-                              alt="Perplexity"
-                              className="w-8 h-8 object-contain"
-                              onError={(e) => {
-                                e.currentTarget.style.display = 'none';
-                                e.currentTarget.parentElement!.innerHTML += '<span class="text-xs font-medium">Perplexity</span>';
-                              }}
-                            />
-                          </button>
-                        )}
-                        {(availableLlms.length === 0 || availableLlms.includes('gemini')) && (
-                          <button
-                            type="button"
-                            onClick={() => setInsightConfig({ ...insightConfig, targetLlm: 'gemini' })}
-                            className={`flex-1 flex items-center justify-center rounded-xl border-2 transition-all ${
-                              insightConfig.targetLlm === 'gemini'
-                                ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/20'
-                                : 'border-gray-200 dark:border-gray-700 hover:border-blue-300 dark:hover:border-blue-700'
-                            }`}
-                            title="Gemini"
-                          >
-                            <img
-                              src={LLM_ICONS.gemini}
-                              alt="Gemini"
-                              className="w-8 h-8 object-contain"
-                              onError={(e) => {
-                                e.currentTarget.style.display = 'none';
-                                e.currentTarget.parentElement!.innerHTML += '<span class="text-xs font-medium">Gemini</span>';
-                              }}
-                            />
-                          </button>
-                        )}
+                        ))}
                       </div>
                     </div>
 
@@ -6461,22 +6440,45 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                       {/* Prompts Group Filter (Optional) */}
                       <div>
                         <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-                          Prompts Group <span className="text-gray-500 text-xs">(optional)</span>
+                          Prompts Group <span className="text-gray-500 text-xs">(optional, multi-select)</span>
                         </label>
-                        <select
-                          value={insightConfig.groupId}
-                          onChange={(e) => setInsightConfig({ ...insightConfig, groupId: e.target.value })}
-                          className="w-full h-[46px] px-4 py-2.5 rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20"
-                        >
-                          <option value="">All Prompt Groups</option>
-                          {promptGroups.map((groupName: string) => (
-                            <option key={groupName} value={groupName}>
-                              {groupName}
-                            </option>
-                          ))}
-                        </select>
+                        <div className="flex flex-wrap gap-2">
+                          <button
+                            type="button"
+                            onClick={() => setInsightConfig({ ...insightConfig, groupIds: [] })}
+                            className={`px-3 py-2 rounded-xl text-sm font-medium border transition-all ${
+                              insightConfig.groupIds.length === 0
+                                ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/20 text-blue-700 dark:text-blue-300'
+                                : 'border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-700 dark:text-gray-300 hover:border-blue-300'
+                            }`}
+                          >
+                            All Prompt Groups
+                          </button>
+                          {promptGroups.map((groupName: string) => {
+                            const selected = insightConfig.groupIds.includes(groupName);
+                            return (
+                              <button
+                                key={groupName}
+                                type="button"
+                                onClick={() => setInsightConfig({
+                                  ...insightConfig,
+                                  groupIds: selected
+                                    ? insightConfig.groupIds.filter(g => g !== groupName)
+                                    : [...insightConfig.groupIds, groupName],
+                                })}
+                                className={`px-3 py-2 rounded-xl text-sm font-medium border transition-all ${
+                                  selected
+                                    ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/20 text-blue-700 dark:text-blue-300'
+                                    : 'border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-700 dark:text-gray-300 hover:border-blue-300'
+                                }`}
+                              >
+                                {selected ? '✓ ' : ''}{groupName}
+                              </button>
+                            );
+                          })}
+                        </div>
                         <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                          Filter prompts by a specific group from your project
+                          Select one or more prompt groups to include; none selected = all groups
                         </p>
                       </div>
 

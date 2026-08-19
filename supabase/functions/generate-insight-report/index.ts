@@ -25,9 +25,14 @@ Deno.serve(async (req: Request) => {
 
     const requestData = await req.json();
     reportId = requestData.reportId;
-    const { projectId, reportType, targetBrand, targetLlm, reportLanguage, groupId, customCompetitors } = requestData;
+    const { projectId, reportType, targetBrand, targetLlm, reportLanguage, groupId, groupIds, customCompetitors } = requestData;
 
-    console.log('Generating insight report:', { reportId, projectId, reportType, targetBrand, targetLlm, reportLanguage, groupId, customCompetitors });
+    // Multi-select prompt groups; legacy single groupId still accepted.
+    const promptGroups: string[] = Array.isArray(groupIds) && groupIds.length > 0
+      ? groupIds
+      : (groupId && groupId !== '' ? [groupId] : []);
+
+    console.log('Generating insight report:', { reportId, projectId, reportType, targetBrand, targetLlm, reportLanguage, promptGroups, customCompetitors });
 
     // Update status to running
     await supabase
@@ -81,11 +86,11 @@ Deno.serve(async (req: Request) => {
 
     if (responsesError) throw responsesError;
 
-    // Filter responses by group if groupId is provided
+    // Filter responses by prompt group(s) if provided
     let llmResponses = allResponses;
-    if (groupId && groupId !== '') {
-      llmResponses = allResponses?.filter(r => r.prompts?.prompt_group === groupId) || [];
-      console.log(`Filtered responses by group ${groupId}: ${llmResponses.length} responses`);
+    if (promptGroups.length > 0) {
+      llmResponses = allResponses?.filter(r => promptGroups.includes(r.prompts?.prompt_group)) || [];
+      console.log(`Filtered responses by groups [${promptGroups.join(', ')}]: ${llmResponses.length} responses`);
     }
 
     // Fetch citations for these audits
