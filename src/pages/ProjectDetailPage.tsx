@@ -1910,39 +1910,80 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
         if (insertBrandsError) throw insertBrandsError;
       }
 
-      // Delete existing prompts
-      const { error: deletePromptsError } = await supabase
+      // Diff-update prompts. NEVER delete-and-reinsert everything: the
+      // llm_responses/citations FKs are ON DELETE SET NULL, so recreating a
+      // prompt under a new id orphans ALL historical answers and citations
+      // (by-prompt-group widgets go empty). Keep rows whose text is
+      // unchanged, update their group if needed, insert only new texts and
+      // delete only removed ones.
+      const parsedPrompts = editFormData.prompts.trim()
+        ? editFormData.prompts
+            .split(/\r?\n/)
+            .map(line => line.trim())
+            .filter(Boolean)
+            .map(line => {
+              const [maybeGroup, ...rest] = line.split(';');
+              if (rest.length > 0) {
+                const text = rest.join(';').trim();
+                return { group: maybeGroup.trim() || 'General', text };
+              }
+              return { group: 'General', text: line };
+            })
+        : [];
+
+      const { data: existingPrompts, error: existingPromptsError } = await supabase
         .from('prompts')
-        .delete()
+        .select('id, prompt_text, prompt_group')
         .eq('project_id', id);
 
-      if (deletePromptsError) throw deletePromptsError;
+      if (existingPromptsError) throw existingPromptsError;
 
-      // Add new prompts
-      if (editFormData.prompts.trim()) {
-        const parsedPrompts = editFormData.prompts
-          .split(/\r?\n/)
-          .map(line => line.trim())
-          .filter(Boolean)
-          .map(line => {
-            const [maybeGroup, ...rest] = line.split(';');
-            if (rest.length > 0) {
-              const text = rest.join(';').trim();
-              return { group: maybeGroup.trim() || 'General', text };
-            }
-            return { group: 'General', text: line };
+      const byText = new Map<string, any[]>();
+      (existingPrompts || []).forEach(p => {
+        const key = (p.prompt_text || '').trim();
+        if (!byText.has(key)) byText.set(key, []);
+        byText.get(key)!.push(p);
+      });
+
+      const keptIds = new Set<string>();
+      const promptsToInsert: any[] = [];
+      for (const prompt of parsedPrompts) {
+        const candidates = (byText.get(prompt.text) || []).filter(p => !keptIds.has(p.id));
+        if (candidates.length > 0) {
+          const existing = candidates[0];
+          keptIds.add(existing.id);
+          if (existing.prompt_group !== prompt.group) {
+            const { error: updateGroupError } = await supabase
+              .from('prompts')
+              .update({ prompt_group: prompt.group })
+              .eq('id', existing.id);
+            if (updateGroupError) throw updateGroupError;
+          }
+        } else {
+          promptsToInsert.push({
+            project_id: id,
+            prompt_text: prompt.text,
+            prompt_group: prompt.group,
           });
+        }
+      }
 
+      const promptIdsToDelete = (existingPrompts || [])
+        .filter(p => !keptIds.has(p.id))
+        .map(p => p.id);
+
+      if (promptIdsToDelete.length > 0) {
+        const { error: deletePromptsError } = await supabase
+          .from('prompts')
+          .delete()
+          .in('id', promptIdsToDelete);
+        if (deletePromptsError) throw deletePromptsError;
+      }
+
+      if (promptsToInsert.length > 0) {
         const { error: insertPromptsError } = await supabase
           .from('prompts')
-          .insert(
-            parsedPrompts.map(prompt => ({
-              project_id: id,
-              prompt_text: prompt.text,
-              prompt_group: prompt.group,
-            }))
-          );
-
+          .insert(promptsToInsert);
         if (insertPromptsError) throw insertPromptsError;
       }
 
