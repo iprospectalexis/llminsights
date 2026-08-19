@@ -394,16 +394,17 @@ async def extract_competitors(
 
     for attempt in range(2):  # Retry once on empty output / transient errors
         try:
-            # max_tokens: 4096 is ample for brand extraction (successful outputs
-            # are <500 tokens in practice) and avoids the gpt-5-nano "think-a-lot"
-            # behaviour triggered by 16384. If we ever see finish_reason=length in
-            # the warning log (see _call_openai line ~81), bump back up to 8192.
-            # response_format: strict json_schema skips JSON-shape planning inside
-            # the model and guarantees valid output — also removes the need for
-            # the defensive "Invalid structure" branch below.
+            # max_tokens: 4096 covers most extractions cheaply, but gpt-5-nano
+            # is a reasoning model and on ~10-15% of answers burns the entire
+            # budget on hidden reasoning (finish_reason=length, empty content,
+            # reasoning_tokens=4096). Reasoning depth is deterministic for the
+            # same input, so retrying at the SAME cap fails identically — that
+            # is where the thousands of {"error": "No output from OpenAI"}
+            # sentinels came from. The retry therefore escalates to 16384;
+            # only the problematic ~10% pay the higher-budget price.
             raw = await _call_openai(
                 messages,
-                max_tokens=4096,
+                max_tokens=4096 if attempt == 0 else 16384,
                 response_format={"type": "json_schema", "json_schema": COMPETITORS_SCHEMA},
                 _ctx=_ctx,
                 _operation="competitors_extract",
