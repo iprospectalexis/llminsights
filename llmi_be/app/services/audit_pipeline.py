@@ -235,6 +235,15 @@ POLLING_MAX_MINUTES = 90
 # the 90-min global window and matches realistic provider latency.
 MAX_POLL_ATTEMPTS_PER_ROW = 60
 
+# Job statuses meaning "the provider is still working on it". A row whose job
+# is in one of these states must NOT be swept as exhausted, no matter how many
+# attempts it has burned: 100+ prompt SERP batches routinely take 30-60 min —
+# far beyond the 15-min per-row attempts budget — and sweeping such rows
+# discards results that arrive minutes later (audit b1d8c034 completed at
+# 08:41 while its fallback jobs delivered at 08:42 and 08:53). The 90-minute
+# audit deadline remains the backstop for genuinely stuck jobs.
+_JOB_IN_FLIGHT_STATUSES = {"pending", "getting_results", "processing_results"}
+
 # Don't re-poll the same row faster than this. Prevents hammering the
 # provider when the scheduler tick interval drops or warm-starts overlap.
 MIN_POLL_INTERVAL_SECONDS = 5
@@ -563,6 +572,7 @@ async def handle_polling(audit_id: str, worker_id: str) -> None:
         dropped_terminal_ids: list[str] = [] # provider_dropped
         failed_job_rows: list[dict] = []     # job hard-failed → provider switch
         job_provider_map: dict[str, str] = {}
+        job_status_map: dict[str, str] = {}
 
         # Process legacy BrightData responses
         if legacy_responses:
@@ -620,10 +630,11 @@ async def handle_polling(audit_id: str, worker_id: str) -> None:
                 from sqlalchemy import text as sql_text
                 async with AsyncSessionLocal() as s:
                     jrows = (await s.execute(
-                        sql_text("SELECT id, provider FROM jobs WHERE id = ANY(:ids)"),
+                        sql_text("SELECT id, provider, status FROM jobs WHERE id = ANY(:ids)"),
                         {"ids": list(job_groups.keys())},
                     )).mappings().all()
                 job_provider_map = {str(j["id"]): (j["provider"] or "serp") for j in jrows}
+                job_status_map = {str(j["id"]): (j["status"] or "") for j in jrows}
             except Exception as e:
                 logger.warning(f"[polling] {audit_id}: job provider lookup failed: {e}")
             phase = "fetch_onesearch"
@@ -786,6 +797,12 @@ async def handle_polling(audit_id: str, worker_id: str) -> None:
             # `poll_attempts` was the value BEFORE we bumped — compare against cap-1.
             prev_attempts = int(r.get("poll_attempts") or 0)
             if prev_attempts + 1 >= MAX_POLL_ATTEMPTS_PER_ROW:
+                # Rows whose job the provider is still processing are immune:
+                # exhausting them here throws away answers that land minutes
+                # later. The 90-min audit deadline covers truly stuck jobs.
+                jstatus = job_status_map.get(str(r.get("job_id") or ""), "")
+                if jstatus in _JOB_IN_FLIGHT_STATUSES:
+                    continue
                 exhausted_ids.append(rid)
         # ── Auto-failover: exhausted rows + rows from hard-failed jobs ──
         # Pick the next capable & healthy provider from the chain
