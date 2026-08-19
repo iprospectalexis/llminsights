@@ -734,7 +734,12 @@ class SupabaseDB:
                 for j, u in enumerate(chunk):
                     values_parts.append(f"(CAST(:id_{j} AS uuid), CAST(:comp_{j} AS jsonb))")
                     params[f"id_{j}"] = u["id"]
-                    params[f"comp_{j}"] = _serialize_value(u["competitors"])
+                    comp = _serialize_value(u["competitors"])
+                    if isinstance(comp, str):
+                        # Postgres jsonb rejects NUL — one poisoned string
+                        # (model-mangled unicode) would fail the whole chunk.
+                        comp = comp.replace("\\u0000", "").replace("\x00", "")
+                    params[f"comp_{j}"] = comp
                 sql = f"""
                     UPDATE llm_responses SET
                       answer_competitors = v.competitors,

@@ -74,6 +74,22 @@ COMPETITORS_SCHEMA = {
 }
 
 
+def strip_nul(obj):
+    """Recursively remove NUL (u0000) characters from all strings.
+
+    gpt-5-nano occasionally emits them inside string values (mangled
+    unicode like degree signs); Postgres jsonb rejects NUL entirely, so a
+    single poisoned row would fail every batched jsonb write it rides in.
+    """
+    if isinstance(obj, str):
+        return obj.replace("\x00", "")
+    if isinstance(obj, list):
+        return [strip_nul(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: strip_nul(v) for k, v in obj.items()}
+    return obj
+
+
 async def _call_openai(messages: list[dict], max_tokens: int = 2048,
                         response_format: Optional[dict] = None,
                         _ctx: Optional[dict] = None,
@@ -420,7 +436,10 @@ async def extract_competitors(
             data = json.loads(raw)
             if not isinstance(data.get("brands"), list):
                 return {"brands": [], "warning": "Invalid structure", "original": data}
-            return data
+            # The model occasionally emits NUL (u0000) inside strings (mangled
+            # symbols like °C) — Postgres jsonb rejects NUL outright and one
+            # such row fails the whole batch UPDATE. Strip defensively.
+            return strip_nul(data)
 
         except Exception as e:
             # Retry once on transient provider failures. Previously only "rate"

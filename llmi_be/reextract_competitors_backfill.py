@@ -62,7 +62,8 @@ async def _reextract_row(row: dict, ctx_cache: dict) -> tuple[str, dict | None]:
         return str(row["id"]), None
     if not isinstance(data.get("brands"), list):
         return str(row["id"]), None
-    return str(row["id"]), data
+    # NUL chars in model output crash the jsonb CAST (killed the first run).
+    return str(row["id"]), openai_client.strip_nul(data)
 
 
 async def main() -> None:
@@ -137,12 +138,28 @@ async def main() -> None:
             else:
                 updates.append((rid, json.dumps(data)))
                 done += 1
-        async with AsyncSessionLocal() as s:
-            for rid, payload in updates:
-                await s.execute(text(
-                    "UPDATE llm_responses SET answer_competitors = CAST(:c AS jsonb) WHERE id = :id"
-                ), {"c": payload, "id": rid})
-            await s.commit()
+        for rid, payload in updates:
+            # Per-row transactions: one bad payload must not kill the run.
+            try:
+                async with AsyncSessionLocal() as s:
+                    await s.execute(text(
+                        "UPDATE llm_responses SET answer_competitors = CAST(:c AS jsonb) WHERE id = :id"
+                    ), {"c": payload.replace("\\u0000", ""), "id": rid})
+                    await s.commit()
+            except Exception as e:
+                print(f"  row {rid}: write failed: {str(e)[:120]}", flush=True)
+                if '"_reextract_failed"' not in payload:
+                    failed += 1
+                    done = max(0, done - 1)
+                try:
+                    async with AsyncSessionLocal() as s:
+                        await s.execute(text(
+                            "UPDATE llm_responses SET answer_competitors = CAST(:c AS jsonb) WHERE id = :id"
+                        ), {"c": json.dumps({"brands": [], "error": "No output from OpenAI",
+                                             "_retry": 3, "_reextract_failed": True}), "id": rid})
+                        await s.commit()
+                except Exception:
+                    pass
         print(f"progress: {done} re-extracted, {failed} failed", flush=True)
 
     print(f"DONE: {done} re-extracted, {failed} failed", flush=True)
