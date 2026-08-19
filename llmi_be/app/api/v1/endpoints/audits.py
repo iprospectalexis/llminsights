@@ -128,10 +128,28 @@ def collect_citations(result: dict, response: dict) -> list[dict]:
             **({"cited": cited} if cited is not None else {}),
         })
 
-    # SearchGPT / ChatGPT
-    if llm in ("searchgpt", "chatgpt") and result.get("links_attached"):
-        for i, link in enumerate(result["links_attached"]):
-            _add(link.get("url", ""), link.get("text") or link.get("title"), link.get("position", i + 1), link.get("cited"))
+    # SearchGPT / ChatGPT. Three source tiers come back from the provider:
+    # links_attached ⊆ search_sources ⊆ citations = sources ∪ sources_more.
+    # links_attached are the sources actually used in the answer ([N] markers)
+    # → cited; search_sources_more is the consulted-but-unused tail → the
+    # cited=False "More" tier, mirroring the SERP-era cited/more split.
+    if llm in ("searchgpt", "chatgpt") and (
+        result.get("links_attached") or result.get("search_sources_more")
+    ):
+        seen_urls: set = set()
+        for i, link in enumerate(result.get("links_attached") or []):
+            url = link.get("url", "")
+            if url:
+                seen_urls.add(url)
+            _add(url, link.get("text") or link.get("title"), link.get("position", i + 1), link.get("cited"))
+        more_pos = 0
+        for src in result.get("search_sources_more") or []:
+            url = src.get("url", "")
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            more_pos += 1
+            _add(url, src.get("title") or src.get("snippet"), more_pos, False)
     elif llm == "perplexity" and result.get("sources"):
         for i, src in enumerate(result["sources"]):
             _add(src.get("url", ""), src.get("title") or src.get("description") or src.get("snippet"), i + 1)

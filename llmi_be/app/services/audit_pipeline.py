@@ -695,6 +695,17 @@ async def handle_polling(audit_id: str, worker_id: str) -> None:
                                         # Google AI Overview (DataForSEO/BrightData) also returns
                                         # the page's organic results — stored in its own column.
                                         "organic_results": json.dumps(matched["organic"], ensure_ascii=False) if matched.get("organic") else None,
+                                        # Rich results (chatgpt/searchgpt via BrightData). Raw
+                                        # dicts/lists — upsert_llm_responses serializes + casts.
+                                        "shopping": matched.get("shopping") or None,
+                                        "shopping_visible": bool(matched.get("shopping_visible")),
+                                        "is_map": bool(matched.get("is_map")),
+                                        "search_sources": matched.get("search_sources") or None,
+                                        "search_sources_more": matched.get("search_sources_more") or None,
+                                        "ads": matched.get("ads") or None,
+                                        "business_locations": matched.get("business_locations") or None,
+                                        "map_places": matched.get("map") or None,
+                                        "map_search_queries": matched.get("map_search_queries") or None,
                                     },
                                 })
                             else:

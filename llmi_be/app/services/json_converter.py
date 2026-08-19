@@ -26,30 +26,35 @@ def extract_domain(url: str) -> str:
         return url
 
 
-def _collect_search_queries(obj, out: list, seen: set) -> None:
-    """Recursively collect every metadata.search_model_queries.queries string
-    from a parsed streaming payload, deduped and in first-seen order.
+def _collect_search_queries(obj, out: list, seen: set, key: str = 'search_model_queries') -> None:
+    """Recursively collect every metadata.<key>.queries string from a parsed
+    streaming payload, deduped and in first-seen order.
 
     ChatGPT nests search_model_queries under different wrappers depending on the
     event (v.message.metadata, message.metadata, patch ops, …) and emits one set
     per search turn. Walking the whole structure catches them all instead of
     guessing a single path (the previous version missed the common
     message.metadata shape, so web_search_query fell back to the prompt).
+
+    `key` selects the fan-out type: 'search_model_queries' (regular web) or
+    'map_search_model_queries' (map/local results). The value can be either a
+    dict {"queries": [...]} or a bare list of strings depending on the event.
     """
     if isinstance(obj, dict):
-        smq = obj.get('search_model_queries')
-        if isinstance(smq, dict):
-            for q in (smq.get('queries') or []):
+        smq = obj.get(key)
+        queries = smq.get('queries') if isinstance(smq, dict) else smq
+        if isinstance(queries, list):
+            for q in queries:
                 if isinstance(q, str):
                     q = q.strip()
                     if q and q not in seen:
                         seen.add(q)
                         out.append(q)
         for v in obj.values():
-            _collect_search_queries(v, out, seen)
+            _collect_search_queries(v, out, seen, key)
     elif isinstance(obj, list):
         for item in obj:
-            _collect_search_queries(item, out, seen)
+            _collect_search_queries(item, out, seen, key)
 
 
 def extract_search_queries(raw_response: list) -> list:
@@ -382,6 +387,17 @@ def extract_search_queries_from_bd_events(events: list) -> list:
     return out
 
 
+def extract_map_search_queries_from_bd_events(events: list) -> list:
+    """Extract map fan-out queries (map_search_model_queries) from BrightData
+    response_raw events — the queries ChatGPT sends to its local/map search
+    when building place results. Separate from regular web queries."""
+    out: list = []
+    seen: set = set()
+    for evt in (events or []):
+        _collect_search_queries(evt, out, seen, key='map_search_model_queries')
+    return out
+
+
 def convert_brightdata_record(item: dict, country: str = "") -> dict:
     """
     Converts a single BrightData record to the same format as SERP converted records.
@@ -403,6 +419,10 @@ def convert_brightdata_record(item: dict, country: str = "") -> dict:
         extracted = extract_search_queries_from_bd_events(raw_events)
         web_search_query = extracted if extracted else None
 
+    # Map fan-out queries are a distinct pipeline (place results) — keep them
+    # separate from regular web queries so reports can label them.
+    map_search_queries = extract_map_search_queries_from_bd_events(raw_events) or None
+
     # Fix country: prefer explicit param, then item value, then fallback
     record_country = country or item.get('country') or ''
 
@@ -416,6 +436,13 @@ def convert_brightdata_record(item: dict, country: str = "") -> dict:
             'web_search': item.get('web_search_triggered', True),
             'additional_prompt': input_data.get('additional_prompt', ''),
         }
+
+    # Ads: keep only when there is actual ad content (BrightData returns
+    # {"carousel_cards": []} even when no ad was shown).
+    ads = item.get('ads')
+    if isinstance(ads, dict) and not ads.get('name') and not ads.get('url') \
+            and not ads.get('carousel_cards'):
+        ads = None
 
     return {
         'map': item.get('map'),
@@ -442,6 +469,13 @@ def convert_brightdata_record(item: dict, country: str = "") -> dict:
         'additional_prompt': item.get('additional_prompt', ''),
         'additional_answer_text': item.get('additional_answer_text'),
         'all_sources': all_sources,
+        # Rich results (chatgpt/searchgpt): ad block, place cards and the
+        # detailed local-business records, plus the "More" sources tier and
+        # map fan-out queries. Persisted to dedicated llm_responses columns.
+        'ads': ads,
+        'business_locations': item.get('business_locations') or [],
+        'search_sources_more': item.get('search_sources_more') or [],
+        'map_search_queries': map_search_queries,
     }
 
 

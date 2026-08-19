@@ -9,6 +9,7 @@ import { supabase } from '../lib/supabase';
 import { useDashboardFilters } from '../contexts/DashboardFiltersContext';
 import { applyFilters as applyDashboardFilters } from '../lib/dashboard-filter-utils';
 import { FanOutDiagram } from '../components/prompt/FanOutDiagram';
+import { ResponseRichResults } from '../components/response/ResponseRichResults';
 import {
   FileText, Globe, ArrowLeft, Brain,
   Download, ExternalLink, MessageSquare, Clock, Eye, X,
@@ -243,6 +244,15 @@ export const PromptDetailPage: React.FC = () => {
           links_attached,
           all_sources,
           web_search_query,
+          map_search_queries,
+          shopping,
+          shopping_visible,
+          is_map,
+          search_sources,
+          search_sources_more,
+          ads,
+          business_locations,
+          map_places,
           answer_competitors,
           sentiment_score,
           sentiment_label,
@@ -1370,6 +1380,10 @@ export const PromptDetailPage: React.FC = () => {
                     )}
                   </div>
                 </div>
+
+                {/* Rich results: typed queries, shopping/place/ad cards and
+                    the three source tiers (chatgpt/searchgpt via BrightData) */}
+                <ResponseRichResults response={selectedResponse} />
 
                 {/* Full Response Text */}
                 {selectedResponse.answer_text_markdown && (
