@@ -10,6 +10,8 @@ import { Input } from '../components/ui/Input';
 import { Progress } from '../components/ui/Progress';
 import { supabase } from '../lib/supabase';
 import { DOMAIN_CATEGORIES, categoryChipClass } from '../lib/domainCategories';
+import { normalizeBrandKey, buildBrandDomainMapFromCitations } from '../lib/brandDomains';
+import { BrandFavicon } from '../components/ui/BrandFavicon';
 import { queryCache } from '../lib/queryCache';
 import { Calendar, FileText, ChartBar as BarChart3, Globe, Users, Play, ArrowLeft, Brain, Download, Settings as SettingsIcon, PencilLine, X, MessageSquare, Crown, TrendingUp, Lightbulb, Trash2, Info, Settings, CalendarCheck, ArrowUpDown, ArrowUp, ArrowDown, BadgeCheck, MessageCircle, List, ChevronDown, Smile } from 'lucide-react';
 import { SentimentDashboard } from '../components/sentiment/SentimentDashboard';
@@ -280,6 +282,46 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
   // Domains tab. Own Brand / Competitor are computed per project on top.
   const [domainCategoryMap, setDomainCategoryMap] = useState<Record<string, string>>({});
   const [domainCategoryFilter, setDomainCategoryFilter] = useState<string>('all');
+
+  // Brand → official-site domain, for brand favicons. Tier 0: most-cited
+  // matching domain from this project's citations (free, computed here).
+  // Fallback: global brand_domains table (gpt-5-nano fills it per audit).
+  const [brandDbDomains, setBrandDbDomains] = useState<Record<string, string>>({});
+  const citationBrandDomains = useMemo(
+    () => buildBrandDomainMapFromCitations(processedCitations),
+    [processedCitations]
+  );
+  const getBrandDomain = (brandName: string): string | null => {
+    const key = normalizeBrandKey(brandName);
+    if (!key) return null;
+    return citationBrandDomains[key] || brandDbDomains[key] || null;
+  };
+
+  useEffect(() => {
+    const names = [...brands, ...competitors].map(b => b.brand_name).filter(Boolean);
+    const norms = Array.from(new Set(names.map(normalizeBrandKey).filter(k => k)));
+    if (norms.length === 0) {
+      setBrandDbDomains({});
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      const { data, error } = await supabase
+        .from('brand_domains')
+        .select('brand_norm, domain')
+        .in('brand_norm', norms);
+      if (error) {
+        console.error('Error fetching brand domains:', error);
+        return;
+      }
+      if (!cancelled) {
+        const map: Record<string, string> = {};
+        (data || []).forEach((r: any) => { map[r.brand_norm] = r.domain; });
+        setBrandDbDomains(map);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [brands, competitors]);
 
   useEffect(() => {
     // processedCitations is what the Domains tab actually renders: citation
@@ -2746,8 +2788,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
 
     // Match the registrable label ("credit-agricole" in credit-agricole.fr)
     // against normalized brand names ("Crédit Agricole" → "creditagricole").
-    const normalize = (s: string) =>
-      s.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9]/g, '');
+    const normalize = normalizeBrandKey;
     const labels = domain.split('.');
     const secondLevel = normalize(labels.length >= 2 ? labels[labels.length - 2] : labels[0]);
     if (secondLevel.length >= 3) {
@@ -4801,6 +4842,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                                 {brand.isOwnBrand && (
                                   <div className="w-2 h-2 rounded-full bg-emerald-500 dark:bg-emerald-400 flex-shrink-0" title="Your Brand" />
                                 )}
+                                <BrandFavicon name={brand.name} domain={getBrandDomain(brand.name)} size={16} />
                                 <span className={`text-sm font-medium truncate ${
                                   brand.isOwnBrand
                                     ? 'text-emerald-700 dark:text-emerald-400 font-semibold'
@@ -4853,6 +4895,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                                 {brand.isOwnBrand && (
                                   <div className="w-2 h-2 rounded-full bg-emerald-500 dark:bg-emerald-400 flex-shrink-0" title="Your Brand" />
                                 )}
+                                <BrandFavicon name={brand.name} domain={getBrandDomain(brand.name)} size={16} />
                                 <span className={`text-sm font-medium truncate ${
                                   brand.isOwnBrand
                                     ? 'text-emerald-700 dark:text-emerald-400 font-semibold'
@@ -5776,13 +5819,19 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                           >
                             <td className="py-4 px-6">
                               <div className="flex items-center gap-3">
-                                <div className={`w-10 h-10 rounded-xl flex items-center justify-center font-bold text-sm shadow-sm ${
-                                  brand.is_competitor
-                                    ? 'bg-gradient-to-br from-red-100 to-red-200 dark:from-red-900/30 dark:to-red-800/20 text-red-700 dark:text-red-400'
-                                    : 'bg-gradient-to-br from-emerald-100 to-emerald-200 dark:from-emerald-900/30 dark:to-emerald-800/20 text-emerald-700 dark:text-emerald-400'
-                                }`}>
-                                  {brand.brand_name.charAt(0).toUpperCase()}
-                                </div>
+                                {getBrandDomain(brand.brand_name) ? (
+                                  <div className="w-10 h-10 rounded-xl flex items-center justify-center bg-white dark:bg-gray-700 border border-gray-200 dark:border-gray-600 shadow-sm">
+                                    <BrandFavicon name={brand.brand_name} domain={getBrandDomain(brand.brand_name)} size={24} />
+                                  </div>
+                                ) : (
+                                  <div className={`w-10 h-10 rounded-xl flex items-center justify-center font-bold text-sm shadow-sm ${
+                                    brand.is_competitor
+                                      ? 'bg-gradient-to-br from-red-100 to-red-200 dark:from-red-900/30 dark:to-red-800/20 text-red-700 dark:text-red-400'
+                                      : 'bg-gradient-to-br from-emerald-100 to-emerald-200 dark:from-emerald-900/30 dark:to-emerald-800/20 text-emerald-700 dark:text-emerald-400'
+                                  }`}>
+                                    {brand.brand_name.charAt(0).toUpperCase()}
+                                  </div>
+                                )}
                                 <div className="font-semibold text-gray-900 dark:text-gray-100">
                                   {brand.brand_name}
                                 </div>
@@ -6032,11 +6081,17 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                                                   : 'bg-blue-100 text-blue-800 dark:bg-blue-900/20 dark:text-blue-400'
                                               }`}
                                             >
-                                              <div
-                                                className={`w-2 h-2 rounded-full mr-1 ${
-                                                  brand.is_competitor ? 'bg-red-500' : 'bg-blue-500'
-                                                }`}
-                                              />
+                                              {getBrandDomain(brand.brand_name) ? (
+                                                <span className="mr-1 inline-flex">
+                                                  <BrandFavicon name={brand.brand_name} domain={getBrandDomain(brand.brand_name)} size={12} />
+                                                </span>
+                                              ) : (
+                                                <div
+                                                  className={`w-2 h-2 rounded-full mr-1 ${
+                                                    brand.is_competitor ? 'bg-red-500' : 'bg-blue-500'
+                                                  }`}
+                                                />
+                                              )}
                                               {brand.brand_name}
                                             </span>
                                           ))}

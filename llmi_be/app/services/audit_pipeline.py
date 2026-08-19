@@ -1945,6 +1945,13 @@ async def handle_finalize(audit_id: str, worker_id: str) -> None:
     except Exception as e:
         logger.warning(f"[pipeline] {audit_id}: domain categorization warning: {e}")
 
+    # Resolve official-site domains for new brands (favicons; best-effort).
+    try:
+        from app.services import brand_domain_resolver
+        await brand_domain_resolver.resolve_new_brands(audit_id)
+    except Exception as e:
+        logger.warning(f"[pipeline] {audit_id}: brand domain resolution warning: {e}")
+
     try:
         await db.update_audit_step(audit_id, "persist", {
             "status": "done", "message": "Results saved"

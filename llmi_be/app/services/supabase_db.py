@@ -993,6 +993,79 @@ class SupabaseDB:
             )).scalars().all()
             return [r for r in rows if r]
 
+    async def get_project_brand_names(self, audit_id: str) -> list[str]:
+        """All brand names (own + competitors) of the audit's project."""
+        async with AsyncSessionLocal() as s:
+            rows = (await s.execute(
+                text("""
+                    SELECT DISTINCT b.brand_name
+                    FROM brands b
+                    JOIN audits a ON a.project_id = b.project_id
+                    WHERE a.id = :aid AND b.brand_name IS NOT NULL
+                """),
+                {"aid": audit_id},
+            )).scalars().all()
+            return [r for r in rows if r]
+
+    async def get_brand_domains(self, norms: list[str]) -> dict[str, str]:
+        if not norms:
+            return {}
+        async with AsyncSessionLocal() as s:
+            rows = (await s.execute(
+                text("SELECT brand_norm, domain FROM brand_domains WHERE brand_norm = ANY(:n)"),
+                {"n": norms},
+            )).all()
+            return {r[0]: r[1] for r in rows}
+
+    async def get_project_citation_domains(
+        self, audit_id: str, limit: int = 2000
+    ) -> list[tuple[str, int]]:
+        """(domain, citation count) across ALL audits of the audit's project,
+        most-cited first — Tier 0 input for brand-domain resolution."""
+        async with AsyncSessionLocal() as s:
+            rows = (await s.execute(
+                text("""
+                    SELECT c.domain, count(*) AS n
+                    FROM citations c
+                    JOIN audits a ON a.id = c.audit_id
+                    WHERE a.project_id = (SELECT project_id FROM audits WHERE id = :aid)
+                      AND c.domain IS NOT NULL AND c.domain <> ''
+                    GROUP BY c.domain
+                    ORDER BY n DESC
+                    LIMIT :lim
+                """),
+                {"aid": audit_id, "lim": limit},
+            )).all()
+            return [(r[0], r[1]) for r in rows]
+
+    async def upsert_brand_domains(self, rows: list[dict]) -> None:
+        """Upsert brand → domain rows. 'manual' rows are never overwritten."""
+        if not rows:
+            return
+        async with AsyncSessionLocal() as s:
+            for r in rows:
+                await s.execute(
+                    text("""
+                        INSERT INTO brand_domains (brand_norm, brand_name, domain, source, confidence, updated_at)
+                        VALUES (:brand_norm, :brand_name, :domain, :source, :confidence, now())
+                        ON CONFLICT (brand_norm) DO UPDATE SET
+                            brand_name = EXCLUDED.brand_name,
+                            domain     = EXCLUDED.domain,
+                            source     = EXCLUDED.source,
+                            confidence = EXCLUDED.confidence,
+                            updated_at = now()
+                        WHERE brand_domains.source <> 'manual'
+                    """),
+                    {
+                        "brand_norm": r["brand_norm"],
+                        "brand_name": r["brand_name"],
+                        "domain": r["domain"],
+                        "source": r.get("source", "llm"),
+                        "confidence": r.get("confidence"),
+                    },
+                )
+            await s.commit()
+
     async def upsert_domain_categories(self, rows: list[dict]) -> None:
         """Upsert domain → category rows. A 'manual' row is never overwritten
         by rule/llm re-classification."""
