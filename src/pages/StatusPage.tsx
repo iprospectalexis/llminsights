@@ -193,6 +193,7 @@ export function StatusPage() {
               pending: Number(s.pending),
               failed: Number(s.failed),
               scraped_empty: Number(s.scraped_empty ?? 0),
+              competitors_missing: Number(s.competitors_missing ?? 0),
               reasons: s.reasons,
             });
           }

@@ -94,7 +94,8 @@ async def _call_openai(messages: list[dict], max_tokens: int = 2048,
                         response_format: Optional[dict] = None,
                         _ctx: Optional[dict] = None,
                         _operation: Optional[str] = None,
-                        model: Optional[str] = None) -> Optional[str]:
+                        model: Optional[str] = None,
+                        timeout_s: float = 60.0) -> Optional[str]:
     """Call OpenAI chat completions API with concurrency control.
 
     `_ctx` carries audit_id/project_id/user_id from the caller so the cost
@@ -125,7 +126,7 @@ async def _call_openai(messages: list[dict], max_tokens: int = 2048,
             # extract_competitors retry-loop also retries on timeout, so a
             # one-off 60s stall triggers a 2s-backoff retry inside the
             # same call instead of waiting 15s for the next scheduler tick.
-            resp = await _client.chat.completions.create(timeout=60.0, **kwargs)
+            resp = await _client.chat.completions.create(timeout=timeout_s, **kwargs)
             choice = resp.choices[0]
             content = choice.message.content
             if not content:
@@ -425,6 +426,10 @@ async def extract_competitors(
                 _ctx=_ctx,
                 _operation="competitors_extract",
                 model=MODEL_COMPETITORS,
+                # The escalated 16384-budget retry reasons for longer — give
+                # it real headroom instead of dying at 60s ("Request timed
+                # out." sentinels).
+                timeout_s=60.0 if attempt == 0 else 150.0,
             )
             if not raw:
                 if attempt == 0:
