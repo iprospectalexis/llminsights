@@ -72,11 +72,16 @@ async def main() -> None:
 
         rows = await conn.fetch("""
             SELECT lr.id, lr.audit_id, lr.llm, lr.run_index, lr.created_at,
-                   lr.raw_response_data->>'prompt' AS ptext
+                   coalesce(
+                     nullif(lr.raw_response_data->>'prompt', ''),
+                     nullif(lr.raw_response_data->>'query', ''),
+                     nullif(lr.raw_response_data->'input'->>'keyword', ''),
+                     nullif(lr.raw_response_data->'input'->>'prompt', '')
+                   ) AS ptext,
+                   lr.web_search_query AS wsq
             FROM llm_responses lr
             JOIN audits a ON a.id = lr.audit_id
             WHERE a.project_id = $1 AND lr.prompt_id IS NULL
-              AND lr.raw_response_data IS NOT NULL
         """, project_id)
         matched, unmatched = [], 0
         for r in rows:
@@ -84,6 +89,20 @@ async def main() -> None:
             if pid is None:
                 stripped = _norm(_strip_group_prefix(r["ptext"] or ""))
                 pid = by_norm.get(stripped) if stripped else None
+            if pid is None and r["wsq"]:
+                # Last resort: rows whose raw was pruned sometimes keep the
+                # prompt inside web_search_query (exact matches only — real
+                # fan-out queries won't equal a prompt verbatim).
+                wsq = r["wsq"]
+                try:
+                    parsed = json.loads(wsq)
+                    queries = parsed if isinstance(parsed, list) else [parsed]
+                except (json.JSONDecodeError, TypeError):
+                    queries = [wsq]
+                for q in queries:
+                    pid = by_norm.get(_norm(str(q)))
+                    if pid is not None:
+                        break
             if pid is None:
                 unmatched += 1
             else:
