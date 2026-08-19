@@ -235,6 +235,28 @@ POLLING_MAX_MINUTES = 90
 # the 90-min global window and matches realistic provider latency.
 MAX_POLL_ATTEMPTS_PER_ROW = 60
 
+def _rich_digest_from_row(r: dict) -> str:
+    """build_rich_results_digest over a get_responses_for_competitors row.
+    jsonb columns arrive as JSON strings from raw text() queries — parse
+    defensively (older rows have NULLs; pre-deploy rows lack the keys)."""
+    def _j(v):
+        if v is None:
+            return None
+        if isinstance(v, str):
+            try:
+                return json.loads(v)
+            except (json.JSONDecodeError, TypeError):
+                return None
+        return v
+    from app.services import openai_client
+    return openai_client.build_rich_results_digest(
+        shopping=_j(r.get("shopping")),
+        map_places=_j(r.get("map_places")),
+        business_locations=_j(r.get("business_locations")),
+        ads=_j(r.get("ads")),
+    )
+
+
 # Job statuses meaning "the provider is still working on it". A row whose job
 # is in one of these states must NOT be swept as exhausted, no matter how many
 # attempts it has burned: 100+ prompt SERP batches routinely take 30-60 min —
@@ -1020,8 +1042,12 @@ async def _competitors_via_batch(audit_id: str, audit: dict, pending: list[dict]
         lines: list[dict] = []
         for r in pending:
             answer = r.get("answer_text") or ""
+            # Rich result blocks (shopping / ad / places) carry brands the
+            # body text may never mention — include them in prefilter + prompt.
+            rich = _rich_digest_from_row(r)
             if openai_client.competitors_prefilter_skip(
-                answer, (own_brands or []) + (competitor_brands or [])
+                f"{answer}\n{rich}" if rich else answer,
+                (own_brands or []) + (competitor_brands or []),
             ):
                 prefilter_updates.append({
                     "id": r["id"],
@@ -1033,6 +1059,7 @@ async def _competitors_via_batch(audit_id: str, audit: dict, pending: list[dict]
                 industry=project_name or "",
                 known_brands=own_brands,
                 known_competitors=competitor_brands,
+                rich_context=rich,
             )
             lines.append(openai_client.batch_request_line(
                 f"comp:{r['id']}", messages,
@@ -1457,6 +1484,7 @@ async def handle_competitors(audit_id: str, worker_id: str) -> None:
                 known_brands=own_brands,
                 known_competitors=competitor_brands,
                 _ctx=cost_ctx,
+                rich_context=_rich_digest_from_row(r),
             )
             # extract_competitors returns {"brands": [...]} on success or
             # {"brands": [], "error": "...", "_retry": N} on recoverable error.

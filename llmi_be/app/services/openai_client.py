@@ -67,7 +67,13 @@ COMPETITORS_SCHEMA = {
                         "weaknesses": {"type": "array", "items": {"type": "string"}},
                         "mention_type": {
                             "type": "string",
-                            "enum": ["recommended", "compared", "mentioned"],
+                            # shopping/sponsored/place: brands that appear in
+                            # the answer's rich result blocks (product cards,
+                            # the ad unit, map/place cards) rather than the
+                            # body text. The frontend renders unknown types
+                            # generically, so extending here is safe.
+                            "enum": ["recommended", "compared", "mentioned",
+                                     "shopping", "sponsored", "place"],
                         },
                         "rank": {"type": ["integer", "null"]},
                     },
@@ -324,15 +330,51 @@ def competitors_prefilter_skip(answer_text: str, known: list[str]) -> bool:
     return not has_known and not _has_proper_nouns(answer_text)
 
 
+def build_rich_results_digest(
+    shopping=None, map_places=None, business_locations=None, ads=None,
+) -> str:
+    """Compact text digest of an answer's rich result blocks so competitor
+    extraction can see brands that never appear in the body text: shopping
+    product cards, the sponsored ad unit, map/place cards (chatgpt/searchgpt
+    via BrightData)."""
+    parts: list[str] = []
+    for p in (shopping or [])[:12]:
+        if not isinstance(p, dict):
+            continue
+        bits = [p.get("title") or ""]
+        if p.get("price"):
+            bits.append(str(p["price"]))
+        if p.get("merchants"):
+            bits.append(f"sold by {p['merchants']}")
+        line = " — ".join(b for b in bits if b)
+        if line:
+            parts.append(f"[SHOPPING CARD] {line}")
+    place_names = [pl.get("name") for pl in (map_places or []) if isinstance(pl, dict) and pl.get("name")]
+    if not place_names:
+        place_names = [b.get("name") for b in (business_locations or []) if isinstance(b, dict) and b.get("name")]
+    for n in place_names[:12]:
+        parts.append(f"[PLACE CARD] {n}")
+    if isinstance(ads, dict):
+        if ads.get("name"):
+            parts.append(f"[SPONSORED AD] advertiser: {ads['name']}")
+        for c in (ads.get("carousel_cards") or [])[:4]:
+            if isinstance(c, dict) and c.get("title"):
+                body = f" — {c['body']}" if c.get("body") else ""
+                parts.append(f"[SPONSORED AD CARD] {c['title']}{body}")
+    return "\n".join(parts)
+
+
 def build_competitors_messages(
     prompt_text: str,
     answer_text: str,
     industry: str = "",
     known_brands: list[str] | None = None,
     known_competitors: list[str] | None = None,
+    rich_context: str = "",
 ) -> list[dict]:
     """Chat messages for competitor extraction — shared by the live call and
-    the Batch API path so both run the identical prompt."""
+    the Batch API path so both run the identical prompt. `rich_context` is
+    the build_rich_results_digest output (shopping / ad / place blocks)."""
     known_brands = known_brands or []
     known_competitors = known_competitors or []
 
@@ -369,6 +411,10 @@ def build_competitors_messages(
                 "- If a brand is ranked or positioned (e.g., '#1', 'top 3', 'best'), capture the rank\n"
                 "- Mention type: 'recommended' if explicitly suggested, 'compared' if part of a comparison, "
                 "'mentioned' if just referenced\n"
+                "- If RICH RESULT BLOCKS are attached: also extract brands visible there — "
+                "mention_type 'shopping' for [SHOPPING CARD] product/merchant brands, "
+                "'sponsored' for the [SPONSORED AD] advertiser, 'place' for [PLACE CARD] venue brands. "
+                "A brand appearing BOTH in the text and in a block keeps its text-based type\n"
                 "- Respond in the SAME LANGUAGE as the analyzed text\n"
                 "- If no brands/companies are mentioned, return {\"brands\": []}\n"
                 "- Return valid JSON only"
@@ -380,7 +426,8 @@ def build_competitors_messages(
                 f"Extract all brands/companies mentioned in this LLM response.\n\n"
                 f"Context prompt that generated this response: \"{prompt_text}\"\n\n"
                 f"LLM response text:\n\"\"\"\n{answer_text}\n\"\"\"\n\n"
-                "Return JSON:\n"
+                + (f"RICH RESULT BLOCKS shown alongside the answer:\n\"\"\"\n{rich_context}\n\"\"\"\n\n" if rich_context else "")
+                + "Return JSON:\n"
                 "{\n"
                 '  "brands": [\n'
                 "    {\n"
@@ -405,16 +452,21 @@ async def extract_competitors(
     known_brands: list[str] | None = None,
     known_competitors: list[str] | None = None,
     _ctx: Optional[dict] = None,
+    rich_context: str = "",
 ) -> dict:
     """
     Extract brand/company names from an LLM response.
-    Returns {"brands": [...]} dict.
+    Returns {"brands": [...]} dict. `rich_context` = build_rich_results_digest
+    output (shopping / ad / place blocks shown alongside the answer).
     """
     known_brands = known_brands or []
     known_competitors = known_competitors or []
 
-    # Pre-filter: skip API call if text has no proper nouns and no known brands
-    if competitors_prefilter_skip(answer_text, known_brands + known_competitors):
+    # Pre-filter: skip API call if text has no proper nouns and no known
+    # brands — the rich blocks count as text here (an ad advertiser is a
+    # brand even when the body mentions none).
+    prefilter_text = f"{answer_text}\n{rich_context}" if rich_context else answer_text
+    if competitors_prefilter_skip(prefilter_text, known_brands + known_competitors):
         return {"brands": [], "_skipped": True}
 
     messages = build_competitors_messages(
@@ -422,6 +474,7 @@ async def extract_competitors(
         industry=industry,
         known_brands=known_brands,
         known_competitors=known_competitors,
+        rich_context=rich_context,
     )
 
     for attempt in range(2):  # attempt 0: luna/effort-none; attempt 1: legacy fallback

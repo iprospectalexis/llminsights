@@ -691,7 +691,8 @@ class SupabaseDB:
         async with AsyncSessionLocal() as s:
             rows = (await s.execute(
                 text("""
-                    SELECT lr.id, lr.answer_text, lr.answer_competitors, p.prompt_text
+                    SELECT lr.id, lr.answer_text, lr.answer_competitors, p.prompt_text,
+                           lr.shopping, lr.map_places, lr.business_locations, lr.ads
                     FROM llm_responses lr
                     JOIN prompts p ON lr.prompt_id = p.id
                     WHERE lr.audit_id = :aid
