@@ -53,7 +53,18 @@ const SectionTitle = ({ icon, children }: { icon: React.ReactNode; children: Rea
   </h4>
 );
 
-export function ResponseRichResults({ response }: { response: any }) {
+export type RichSection = 'queries' | 'shopping' | 'places' | 'ads' | 'sources';
+
+export function ResponseRichResults({
+  response,
+  sections,
+}: {
+  response: any;
+  // Which blocks to render (default: all). Lets the caller interleave them
+  // with other content in the answer-snapshot order.
+  sections?: RichSection[];
+}) {
+  const show = (s: RichSection) => !sections || sections.includes(s);
   const shopping: any[] = Array.isArray(response.shopping) ? response.shopping : [];
   const mapPlaces: any[] = Array.isArray(response.map_places) ? response.map_places : [];
   const businesses: any[] = Array.isArray(response.business_locations) ? response.business_locations : [];
@@ -61,6 +72,7 @@ export function ResponseRichResults({ response }: { response: any }) {
   const linksAttached: any[] = Array.isArray(response.links_attached) ? response.links_attached : [];
   const searchSources: any[] = Array.isArray(response.search_sources) ? response.search_sources : [];
   const sourcesMore: any[] = Array.isArray(response.search_sources_more) ? response.search_sources_more : [];
+  const allRetrieved: any[] = Array.isArray(response.citations) ? response.citations : [];
   const webQueries = parseQueryList(response.web_search_query);
   const mapQueries = parseQueryList(response.map_search_queries);
 
@@ -76,18 +88,26 @@ export function ResponseRichResults({ response }: { response: any }) {
   };
 
   const linkUrls = new Set(linksAttached.map(l => l?.url).filter(Boolean));
-  const consulted = searchSources.filter(s => s?.url && !linkUrls.has(s.url));
+  const moreUrls = new Set(sourcesMore.map(s => s?.url).filter(Boolean));
+  // "All retrieved" = the provider's full source list (search_sources ∪
+  // search_sources_more for chatgpt/searchgpt; the citations column for
+  // other LLMs). Shown minus the entries already listed in the tiers above.
+  const retrieved = (allRetrieved.length > 0 ? allRetrieved : searchSources)
+    .filter(s => s?.url && !linkUrls.has(s.url) && !moreUrls.has(s.url));
 
   const hasQueries = webQueries.length > 0 || mapQueries.length > 0;
-  const hasSources = linksAttached.length > 0 || consulted.length > 0 || sourcesMore.length > 0;
-  const hasAnything = shopping.length > 0 || mapPlaces.length > 0 || businesses.length > 0
-    || ads || hasQueries || hasSources;
+  const hasSources = linksAttached.length > 0 || retrieved.length > 0 || sourcesMore.length > 0;
+  const hasAnything = (show('shopping') && shopping.length > 0)
+    || (show('places') && (mapPlaces.length > 0 || businesses.length > 0))
+    || (show('ads') && ads)
+    || (show('queries') && hasQueries)
+    || (show('sources') && hasSources);
   if (!hasAnything) return null;
 
   return (
     <>
       {/* Typed fan-out queries */}
-      {hasQueries && (
+      {show('queries') && hasQueries && (
         <div>
           <SectionTitle icon={<Search className="w-4 h-4 text-gray-500" />}>
             Web search queries
@@ -108,7 +128,7 @@ export function ResponseRichResults({ response }: { response: any }) {
       )}
 
       {/* Shopping cards */}
-      {shopping.length > 0 && (
+      {show('shopping') && shopping.length > 0 && (
         <div>
           <SectionTitle icon={<ShoppingBag className="w-4 h-4 text-gray-500" />}>
             Shopping results <span className="text-xs font-normal text-gray-500">({shopping.length})</span>
@@ -143,7 +163,7 @@ export function ResponseRichResults({ response }: { response: any }) {
       )}
 
       {/* Place / map cards */}
-      {(mapPlaces.length > 0 || businesses.length > 0) && (
+      {show('places') && (mapPlaces.length > 0 || businesses.length > 0) && (
         <div>
           <SectionTitle icon={<MapIcon className="w-4 h-4 text-gray-500" />}>
             Places (map results) <span className="text-xs font-normal text-gray-500">({mapPlaces.length || businesses.length})</span>
@@ -189,7 +209,7 @@ export function ResponseRichResults({ response }: { response: any }) {
       )}
 
       {/* Ad block */}
-      {ads && (
+      {show('ads') && ads && (
         <div>
           <SectionTitle icon={<Megaphone className="w-4 h-4 text-amber-500" />}>
             Sponsored <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-300 font-semibold uppercase">Ad</span>
@@ -231,7 +251,7 @@ export function ResponseRichResults({ response }: { response: any }) {
       )}
 
       {/* Source tiers */}
-      {hasSources && (
+      {show('sources') && hasSources && (
         <div>
           <SectionTitle icon={<Link2 className="w-4 h-4 text-gray-500" />}>
             Sources
@@ -258,24 +278,6 @@ export function ResponseRichResults({ response }: { response: any }) {
                 </div>
               </div>
             )}
-            {consulted.length > 0 && (
-              <div>
-                <div className="text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400 mb-1.5">
-                  Consulted ({consulted.length})
-                </div>
-                <div className="space-y-1">
-                  {consulted.map((s, i) => (
-                    <div key={i} className="flex items-center gap-2 text-sm">
-                      <Favicon url={s.url} size={14} />
-                      <a href={s.url} target="_blank" rel="noopener noreferrer" className="text-gray-700 dark:text-gray-300 hover:text-brand-primary hover:underline truncate">
-                        {s.title || domainOf(s.url)}
-                      </a>
-                      <span className="text-xs text-gray-400 flex-shrink-0">{domainOf(s.url)}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
             {sourcesMore.length > 0 && (
               <div>
                 <div className="text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400 mb-1.5">
@@ -293,6 +295,24 @@ export function ResponseRichResults({ response }: { response: any }) {
                           <div className="text-xs text-gray-500 dark:text-gray-400 line-clamp-2">{s.snippet}</div>
                         )}
                       </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+            {retrieved.length > 0 && (
+              <div>
+                <div className="text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400 mb-1.5">
+                  All retrieved ({retrieved.length})
+                </div>
+                <div className="space-y-1 max-h-56 overflow-y-auto pr-1">
+                  {retrieved.map((s, i) => (
+                    <div key={i} className="flex items-center gap-2 text-sm">
+                      <Favicon url={s.url} size={14} />
+                      <a href={s.url} target="_blank" rel="noopener noreferrer" className="text-gray-700 dark:text-gray-300 hover:text-brand-primary hover:underline truncate">
+                        {s.title || domainOf(s.url)}
+                      </a>
+                      <span className="text-xs text-gray-400 flex-shrink-0">{domainOf(s.url)}</span>
                     </div>
                   ))}
                 </div>

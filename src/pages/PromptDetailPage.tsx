@@ -354,12 +354,16 @@ export const PromptDetailPage: React.FC = () => {
         .eq('id', responseId)
         .single();
 
-      if (fullResponse && selectedResponse) {
-        setSelectedResponse({
-          ...selectedResponse,
+      if (fullResponse) {
+        // Functional update: the click handler calls setSelectedResponse and
+        // this loader in the same tick, so the closure's selectedResponse is
+        // stale (null on first open) — merging via prev fixes the first-open
+        // "markdown never appears" case.
+        setSelectedResponse(prev => prev ? {
+          ...prev,
           answer_text_markdown: fullResponse.answer_text_markdown,
           answer_html: fullResponse.answer_html,
-        });
+        } : prev);
       }
     } catch (error) {
       console.error('Error loading full response:', error);
@@ -1289,6 +1293,21 @@ export const PromptDetailPage: React.FC = () => {
               </div>
               
               <div className="overflow-y-auto max-h-[calc(90vh-80px)] p-6 space-y-6">
+                {/* Prompt */}
+                <div className="bg-gray-50 dark:bg-gray-700 rounded-xl p-4">
+                  <div className="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400 mb-1.5">
+                    Prompt
+                  </div>
+                  <p className="text-sm font-medium text-gray-900 dark:text-gray-100">
+                    {prompt?.prompt_text}
+                  </p>
+                  {prompt?.prompt_group && prompt.prompt_group !== 'General' && (
+                    <span className="mt-2 inline-flex items-center px-2 py-0.5 rounded-md text-xs font-medium bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300 border border-blue-200 dark:border-blue-800/40">
+                      {prompt.prompt_group}
+                    </span>
+                  )}
+                </div>
+
                 {/* Response Metadata */}
                 <div className="grid grid-cols-2 lg:grid-cols-3 gap-4">
                   <div className="bg-gray-50 dark:bg-gray-700 rounded-xl p-4">
@@ -1381,64 +1400,45 @@ export const PromptDetailPage: React.FC = () => {
                   </div>
                 </div>
 
-                {/* Rich results: typed queries, shopping/place/ad cards and
-                    the three source tiers (chatgpt/searchgpt via BrightData) */}
-                <ResponseRichResults response={selectedResponse} />
+                {/* Fan-out queries (web / map) */}
+                <ResponseRichResults response={selectedResponse} sections={['queries']} />
 
-                {/* Full Response Text */}
-                {selectedResponse.answer_text_markdown && (
+                {/* Answer text — rendered markdown, plain-text fallback */}
+                {(selectedResponse.answer_text_markdown || selectedResponse.answer_text) && (
                   <div>
                     <h4 className="font-medium text-gray-900 dark:text-gray-100 mb-2">
-                      Full Response (Markdown)
+                      Response
                     </h4>
-                    <div className="bg-gray-50 dark:bg-gray-700 rounded-xl p-4 max-h-96 overflow-y-auto">
-                      <pre className="text-sm text-gray-700 dark:text-gray-300 whitespace-pre-wrap font-mono">
-                        {selectedResponse.answer_text_markdown}
-                      </pre>
-                    </div>
-                  </div>
-                )}
-
-                {/* Loading state for full response */}
-                {loadingFullResponse && !selectedResponse.answer_text_markdown && (
-                  <div className="text-center py-8">
-                    <div className="w-6 h-6 border-2 border-brand-primary border-t-transparent rounded-full animate-spin mx-auto mb-2" />
-                    <p className="text-sm text-gray-600 dark:text-gray-400">Loading full response...</p>
-                  </div>
-                )}
-
-                {/* Response Content */}
-                {selectedResponse.raw_response_data && (
-                  <div>
-                    <h4 className="font-medium text-gray-900 dark:text-gray-100 mb-2">
-                      Response Content
-                    </h4>
-                    {selectedResponse.answer_text_markdown ? (
-                      <div className="bg-gray-50 dark:bg-gray-700 p-4 rounded-xl max-h-96 overflow-auto">
+                    <div className="bg-gray-50 dark:bg-gray-700 rounded-xl p-4 max-h-[30rem] overflow-y-auto">
+                      {selectedResponse.answer_text_markdown ? (
                         <div className="prose prose-sm dark:prose-invert max-w-none">
                           <ReactMarkdown remarkPlugins={[remarkGfm]}>
                             {selectedResponse.answer_text_markdown}
                           </ReactMarkdown>
                         </div>
-                      </div>
-                    ) : selectedResponse.answer_text ? (
-                      <div className="bg-gray-50 dark:bg-gray-700 p-4 rounded-xl max-h-96 overflow-auto">
+                      ) : (
                         <div className="text-sm text-gray-800 dark:text-gray-200 whitespace-pre-wrap">
                           {highlightBrands(
                             selectedResponse.answer_text,
                             selectedResponse.answer_competitors?.brands || []
                           )}
                         </div>
-                      </div>
-                    ) : (
-                      <div className="bg-gray-50 dark:bg-gray-700 p-4 rounded-xl">
-                        <div className="text-sm text-gray-500 dark:text-gray-400">
-                          No response content available
-                        </div>
-                      </div>
+                      )}
+                    </div>
+                    {loadingFullResponse && !selectedResponse.answer_text_markdown && (
+                      <p className="text-xs text-gray-500 dark:text-gray-400 mt-1.5 flex items-center gap-1.5">
+                        <span className="w-3 h-3 border-2 border-brand-primary border-t-transparent rounded-full animate-spin inline-block" />
+                        Loading formatted version…
+                      </p>
                     )}
                   </div>
                 )}
+
+                {/* Rich result blocks in the order they appear in the answer */}
+                <ResponseRichResults response={selectedResponse} sections={['shopping', 'places', 'ads']} />
+
+                {/* Sources: used in answer / more / all retrieved */}
+                <ResponseRichResults response={selectedResponse} sections={['sources']} />
 
               </div>
             </motion.div>
