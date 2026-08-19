@@ -32,7 +32,15 @@ _semaphore = asyncio.Semaphore(30)
 _client = AsyncOpenAI(api_key=settings.openai_api_key)
 
 MODEL = "gpt-5-mini"                   # default / legacy fallback
-MODEL_COMPETITORS = "gpt-5-nano"       # competitor extraction (structured JSON, simpler task)
+# Competitor extraction: gpt-5.6-luna with reasoning_effort="none".
+# The old gpt-5-nano spent avg 3,549 hidden reasoning tokens per call to emit
+# ~30 tokens of JSON (99% of its cost, ~$82/mo) and died with empty output
+# whenever reasoning overran the budget. Luna at effort=none: 0 reasoning
+# tokens, ~2-3s latency, ~$17/mo at the same volume. NB: the gpt-5-nano /
+# gpt-5-mini 2025-08-07 snapshots shut down on 2026-12-11 (OpenAI notice
+# 2026-06-11), so the fallback below must be retired before then.
+MODEL_COMPETITORS = "gpt-5.6-luna"
+MODEL_COMPETITORS_FALLBACK = "gpt-5-nano"  # dies 2026-12-11
 MODEL_SENTIMENT = "gpt-5-mini"         # sentiment analysis (needs nuanced scoring + reasoning)
 SENTIMENT_PROMPT_VERSION = "v2.1-2026-04-07"
 
@@ -95,17 +103,18 @@ async def _call_openai(messages: list[dict], max_tokens: int = 2048,
                         _ctx: Optional[dict] = None,
                         _operation: Optional[str] = None,
                         model: Optional[str] = None,
-                        timeout_s: float = 60.0) -> Optional[str]:
+                        timeout_s: float = 60.0,
+                        reasoning_effort: Optional[str] = None) -> Optional[str]:
     """Call OpenAI chat completions API with concurrency control.
 
     `_ctx` carries audit_id/project_id/user_id from the caller so the cost
     tracker can attribute the spend. `_operation` is the high-level operation
     name ('competitors_extract' or 'sentiment_analyze') stored on the event.
 
-    NOTE: do NOT add a `reasoning` / `reasoning_effort` parameter here. The
-    Chat Completions API on gpt-5-nano / gpt-5-mini rejects it with
-    "unexpected keyword argument 'reasoning'" and crashes every call. If you
-    need reasoning-effort control, switch to the Responses API instead.
+    `reasoning_effort` ("none"/"low"/…): supported by the gpt-5.6+ families
+    on Chat Completions (verified live 2026-08-19: luna + "none" → 0
+    reasoning tokens). The LEGACY gpt-5-nano / gpt-5-mini 2025 snapshots
+    reject the parameter — never pass it for those models.
     """
     effective_model = model or MODEL
     async with _semaphore:
@@ -116,6 +125,8 @@ async def _call_openai(messages: list[dict], max_tokens: int = 2048,
         }
         if response_format:
             kwargs["response_format"] = response_format
+        if reasoning_effort:
+            kwargs["reasoning_effort"] = reasoning_effort
 
         try:
             # Hard per-call timeout (60s). Healthy gpt-5-nano / gpt-5-mini
@@ -171,18 +182,22 @@ def batch_request_line(
     model: str,
     max_tokens: int,
     schema: dict,
+    reasoning_effort: Optional[str] = None,
 ) -> dict:
     """One JSONL line for POST /v1/batches input."""
+    body = {
+        "model": model,
+        "messages": messages,
+        "max_completion_tokens": max_tokens,
+        "response_format": {"type": "json_schema", "json_schema": schema},
+    }
+    if reasoning_effort:
+        body["reasoning_effort"] = reasoning_effort
     return {
         "custom_id": custom_id,
         "method": "POST",
         "url": "/v1/chat/completions",
-        "body": {
-            "model": model,
-            "messages": messages,
-            "max_completion_tokens": max_tokens,
-            "response_format": {"type": "json_schema", "json_schema": schema},
-        },
+        "body": body,
     }
 
 
@@ -409,27 +424,25 @@ async def extract_competitors(
         known_competitors=known_competitors,
     )
 
-    for attempt in range(2):  # Retry once on empty output / transient errors
+    for attempt in range(2):  # attempt 0: luna/effort-none; attempt 1: legacy fallback
         try:
-            # max_tokens: 4096 covers most extractions cheaply, but gpt-5-nano
-            # is a reasoning model and on ~10-15% of answers burns the entire
-            # budget on hidden reasoning (finish_reason=length, empty content,
-            # reasoning_tokens=4096). Reasoning depth is deterministic for the
-            # same input, so retrying at the SAME cap fails identically — that
-            # is where the thousands of {"error": "No output from OpenAI"}
-            # sentinels came from. The retry therefore escalates to 16384;
-            # only the problematic ~10% pay the higher-budget price.
+            # Primary path: gpt-5.6-luna with reasoning_effort="none" — zero
+            # hidden reasoning tokens, ~2-3s latency, no finish_reason=length
+            # deaths (4096 is 100× the typical ~30-token JSON output).
+            # Fallback (empty output / API error): the legacy gpt-5-nano
+            # reasoning path with a big budget and long timeout — keeps
+            # extraction alive if luna misbehaves. Remove before 2026-12-11
+            # (legacy snapshot shutdown).
+            primary = attempt == 0
             raw = await _call_openai(
                 messages,
-                max_tokens=4096 if attempt == 0 else 16384,
+                max_tokens=4096 if primary else 16384,
                 response_format={"type": "json_schema", "json_schema": COMPETITORS_SCHEMA},
                 _ctx=_ctx,
                 _operation="competitors_extract",
-                model=MODEL_COMPETITORS,
-                # The escalated 16384-budget retry reasons for longer — give
-                # it real headroom instead of dying at 60s ("Request timed
-                # out." sentinels).
-                timeout_s=60.0 if attempt == 0 else 150.0,
+                model=MODEL_COMPETITORS if primary else MODEL_COMPETITORS_FALLBACK,
+                timeout_s=60.0 if primary else 150.0,
+                reasoning_effort="none" if primary else None,
             )
             if not raw:
                 if attempt == 0:
@@ -459,8 +472,13 @@ async def extract_competitors(
                 or "connection" in msg
                 or " 502" in msg or " 503" in msg or " 504" in msg
             )
-            if attempt == 0 and transient:
-                await asyncio.sleep(2)
+            if attempt == 0:
+                # Any first-attempt failure (transient or luna-specific —
+                # bad param, model access, quota) falls through to the
+                # legacy-nano fallback attempt.
+                if not transient:
+                    logger.warning(f"Competitor extraction: luna attempt failed ({e}), falling back to legacy model")
+                await asyncio.sleep(2 if transient else 0.1)
                 continue
             logger.error(f"Competitor extraction failed: {e}")
             return {"brands": [], "error": str(e)}

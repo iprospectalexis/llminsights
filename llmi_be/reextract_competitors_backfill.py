@@ -49,12 +49,12 @@ async def _reextract_row(row: dict, ctx_cache: dict) -> tuple[str, dict | None]:
     )
     raw = await openai_client._call_openai(
         messages,
-        max_tokens=16384,
+        max_tokens=4096,
         response_format={"type": "json_schema", "json_schema": openai_client.COMPETITORS_SCHEMA},
         _operation="competitors_extract",
         model=openai_client.MODEL_COMPETITORS,
-        # 16384-budget calls reason for longer — 60s default times out.
-        timeout_s=150.0,
+        # luna + effort none: zero reasoning tokens, no length deaths.
+        reasoning_effort="none",
     )
     if not raw:
         return str(row["id"]), None

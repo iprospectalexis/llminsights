@@ -1038,6 +1038,7 @@ async def _competitors_via_batch(audit_id: str, audit: dict, pending: list[dict]
                 f"comp:{r['id']}", messages,
                 openai_client.MODEL_COMPETITORS, 4096,
                 openai_client.COMPETITORS_SCHEMA,
+                reasoning_effort="none",
             ))
         if prefilter_updates:
             await db.update_competitors_batch(prefilter_updates)
