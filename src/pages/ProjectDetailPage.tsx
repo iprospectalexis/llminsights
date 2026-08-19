@@ -11,6 +11,7 @@ import { Progress } from '../components/ui/Progress';
 import { supabase } from '../lib/supabase';
 import { DOMAIN_CATEGORIES, categoryChipClass } from '../lib/domainCategories';
 import { normalizeBrandKey, buildBrandDomainMapFromCitations } from '../lib/brandDomains';
+import { buildPageBrandIndex } from '../lib/pageBrands';
 import { BrandFavicon } from '../components/ui/BrandFavicon';
 import { queryCache } from '../lib/queryCache';
 import { Calendar, FileText, ChartBar as BarChart3, Globe, Users, Play, ArrowLeft, Brain, Download, Settings as SettingsIcon, PencilLine, X, MessageSquare, Crown, TrendingUp, Lightbulb, Trash2, Info, Settings, CalendarCheck, ArrowUpDown, ArrowUp, ArrowDown, BadgeCheck, MessageCircle, List, ChevronDown, Smile, ShoppingBag, Map as MapIcon, Megaphone } from 'lucide-react';
@@ -1223,6 +1224,21 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     }
   };
 
+  // Page ↔ brand attribution index (Pages tab "Brands" column): exact
+  // evidence only — brand in the answer chunk citing the page ([N] markers,
+  // searchgpt/chatgpt) or in the citation's own title (all LLMs); response
+  // co-mentions go to tooltips. See src/lib/pageBrands.ts.
+  const pageBrandIndex = useMemo(
+    () => buildPageBrandIndex({
+      responses: filteredLlmResponses,
+      citations: filteredCitations,
+      projectBrands: [...brands, ...competitors],
+      normalizeUrl,
+    }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [filteredLlmResponses, filteredCitations, brands, competitors]
+  );
+
   const extractDomain = (url: string): string => {
     try {
       const urlObj = new URL(url);
@@ -2415,6 +2431,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
       'Page URL': page.page_url,
       'Domain': page.domain,
       'Category': page.category || 'Unknown',
+      'Brands': (page.pageBrands || []).map((b: any) => b.brand_name).join(', '),
       'Citations (Cited)': page.mentions,
       'Citations (More)': page.more_count || 0,
       'Total Citations': page.mentions + (page.more_count || 0),
@@ -2815,10 +2832,16 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
       }
     });
 
-    const pages = Object.values(pageStats).map((p: any) => ({
-      ...p,
-      category: getDomainDisplayCategory(p.domain),
-    }));
+    const pages = Object.values(pageStats).map((p: any) => {
+      const pb = pageBrandIndex.get(normalizeUrl(p.page_url));
+      return {
+        ...p,
+        category: getDomainDisplayCategory(p.domain),
+        pageBrands: pb?.exact || [],
+        pageBrandsComention: pb?.comention || [],
+        brandsCount: pb?.exact.length || 0,
+      };
+    });
 
     // Apply sorting
     return pages.sort((a: any, b: any) => {
@@ -5687,6 +5710,22 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                           {renderSortIcon('category', pageSortConfig)}
                         </button>
                       </th>
+                      <th className="text-left py-3 px-2 text-gray-900 dark:text-gray-100">
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            onClick={() => handlePageSort('brandsCount')}
+                            className="flex items-center gap-1 hover:text-brand-primary transition-colors"
+                          >
+                            Brands
+                            {renderSortIcon('brandsCount', pageSortConfig)}
+                          </button>
+                          <span
+                            title="Project brands provably tied to this page: found in the answer chunk that cites it (ChatGPT/SearchGPT [N] markers) or in the citation's own title. Perplexity/Gemini/AIO pages rely on titles only, so badges are rarer there."
+                          >
+                            <Info className="w-3.5 h-3.5 text-gray-400 dark:text-gray-500 cursor-help" />
+                          </span>
+                        </div>
+                      </th>
                       <th className="text-center py-3 px-2 text-gray-900 dark:text-gray-100">
                         <button
                           onClick={() => handlePageSort('mentions')}
@@ -5769,6 +5808,38 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                           <span className={categoryChipClass(page.category)}>
                             {page.category}
                           </span>
+                        </td>
+                        <td className="py-3 px-2">
+                          {page.pageBrands && page.pageBrands.length > 0 ? (
+                            <div
+                              className="flex items-center gap-1"
+                              title={page.pageBrandsComention?.length > 0
+                                ? `Also co-mentioned in citing answers: ${page.pageBrandsComention.join(', ')}`
+                                : undefined}
+                            >
+                              {page.pageBrands.slice(0, 6).map((b: any) => (
+                                <span
+                                  key={b.brand_name}
+                                  title={b.brand_name}
+                                  className={b.is_competitor ? '' : 'rounded ring-1 ring-emerald-400 ring-offset-1 dark:ring-offset-gray-900'}
+                                >
+                                  <BrandFavicon name={b.brand_name} domain={getBrandDomain(b.brand_name)} size={16} />
+                                </span>
+                              ))}
+                              {page.pageBrands.length > 6 && (
+                                <span className="text-xs text-gray-500 dark:text-gray-400">+{page.pageBrands.length - 6}</span>
+                              )}
+                            </div>
+                          ) : (
+                            <span
+                              className="text-gray-300 dark:text-gray-600"
+                              title={page.pageBrandsComention?.length > 0
+                                ? `No exact match; co-mentioned in citing answers: ${page.pageBrandsComention.join(', ')}`
+                                : undefined}
+                            >
+                              —
+                            </span>
+                          )}
                         </td>
                         <td className="py-3 px-2 text-center text-gray-900 dark:text-gray-100">{page.mentions}</td>
                         <td className="py-3 px-2 text-center text-gray-900 dark:text-gray-100">{page.more_count || 0}</td>
