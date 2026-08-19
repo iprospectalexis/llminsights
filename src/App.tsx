@@ -13,6 +13,7 @@ import { ProjectPromptsPage } from './pages/ProjectPromptsPage';
 import { ProjectCompetitorsPage } from './pages/ProjectCompetitorsPage';
 import { ProjectPagesPage } from './pages/ProjectPagesPage';
 import { ProjectDomainsPage } from './pages/ProjectDomainsPage';
+import { ProjectAdsPage } from './pages/ProjectAdsPage';
 import { ProjectMentionsPage } from './pages/ProjectMentionsPage';
 import { ProjectInsightsPage } from './pages/ProjectInsightsPage';
 import { ProjectSentimentPage } from './pages/ProjectSentimentPage';
@@ -62,6 +63,7 @@ function App() {
             <Route path="projects/:id/competitors" element={<ProjectCompetitorsPage />} />
             <Route path="projects/:id/pages" element={<ProjectPagesPage />} />
             <Route path="projects/:id/domains" element={<ProjectDomainsPage />} />
+            <Route path="projects/:id/ads" element={<ProjectAdsPage />} />
             <Route path="projects/:id/mentions" element={<ProjectMentionsPage />} />
             <Route path="projects/:id/sentiment" element={<ProjectSentimentPage />} />
             <Route path="projects/:id/insights" element={<ProjectInsightsPage />} />

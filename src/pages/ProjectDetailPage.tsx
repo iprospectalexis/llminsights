@@ -13,6 +13,7 @@ import { DOMAIN_CATEGORIES, categoryChipClass } from '../lib/domainCategories';
 import { normalizeBrandKey, buildBrandDomainMapFromCitations } from '../lib/brandDomains';
 import { buildPageBrandIndex } from '../lib/pageBrands';
 import { BrandFavicon } from '../components/ui/BrandFavicon';
+import { LoadingSpinner } from '../components/ui/LoadingSpinner';
 import { queryCache } from '../lib/queryCache';
 import { Calendar, FileText, ChartBar as BarChart3, Globe, Users, Play, ArrowLeft, Brain, Download, Settings as SettingsIcon, PencilLine, X, MessageSquare, Crown, TrendingUp, Lightbulb, Trash2, Info, Settings, CalendarCheck, ArrowUpDown, ArrowUp, ArrowDown, BadgeCheck, MessageCircle, List, ChevronDown, Smile, ShoppingBag, Map as MapIcon, Megaphone } from 'lucide-react';
 import { SentimentDashboard } from '../components/sentiment/SentimentDashboard';
@@ -293,6 +294,61 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
   // Domains tab. Own Brand / Competitor are computed per project on top.
   const [domainCategoryMap, setDomainCategoryMap] = useState<Record<string, string>>({});
   const [domainCategoryFilter, setDomainCategoryFilter] = useState<string>('all');
+
+  // Ads dashboard (lazy-loaded on tab open). Ads are collected since the
+  // rich-results deploy — older audits have ads=null because the field
+  // wasn't captured, not because no ad was shown.
+  const ADS_COLLECTED_SINCE = '2026-08-19';
+  const [adsDash, setAdsDash] = useState<{
+    loading: boolean; loaded: boolean;
+    audits: any[]; searchgptStats: Record<string, { answered: number }>;
+    adRows: any[];
+  }>({ loading: false, loaded: false, audits: [], searchgptStats: {}, adRows: [] });
+
+  useEffect(() => {
+    if (activeTab !== 'ads' || !id || adsDash.loaded || adsDash.loading) return;
+    let cancelled = false;
+    (async () => {
+      setAdsDash(prev => ({ ...prev, loading: true }));
+      try {
+        const { data: allAudits } = await supabase
+          .from('audits')
+          .select('id, created_at')
+          .eq('project_id', id)
+          .eq('status', 'completed')
+          .gte('created_at', ADS_COLLECTED_SINCE)
+          .order('created_at', { ascending: true });
+        const auditIds = (allAudits || []).map(a => a.id);
+
+        const searchgptStats: Record<string, { answered: number }> = {};
+        const adRows: any[] = [];
+        for (let i = 0; i < auditIds.length; i += 50) {
+          const chunk = auditIds.slice(i, i + 50);
+          const { data: stats } = await supabase.rpc('audit_llm_response_stats', { p_audit_ids: chunk });
+          (stats || []).forEach((s: any) => {
+            if (s.llm === 'searchgpt') {
+              searchgptStats[s.audit_id] = { answered: Number(s.answered) };
+            }
+          });
+          const { data: rows } = await supabase
+            .from('llm_responses')
+            .select(`id, audit_id, created_at, ad_name:ads->>name, ad_url:ads->>url, ad_cards:ads->carousel_cards, prompts(prompt_text)`)
+            .in('audit_id', chunk)
+            .not('ads', 'is', null)
+            .order('created_at', { ascending: false });
+          (rows || []).forEach(r => { if ((r as any).ad_name) adRows.push(r); });
+        }
+        if (!cancelled) {
+          setAdsDash({ loading: false, loaded: true, audits: allAudits || [], searchgptStats, adRows });
+        }
+      } catch (e) {
+        console.error('Error loading ads dashboard:', e);
+        if (!cancelled) setAdsDash(prev => ({ ...prev, loading: false, loaded: true }));
+      }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, id]);
 
   // Brand → official-site domain, for brand favicons. Tier 0: most-cited
   // matching domain from this project's citations (free, computed here).
@@ -3261,6 +3317,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     { id: 'prompts', label: 'Prompts', icon: MessageCircle },
     { id: 'pages', label: 'Pages', icon: FileText },
     { id: 'domains', label: 'Domains', icon: Globe },
+    { id: 'ads', label: 'Ads', icon: Megaphone },
     { id: 'mentions', label: 'Mentions', icon: BadgeCheck },
     { id: 'insights', label: 'Insights', icon: Lightbulb },
     { id: 'sentiment', label: 'Sentiment', icon: Smile },
@@ -6028,6 +6085,242 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                   </tbody>
                 </table>
               </div>
+            </div>
+          )}
+
+          {activeTab === 'ads' && (
+            <div className="space-y-6">
+              {(!adsDash.loaded || adsDash.loading) ? (
+                <div className="flex items-center justify-center py-16">
+                  <LoadingSpinner size="lg" />
+                </div>
+              ) : (() => {
+                const totalAnswered = adsDash.audits.reduce(
+                  (sum, a) => sum + (adsDash.searchgptStats[a.id]?.answered || 0), 0);
+                const adRows = adsDash.adRows;
+                const adRate = totalAnswered > 0 ? Math.round((adRows.length / totalAnswered) * 100) : 0;
+
+                const ownKeys = new Set(brands.map(b => normalizeBrandKey(b.brand_name || '')));
+                const compKeys = new Set(competitors.map(b => normalizeBrandKey(b.brand_name || '')));
+                const advMap = new Map<string, any>();
+                adRows.forEach(r => {
+                  const key = r.ad_name;
+                  let a = advMap.get(key);
+                  if (!a) {
+                    const nk = normalizeBrandKey(key);
+                    a = {
+                      name: key,
+                      domain: r.ad_url ? extractDomain(r.ad_url) : '',
+                      count: 0,
+                      lastSeen: r.created_at,
+                      isOwn: ownKeys.has(nk),
+                      isCompetitor: compKeys.has(nk),
+                    };
+                    advMap.set(key, a);
+                  }
+                  a.count += 1;
+                  if (r.created_at > a.lastSeen) a.lastSeen = r.created_at;
+                });
+                const advertisers = Array.from(advMap.values()).sort((x, y) => y.count - x.count);
+                const competitorAds = advertisers.filter(a => a.isCompetitor).reduce((s, a) => s + a.count, 0);
+
+                const adsByAudit = new Map<string, number>();
+                adRows.forEach(r => adsByAudit.set(r.audit_id, (adsByAudit.get(r.audit_id) || 0) + 1));
+                const evolution = adsDash.audits
+                  .filter(a => (adsDash.searchgptStats[a.id]?.answered || 0) > 0)
+                  .map(a => {
+                    const answered = adsDash.searchgptStats[a.id].answered;
+                    const ads = adsByAudit.get(a.id) || 0;
+                    return {
+                      date: new Date(a.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
+                      rate: Math.round((ads / answered) * 100),
+                      ads,
+                      answered,
+                    };
+                  });
+
+                const promptCounts = new Map<string, number>();
+                adRows.forEach(r => {
+                  const t = r.prompts?.prompt_text;
+                  if (t) promptCounts.set(t, (promptCounts.get(t) || 0) + 1);
+                });
+                const topPrompts = Array.from(promptCounts.entries())
+                  .sort((a, b) => b[1] - a[1]).slice(0, 8);
+
+                if (totalAnswered === 0) {
+                  return (
+                    <div className="text-center py-16 text-gray-500 dark:text-gray-400">
+                      <Megaphone className="w-12 h-12 mx-auto mb-3 opacity-50" />
+                      <p className="text-sm">No ChatGPT/SearchGPT answers collected since Aug 19, 2026 yet.</p>
+                      <p className="text-xs mt-1">Sponsored-ad tracking starts with audits run after that date.</p>
+                    </div>
+                  );
+                }
+
+                return (
+                  <>
+                    {/* KPIs */}
+                    <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+                      <div className="bg-white dark:bg-gray-800 rounded-2xl border border-gray-200 dark:border-gray-700 p-5">
+                        <div className="text-xs text-gray-500 dark:text-gray-400">Ad pressure</div>
+                        <div className="text-3xl font-bold text-gray-900 dark:text-gray-100 mt-1">{adRate}%</div>
+                        <div className="text-xs text-gray-500 dark:text-gray-400 mt-1">of answers contain a sponsored ad</div>
+                      </div>
+                      <div className="bg-white dark:bg-gray-800 rounded-2xl border border-gray-200 dark:border-gray-700 p-5">
+                        <div className="text-xs text-gray-500 dark:text-gray-400">Answers with ads</div>
+                        <div className="text-3xl font-bold text-gray-900 dark:text-gray-100 mt-1">{adRows.length}</div>
+                        <div className="text-xs text-gray-500 dark:text-gray-400 mt-1">of {totalAnswered} ChatGPT answers</div>
+                      </div>
+                      <div className="bg-white dark:bg-gray-800 rounded-2xl border border-gray-200 dark:border-gray-700 p-5">
+                        <div className="text-xs text-gray-500 dark:text-gray-400">Advertisers</div>
+                        <div className="text-3xl font-bold text-gray-900 dark:text-gray-100 mt-1">{advertisers.length}</div>
+                        <div className="text-xs text-gray-500 dark:text-gray-400 mt-1">unique brands buying placement</div>
+                      </div>
+                      <div className={`rounded-2xl border p-5 ${competitorAds > 0
+                        ? 'bg-rose-50 dark:bg-rose-900/20 border-rose-200 dark:border-rose-800/40'
+                        : 'bg-white dark:bg-gray-800 border-gray-200 dark:border-gray-700'}`}>
+                        <div className="text-xs text-gray-500 dark:text-gray-400">Competitor ads</div>
+                        <div className={`text-3xl font-bold mt-1 ${competitorAds > 0 ? 'text-rose-600 dark:text-rose-400' : 'text-gray-900 dark:text-gray-100'}`}>
+                          {competitorAds}
+                        </div>
+                        <div className="text-xs text-gray-500 dark:text-gray-400 mt-1">impressions by your competitors</div>
+                      </div>
+                    </div>
+
+                    {/* Evolution */}
+                    <div className="bg-white dark:bg-gray-800 rounded-2xl border border-gray-200 dark:border-gray-700 p-6">
+                      <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100 mb-1">Ad presence over time</h3>
+                      <p className="text-xs text-gray-500 dark:text-gray-400 mb-4">
+                        Share of ChatGPT answers containing a sponsored ad, per audit. Tracking since Aug 19, 2026.
+                      </p>
+                      {evolution.length > 1 ? (
+                        <div className="h-64">
+                          <ResponsiveContainer width="100%" height="100%">
+                            <LineChart data={evolution}>
+                              <CartesianGrid strokeDasharray="3 3" stroke="rgb(var(--border))" />
+                              <XAxis dataKey="date" tick={{ fontSize: 12 }} />
+                              <YAxis unit="%" tick={{ fontSize: 12 }} allowDecimals={false} />
+                              <Tooltip
+                                contentStyle={{
+                                  backgroundColor: 'rgb(var(--bg-surface))',
+                                  border: '1px solid rgb(var(--border))',
+                                  borderRadius: '12px',
+                                  fontFamily: 'Plus Jakarta Sans'
+                                }}
+                                formatter={(value: any, _n: string, props: any) => [
+                                  `${value}% (${props.payload.ads}/${props.payload.answered} answers)`, 'Ad presence'
+                                ]}
+                              />
+                              <Line type="monotone" dataKey="rate" stroke="rgb(var(--brand-primary))" strokeWidth={2} dot={{ r: 3 }} />
+                            </LineChart>
+                          </ResponsiveContainer>
+                        </div>
+                      ) : (
+                        <div className="text-sm text-gray-500 dark:text-gray-400 py-8 text-center">
+                          Need at least two audits with ChatGPT answers to draw the trend
+                          {evolution.length === 1 && ` — current: ${evolution[0].rate}% (${evolution[0].ads}/${evolution[0].answered})`}.
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                      {/* Top advertisers */}
+                      <div className="bg-white dark:bg-gray-800 rounded-2xl border border-gray-200 dark:border-gray-700 p-6">
+                        <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100 mb-4">Top advertisers</h3>
+                        {advertisers.length > 0 ? (
+                          <div className="space-y-2.5">
+                            {advertisers.slice(0, 10).map(a => (
+                              <div key={a.name} className="flex items-center gap-3">
+                                <BrandFavicon name={a.name} domain={a.domain || getBrandDomain(a.name)} size={18} />
+                                <span className="text-sm font-medium text-gray-900 dark:text-gray-100 truncate">{a.name}</span>
+                                {a.isCompetitor && (
+                                  <span className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-rose-100 dark:bg-rose-900/40 text-rose-700 dark:text-rose-300 uppercase">Competitor</span>
+                                )}
+                                {a.isOwn && (
+                                  <span className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300 uppercase">You</span>
+                                )}
+                                <div className="ml-auto flex items-center gap-3 flex-shrink-0">
+                                  <span className="text-xs text-gray-500 dark:text-gray-400">
+                                    {new Date(a.lastSeen).toLocaleDateString()}
+                                  </span>
+                                  <span className="text-sm font-semibold text-gray-900 dark:text-gray-100 w-14 text-right">
+                                    {a.count} · {Math.round((a.count / adRows.length) * 100)}%
+                                  </span>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <p className="text-sm text-gray-500 dark:text-gray-400 py-6 text-center">No sponsored ads detected yet.</p>
+                        )}
+                      </div>
+
+                      {/* Prompts triggering ads */}
+                      <div className="bg-white dark:bg-gray-800 rounded-2xl border border-gray-200 dark:border-gray-700 p-6">
+                        <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100 mb-1">Prompts triggering ads</h3>
+                        <p className="text-xs text-gray-500 dark:text-gray-400 mb-4">High commercial intent — advertisers bid on these conversations.</p>
+                        {topPrompts.length > 0 ? (
+                          <div className="space-y-2">
+                            {topPrompts.map(([text, n]) => (
+                              <div key={text} className="flex items-start gap-2 text-sm">
+                                <span className="inline-flex items-center justify-center min-w-[1.5rem] h-6 rounded-md bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-300 text-xs font-semibold flex-shrink-0">{n}</span>
+                                <span className="text-gray-700 dark:text-gray-300">{text}</span>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <p className="text-sm text-gray-500 dark:text-gray-400 py-6 text-center">No sponsored ads detected yet.</p>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Ad examples */}
+                    {adRows.length > 0 && (
+                      <div className="bg-white dark:bg-gray-800 rounded-2xl border border-gray-200 dark:border-gray-700 p-6">
+                        <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100 mb-4">Latest ad examples</h3>
+                        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+                          {adRows.slice(0, 6).map(r => (
+                            <div key={r.id} className="bg-amber-50/50 dark:bg-amber-900/10 border border-amber-200 dark:border-amber-800/40 rounded-xl p-4">
+                              <div className="flex items-center gap-2 mb-2">
+                                <span className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-300 uppercase">Ad</span>
+                                <BrandFavicon name={r.ad_name} domain={r.ad_url ? extractDomain(r.ad_url) : getBrandDomain(r.ad_name)} size={16} />
+                                <span className="text-sm font-medium text-gray-900 dark:text-gray-100 truncate">{r.ad_name}</span>
+                                <span className="ml-auto text-xs text-gray-500 dark:text-gray-400 flex-shrink-0">
+                                  {new Date(r.created_at).toLocaleDateString()}
+                                </span>
+                              </div>
+                              {Array.isArray(r.ad_cards) && r.ad_cards.length > 0 && (
+                                <div className="space-y-2">
+                                  {r.ad_cards.slice(0, 2).map((card: any, i: number) => (
+                                    <a
+                                      key={i}
+                                      href={card.target_url || undefined}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      className="flex gap-2 bg-white dark:bg-gray-800 rounded-lg p-2 border border-amber-100 dark:border-amber-900/40 hover:border-amber-300 transition-colors"
+                                    >
+                                      {card.image_url && <img src={card.image_url} alt="" className="w-12 h-12 rounded object-cover flex-shrink-0" />}
+                                      <div className="min-w-0">
+                                        <div className="text-xs font-medium text-gray-900 dark:text-gray-100 line-clamp-1">{card.title}</div>
+                                        <div className="text-xs text-gray-500 dark:text-gray-400 line-clamp-2">{card.body}</div>
+                                      </div>
+                                    </a>
+                                  ))}
+                                </div>
+                              )}
+                              {r.prompts?.prompt_text && (
+                                <div className="mt-2 text-xs text-gray-500 dark:text-gray-400 line-clamp-2">
+                                  Prompt: {r.prompts.prompt_text}
+                                </div>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </>
+                );
+              })()}
             </div>
           )}
 
