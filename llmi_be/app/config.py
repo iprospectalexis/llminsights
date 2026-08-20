@@ -33,6 +33,12 @@ class Settings(BaseSettings):
     # Database
     database_path: str = "serp_jobs.db"  # SQLite fallback for local dev
     database_url_override: Optional[str] = None  # PostgreSQL URL (env: DATABASE_URL_OVERRIDE)
+
+    # Master switch for background workers (audit scheduler + job claiming).
+    # MUST be 0 on local dev machines that share the prod database: a local
+    # uvicorn once claimed prod audits/jobs and wrote result files to the
+    # developer's disk — the VPS then 404'd on them and audits froze.
+    worker_enabled: bool = True  # env: WORKER_ENABLED
     
     # SERP API
     serp_api_key: str = ""

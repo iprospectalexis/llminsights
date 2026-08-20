@@ -37,7 +37,12 @@ async def lifespan(app: FastAPI):
 
     # Start audit scheduler if connected to PostgreSQL (Supabase)
     scheduler_task = None
-    if settings.is_postgres:
+    if settings.is_postgres and not settings.worker_enabled:
+        logger.warning(
+            "Audit scheduler DISABLED (WORKER_ENABLED=0) — this instance "
+            "serves the API only and will not claim audits or jobs"
+        )
+    if settings.is_postgres and settings.worker_enabled:
         # Self-test of polling SQL helpers BEFORE the scheduler starts.
         # If any of these crash on the driver level (e.g. the
         # `CAST(:ids AS uuid[])` bug from 2026-04-08, where every tick

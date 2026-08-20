@@ -652,11 +652,25 @@ async def handle_polling(audit_id: str, worker_id: str) -> None:
                 from sqlalchemy import text as sql_text
                 async with AsyncSessionLocal() as s:
                     jrows = (await s.execute(
-                        sql_text("SELECT id, provider, status FROM jobs WHERE id = ANY(:ids)"),
+                        sql_text("SELECT id, provider, status, updated_at FROM jobs WHERE id = ANY(:ids)"),
                         {"ids": list(job_groups.keys())},
                     )).mappings().all()
                 job_provider_map = {str(j["id"]): (j["provider"] or "serp") for j in jrows}
-                job_status_map = {str(j["id"]): (j["status"] or "") for j in jrows}
+                # In-flight protection applies only to jobs showing recent
+                # progress: a job whose processor died (container restart)
+                # stays "getting_results" forever and must NOT shield its
+                # rows from exhaustion/failover indefinitely.
+                _now = datetime.now(timezone.utc)
+                job_status_map = {}
+                for j in jrows:
+                    status = j["status"] or ""
+                    upd = j["updated_at"]
+                    if upd is not None and upd.tzinfo is None:
+                        upd = upd.replace(tzinfo=timezone.utc)
+                    stalled = upd is not None and (_now - upd) > timedelta(minutes=30)
+                    job_status_map[str(j["id"])] = "stalled" if (
+                        status in _JOB_IN_FLIGHT_STATUSES and stalled
+                    ) else status
             except Exception as e:
                 logger.warning(f"[polling] {audit_id}: job provider lookup failed: {e}")
             phase = "fetch_onesearch"
