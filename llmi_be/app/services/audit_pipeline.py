@@ -2040,6 +2040,9 @@ async def handle_finalize(audit_id: str, worker_id: str) -> None:
             "finished_at": now,
             "locked_by": None,
             "locked_at": None,
+            # Clear transient step errors accumulated along the way — a
+            # completed audit must not display a stale red error text.
+            "error_message": None,
         })
         logger.info(f"[pipeline] Audit {audit_id} COMPLETED")
     except Exception as e:
