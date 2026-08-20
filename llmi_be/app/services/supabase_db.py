@@ -833,6 +833,21 @@ class SupabaseDB:
         """
         if not rows:
             return
+        # The model sometimes returns the SAME brand twice for one response
+        # ("Le Chocolat Alain Ducasse" + "La Manufacture Alain Ducasse" both
+        # normalized to one brand). Two identical (response_id, brand) keys
+        # inside one INSERT crash Postgres with CardinalityViolation ("ON
+        # CONFLICT DO UPDATE cannot affect row a second time") — and since
+        # the model output is deterministic-ish, every retry failed the same
+        # way and the whole audit went FAILED. Keep the highest-confidence
+        # entry per key.
+        best: dict[tuple, dict] = {}
+        for r in rows:
+            key = (r.get("response_id"), r.get("brand"))
+            prev = best.get(key)
+            if prev is None or (r.get("confidence") or 0) > (prev.get("confidence") or 0):
+                best[key] = r
+        rows = list(best.values())
         _COLS = [
             "response_id", "audit_id", "brand", "brand_kind", "label", "score",
             "confidence", "reasoning", "is_fallback", "model", "prompt_version",

@@ -124,6 +124,9 @@ async def fail_audit(audit_id: str, reason: str) -> None:
         "finished_at": now,
         "locked_by": None,
         "locked_at": None,
+        # Persist WHY — a failed audit with error_message=NULL forced log
+        # archaeology to explain a red status in the UI.
+        "error_message": (reason or "")[:1000],
     })
     logger.error(f"Audit {audit_id} FAILED: {reason}")
 
