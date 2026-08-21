@@ -2003,11 +2003,6 @@ async def handle_finalize(audit_id: str, worker_id: str) -> None:
         logger.warning(f"[pipeline] {audit_id}: coverage check failed: {e}")
 
     try:
-        await db.calculate_project_metrics(audit_id)
-    except Exception as e:
-        logger.warning(f"[pipeline] {audit_id}: metrics calculation warning: {e}")
-
-    try:
         await db.refresh_audit_metrics(audit_id)
     except Exception as e:
         logger.warning(f"[pipeline] {audit_id}: audit metrics refresh warning: {e}")
@@ -2049,6 +2044,16 @@ async def handle_finalize(audit_id: str, worker_id: str) -> None:
         logger.error(
             f"[pipeline] {audit_id}: finalize update failed: {e}, will retry next tick"
         )
+        return
+
+    # Project metrics LAST — after the audit is completed and every citation
+    # is written. Running it earlier (as it used to) froze a mid-flight
+    # snapshot: one project's card showed citation_rate=3% because 97 of its
+    # own-domain citations landed in the 10 seconds AFTER the calculation.
+    try:
+        await db.calculate_project_metrics(audit_id)
+    except Exception as e:
+        logger.warning(f"[pipeline] {audit_id}: metrics calculation warning: {e}")
 
 
 # ── Main dispatcher ──────────────────────────────────────────────────

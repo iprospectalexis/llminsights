@@ -1189,125 +1189,35 @@ class SupabaseDB:
             logger.warning(f"Failed to refresh metrics for {audit_id}: {e}")
 
     async def calculate_project_metrics(self, audit_id: str) -> None:
-        """Calculate and save project-level metrics."""
+        """Recompute the project's card metrics via the single SQL definition.
+
+        The formulas live in recalculate_project_metrics() (see the
+        20260820140000 migration) so the pipeline, the recalculate-metrics
+        edge function and any backfill all produce the same numbers:
+        per-response rates over ANSWERED responses, brand matching on word
+        boundaries (accent-insensitive, aliases included) and citations
+        excluding `cited = false` (the "More" tier and the organic SERP
+        block stored next to Google AI Overview).
+        """
         try:
             async with AsyncSessionLocal() as s:
-                # Get project info
-                audit_row = (await s.execute(
+                project_id = (await s.execute(
                     text("SELECT project_id FROM audits WHERE id = :aid"),
                     {"aid": audit_id},
-                )).mappings().first()
-                if not audit_row:
-                    return
-                project_id = str(audit_row["project_id"])
-
-                # Total prompts & audits
-                total_prompts = (await s.execute(
-                    text("SELECT count(*) FROM prompts WHERE project_id = :pid"),
-                    {"pid": project_id},
-                )).scalar() or 0
-
-                total_audits = (await s.execute(
-                    text("SELECT count(*) FROM audits WHERE project_id = :pid AND status = 'completed'"),
-                    {"pid": project_id},
-                )).scalar() or 0
-
-                # Get domain and own brands
-                proj = (await s.execute(
-                    text("SELECT domain FROM projects WHERE id = :pid"),
-                    {"pid": project_id},
-                )).mappings().first()
-
-                brands_rows = (await s.execute(
-                    text("SELECT brand_name FROM brands WHERE project_id = :pid AND is_competitor = false"),
-                    {"pid": project_id},
-                )).mappings().all()
-                own_brands = [r["brand_name"].lower() for r in brands_rows]
-
-                # Audit IDs
-                audit_ids_rows = (await s.execute(
-                    text("SELECT id FROM audits WHERE project_id = :pid"),
-                    {"pid": project_id},
-                )).mappings().all()
-                audit_ids = [str(r["id"]) for r in audit_ids_rows]
-
-                # Mention rate
-                mention_rate = 0
-                if audit_ids and own_brands:
-                    lr_rows = (await s.execute(
-                        text("""
-                            SELECT answer_text, audit_id, prompt_id
-                            FROM llm_responses
-                            WHERE audit_id = ANY(:aids)
-                              AND answer_text IS NOT NULL
-                        """),
-                        {"aids": audit_ids},
-                    )).mappings().all()
-
-                    if lr_rows:
-                        unique_prompts = set()
-                        prompts_with_mentions = set()
-                        for r in lr_rows:
-                            key = f"{r['audit_id']}-{r['prompt_id']}"
-                            unique_prompts.add(key)
-                            answer_lower = (r["answer_text"] or "").lower()
-                            if any(b in answer_lower for b in own_brands):
-                                prompts_with_mentions.add(key)
-                        if unique_prompts:
-                            mention_rate = round((len(prompts_with_mentions) / len(unique_prompts)) * 100)
-
-                # Citation rate
-                citation_rate = 0
-                if audit_ids and proj:
-                    project_domain = (proj["domain"] or "").lower().lstrip("www.")
-                    if project_domain:
-                        cit_rows = (await s.execute(
-                            text("""
-                                SELECT domain, audit_id, prompt_id, llm
-                                FROM citations WHERE audit_id = ANY(:aids) AND domain IS NOT NULL
-                            """),
-                            {"aids": audit_ids},
-                        )).mappings().all()
-
-                        lr_count_rows = (await s.execute(
-                            text("SELECT audit_id, prompt_id, llm FROM llm_responses WHERE audit_id = ANY(:aids)"),
-                            {"aids": audit_ids},
-                        )).mappings().all()
-
-                        if cit_rows and lr_count_rows:
-                            cited_keys = set()
-                            for c in cit_rows:
-                                d = (c["domain"] or "").lower().lstrip("www.")
-                                if d == project_domain or d.endswith(f".{project_domain}"):
-                                    cited_keys.add(f"{c['audit_id']}-{c['prompt_id']}-{c['llm']}")
-                            citation_rate = round((len(cited_keys) / len(lr_count_rows)) * 100)
-
-                # Last audit
-                last_audit = (await s.execute(
-                    text("""
-                        SELECT finished_at FROM audits
-                        WHERE project_id = :pid AND status = 'completed'
-                        ORDER BY finished_at DESC LIMIT 1
-                    """),
-                    {"pid": project_id},
                 )).scalar()
-
-                # Upsert project_metrics
-                now = datetime.now(timezone.utc)
-                await s.execute(
-                    text("""
-                        INSERT INTO project_metrics (project_id, mention_rate, citation_rate, total_prompts, total_audits, last_audit_at, updated_at)
-                        VALUES (:pid, :mr, :cr, :tp, :ta, :la, :now)
-                        ON CONFLICT (project_id) DO UPDATE SET
-                            mention_rate = :mr, citation_rate = :cr, total_prompts = :tp,
-                            total_audits = :ta, last_audit_at = :la, updated_at = :now
-                    """),
-                    {"pid": project_id, "mr": mention_rate, "cr": citation_rate,
-                     "tp": total_prompts, "ta": total_audits,
-                     "la": last_audit if last_audit else now, "now": now},
-                )
+                if not project_id:
+                    return
+                row = (await s.execute(
+                    text("SELECT * FROM recalculate_project_metrics(CAST(:pid AS uuid))"),
+                    {"pid": str(project_id)},
+                )).mappings().first()
                 await s.commit()
-                logger.info(f"Project metrics saved: mention={mention_rate}% citation={citation_rate}%")
+            if row:
+                logger.info(
+                    f"Project metrics saved: mention={row['mention_rate']}% "
+                    f"citation={row['citation_rate']}% "
+                    f"({row['mentioned']}/{row['cited']} of {row['answered_responses']} answers)"
+                )
         except Exception as e:
             logger.error(f"Error calculating project metrics: {e}")
 

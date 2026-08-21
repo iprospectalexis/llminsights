@@ -11,7 +11,7 @@ import { Progress } from '../components/ui/Progress';
 import { supabase } from '../lib/supabase';
 import { DOMAIN_CATEGORIES, categoryChipClass } from '../lib/domainCategories';
 import { normalizeBrandKey, buildBrandDomainMapFromCitations } from '../lib/brandDomains';
-import { buildPageBrandIndex } from '../lib/pageBrands';
+import { buildPageBrandIndex, findBrandsInText } from '../lib/pageBrands';
 import { BrandFavicon } from '../components/ui/BrandFavicon';
 import { LoadingSpinner } from '../components/ui/LoadingSpinner';
 import { queryCache } from '../lib/queryCache';
@@ -3359,17 +3359,22 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
         citedLlmResponseIds.add(`${c.audit_id}-${c.prompt_id}-${c.llm}`)
       );
 
-    // Denominator: all filtered LLM responses (one per LLM × prompt × audit).
-    const totalLlmResponses = filteredLlmResponses.filter(
-      r => r.audit_id && r.prompt_id
-    ).length;
+    // Denominator: ANSWERED responses only — a failed or empty scrape is not
+    // "an AI answer that ignored us". Same definition as the card metrics
+    // (recalculate_project_metrics SQL function), so both surfaces agree.
+    const answered = filteredLlmResponses.filter(
+      r => r.audit_id && r.prompt_id && r.answer_text && r.answer_text !== ''
+    );
+    const totalLlmResponses = answered.length;
 
     if (totalLlmResponses === 0) return { rate: 0, cited: 0, total: 0 };
 
-    const rate = Math.round(
-      (citedLlmResponseIds.size / totalLlmResponses) * 100
-    );
-    return { rate, cited: citedLlmResponseIds.size, total: totalLlmResponses };
+    const citedAnswers = answered.filter(
+      r => citedLlmResponseIds.has(`${r.audit_id}-${r.prompt_id}-${r.llm}`)
+    ).length;
+
+    const rate = Math.round((citedAnswers / totalLlmResponses) * 100);
+    return { rate, cited: citedAnswers, total: totalLlmResponses };
   };
 
   const getMentionRate = () => {
@@ -3384,19 +3389,23 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     // de-duplicated by (audit_id, prompt_id) which silently collapsed
     // multi-LLM runs and reported the wrong total (e.g. 240 instead of 480
     // for a 2-LLM / 240-prompt project).
+    // ANSWERED responses only (see getCitationRate) — same denominator as
+    // the card metrics.
     const relevantResponses = filteredLlmResponses.filter(
-      r => r.audit_id && r.prompt_id
+      r => r.audit_id && r.prompt_id && r.answer_text && r.answer_text !== ''
     );
 
     const total = relevantResponses.length;
     if (total === 0) return { rate: 0, mentioned: 0, total: 0 };
 
-    const mentioned = relevantResponses.filter(response => {
-      const answerText = response.answer_text?.toLowerCase() || '';
-      return ownBrands.some(brandName =>
-        answerText.includes(brandName.toLowerCase())
-      );
-    }).length;
+    // Word-boundary, accent-insensitive, alias-aware matching. The old
+    // `includes()` test counted the 3-letter brand "eni" inside ordinary
+    // French words (venir, devenir, obtenir…) and inflated one project's
+    // mention rate from 21% to 35%.
+    const ownBrandRows = brands.filter(b => !b.is_competitor);
+    const mentioned = relevantResponses.filter(
+      response => findBrandsInText(response.answer_text, ownBrandRows).length > 0
+    ).length;
 
     const rate = Math.round((mentioned / total) * 100);
     return { rate, mentioned, total };
