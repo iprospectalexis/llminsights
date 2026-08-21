@@ -369,6 +369,62 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab, id]);
 
+  // Full-history trends for the Overview charts. The page's own data holds
+  // only the 5 most recent audits, so these two series come from server-side
+  // aggregates over the WHOLE project history (project_citations_over_time /
+  // project_mentions_over_time RPCs).
+  const [trends, setTrends] = useState<{
+    loading: boolean; citations: any[] | null; mentions: any[] | null;
+  }>({ loading: false, citations: null, mentions: null });
+
+  const promptGroupsKey = filters.promptGroups.join('|');
+  useEffect(() => {
+    if (!id) return;
+    let cancelled = false;
+    (async () => {
+      setTrends(prev => ({ ...prev, loading: true }));
+      const custom = filters.dateRange === 'custom' && customDateRange.startDate && customDateRange.endDate;
+      const common = {
+        p_project_id: id,
+        p_llm: filters.llms !== 'all' ? filters.llms : null,
+        p_groups: filters.promptGroups.length > 0 ? filters.promptGroups : null,
+        p_from: custom ? new Date(customDateRange.startDate).toISOString() : null,
+        p_to: custom ? new Date(`${customDateRange.endDate}T23:59:59`).toISOString() : null,
+      };
+      try {
+        const [cit, men] = await Promise.all([
+          supabase.rpc('project_citations_over_time', {
+            ...common,
+            p_project_domain: project?.domain
+              ? String(project.domain).toLowerCase().replace(/^www\./, '')
+              : null,
+            p_domain_mode: project?.domain_mode || 'exact',
+          }),
+          supabase.rpc('project_mentions_over_time', {
+            ...common,
+            p_sentiment: filters.sentiment !== 'all' ? filters.sentiment : null,
+          }),
+        ]);
+        if (cancelled) return;
+        if (cit.error) console.error('citations trend RPC:', cit.error);
+        if (men.error) console.error('mentions trend RPC:', men.error);
+        setTrends({
+          loading: false,
+          // null (not []) means "unavailable" → the charts fall back to the
+          // client-side computation over the loaded audits.
+          citations: cit.error ? null : (cit.data || []),
+          mentions: men.error ? null : (men.data || []),
+        });
+      } catch (e) {
+        console.error('Error loading trends:', e);
+        if (!cancelled) setTrends({ loading: false, citations: null, mentions: null });
+      }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id, project?.domain, project?.domain_mode, filters.llms, promptGroupsKey,
+      filters.sentiment, filters.dateRange, customDateRange.startDate, customDateRange.endDate]);
+
   // Brand → official-site domain, for brand favicons. Tier 0: most-cited
   // matching domain from this project's citations (free, computed here).
   // Fallback: global brand_domains table (gpt-5-nano fills it per audit).
@@ -764,7 +820,103 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     }
   };
 
+  const fmtTrendDate = (d: string) =>
+    new Date(`${d}T00:00:00`).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+
+  // Chart builders over the full-history RPC rows. Row shapes:
+  //   citations: {audit_date, domain|null, citations, total}
+  //   mentions:  {audit_date, brand|null, mentions, total_responses}
+  // The NULL-series row per date carries that date's total, so dates whose
+  // series all fell outside the server-side top-N still produce a point.
+  const buildCitationsTrend = (rows: any[]) => {
+    const byDate = new Map<string, { total: number; domains: Map<string, number> }>();
+    rows.forEach(r => {
+      const d = String(r.audit_date);
+      let e = byDate.get(d);
+      if (!e) { e = { total: Number(r.total) || 0, domains: new Map() }; byDate.set(d, e); }
+      if (r.domain) e.domains.set(r.domain, Number(r.citations) || 0);
+    });
+
+    const projectDomain = project?.domain?.toLowerCase().replace(/^www\./, '') || '';
+    const domainMode = project?.domain_mode || 'exact';
+
+    const globalCounts = new Map<string, number>();
+    byDate.forEach(e => e.domains.forEach((n, dom) =>
+      globalCounts.set(dom, (globalCounts.get(dom) || 0) + n)));
+    const topDomains = Array.from(globalCounts.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 15)
+      .map(([domain, count]) => ({ domain, count }));
+
+    const chartData = Array.from(byDate.entries())
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([date, e]) => {
+        const dp: any = { date: fmtTrendDate(date), fullDate: date, total: e.total };
+        if (projectDomain) {
+          let n = 0;
+          e.domains.forEach((v, dom) => {
+            if (dom === projectDomain || (domainMode === 'subdomains' && dom.endsWith(`.${projectDomain}`))) n += v;
+          });
+          dp[projectDomain] = n;
+        }
+        topDomains.forEach(({ domain }) => {
+          let n = 0;
+          e.domains.forEach((v, dom) => { if (dom === domain || dom.endsWith(`.${domain}`)) n += v; });
+          dp[domain] = n;
+        });
+        return dp;
+      });
+
+    return { chartData, projectDomain, topDomains };
+  };
+
+  const buildMentionsTrend = (rows: any[]) => {
+    const byDate = new Map<string, { total: number; brands: Map<string, number> }>();
+    rows.forEach(r => {
+      const d = String(r.audit_date);
+      let e = byDate.get(d);
+      if (!e) { e = { total: Number(r.total_responses) || 0, brands: new Map() }; byDate.set(d, e); }
+      if (r.brand) e.brands.set(r.brand, Number(r.mentions) || 0);
+    });
+
+    const myBrands = brands.map(b => b.brand_name).filter(Boolean);
+    const isOwn = (name: string) => myBrands.some(mb => mb.toLowerCase() === name.toLowerCase());
+
+    const globalCounts = new Map<string, number>();
+    byDate.forEach(e => e.brands.forEach((n, b) => {
+      if (!isOwn(b)) globalCounts.set(b, (globalCounts.get(b) || 0) + n);
+    }));
+    const allCompetitors = Array.from(globalCounts.entries())
+      .sort((a, b) => b[1] - a[1])
+      .map(([brand, count]) => ({ brand, count }));
+
+    const chartData = Array.from(byDate.entries())
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([date, e]) => {
+        const dp: any = { date: fmtTrendDate(date), fullDate: date };
+        const rate = (name: string) => {
+          let n = 0;
+          e.brands.forEach((v, b) => { if (b.toLowerCase() === name.toLowerCase()) n += v; });
+          return e.total > 0 ? Math.round((n / e.total) * 100) : 0;
+        };
+        myBrands.forEach(b => { dp[b] = rate(b); });
+        allCompetitors.forEach(({ brand }) => { dp[brand] = rate(brand); });
+        return dp;
+      });
+
+    return { chartData, myBrands, allCompetitors };
+  };
+
   const getMentionRateByAuditDate = () => {
+    // Full history when the aggregate is available; the legacy client-side
+    // path (last 5 audits only) stays as the fallback.
+    if (trends.mentions && trends.mentions.length > 0) {
+      try {
+        return buildMentionsTrend(trends.mentions);
+      } catch (e) {
+        console.error('mentions trend build failed, falling back:', e);
+      }
+    }
     try {
       // Get all responses grouped by audit date
       // Apply non-date filters (LLM, prompt groups, sentiment) but show all dates by default
@@ -890,6 +1042,13 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
   };
 
   const getCitationsOverTime = () => {
+    if (trends.citations && trends.citations.length > 0) {
+      try {
+        return buildCitationsTrend(trends.citations);
+      } catch (e) {
+        console.error('citations trend build failed, falling back:', e);
+      }
+    }
     try {
       // Group citations by audit date
       const citationsByAuditDate = new Map<string, any[]>();
