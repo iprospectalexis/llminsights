@@ -192,7 +192,10 @@ export const ProjectsPage: React.FC = () => {
         const finalMetrics = {
           prompts: metrics?.total_prompts ?? 0,
           mentionRate: metrics?.mention_rate ?? 0,
-          citationRate: metrics?.citation_rate ?? 0
+          // null = "not measurable" (the project's prompt links were lost by
+          // the old edit flow, so citations cannot be attributed) — keep it
+          // null so the card can say so instead of showing a fake 0%.
+          citationRate: metrics?.citation_rate ?? null
         };
 
         console.log(`🔍 Project "${project.name}":`, {
@@ -579,7 +582,9 @@ export const ProjectsPage: React.FC = () => {
                           <div className="absolute top-0 right-0 w-16 h-16 bg-blue-400/10 rounded-full -mr-8 -mt-8" />
                           <div className="relative text-center">
                             <div className="text-2xl font-bold bg-gradient-to-br from-blue-600 to-blue-700 dark:from-blue-400 dark:to-blue-500 bg-clip-text text-transparent">
-                              {project._metrics?.citationRate || 0}%
+                              {project._metrics?.citationRate == null
+                                ? '—'
+                                : `${project._metrics.citationRate}%`}
                             </div>
                             <div className="text-xs font-medium text-blue-700 dark:text-blue-400 mt-0.5">
                               Citation Rate

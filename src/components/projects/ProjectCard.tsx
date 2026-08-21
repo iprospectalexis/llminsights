@@ -22,7 +22,7 @@ interface Project {
   _metrics?: {
     prompts: number;
     mentionRate: number;
-    citationRate: number;
+    citationRate: number | null;
   };
 }
 
@@ -158,7 +158,7 @@ export const ProjectCard: React.FC<ProjectCardProps> = ({
                 <div className="absolute top-0 right-0 w-20 h-20 bg-blue-400/10 rounded-full -mr-10 -mt-10" />
                 <div className="relative">
                   <div className="text-3xl font-bold bg-gradient-to-br from-blue-600 to-blue-700 dark:from-blue-400 dark:to-blue-500 bg-clip-text text-transparent">
-                    {project._metrics?.citationRate || 0}%
+                    {project._metrics?.citationRate == null ? '—' : `${project._metrics.citationRate}%`}
                   </div>
                   <div className="text-xs font-medium text-blue-700 dark:text-blue-400 mt-1">
                     Citation Rate
