@@ -81,17 +81,25 @@ export const SentimentDashboard: React.FC<Props> = ({ projectId }) => {
           .in('audit_id', auditIds);
         if (rbsErr) throw rbsErr;
 
-        const flat: SentimentRow[] = (data || []).map((r: any) => ({
-          brand: r.brand,
-          brand_kind: r.brand_kind,
-          label: r.label,
-          score: Number(r.score),
-          confidence: r.confidence != null ? Number(r.confidence) : null,
-          audit_id: r.audit_id,
-          response_id: r.response_id,
-          llm: r.llm_responses?.llm ?? 'unknown',
-          audit_started_at: startedMap.get(r.audit_id) || '',
-        }));
+        const flat: SentimentRow[] = (data || [])
+          // Drop the pipeline's sentinel rows (__none__/__error__/__stuck__,
+          // brand_kind 'none') — they mark "no brand / extraction failed",
+          // not real brand sentiment, and would otherwise pollute the brand
+          // list and every aggregate.
+          .filter((r: any) =>
+            r.brand_kind !== 'none' &&
+            !['__none__', '__error__', '__stuck__'].includes(r.brand))
+          .map((r: any) => ({
+            brand: r.brand,
+            brand_kind: r.brand_kind,
+            label: r.label,
+            score: Number(r.score),
+            confidence: r.confidence != null ? Number(r.confidence) : null,
+            audit_id: r.audit_id,
+            response_id: r.response_id,
+            llm: r.llm_responses?.llm ?? 'unknown',
+            audit_started_at: startedMap.get(r.audit_id) || '',
+          }));
         if (!cancelled) setRows(flat);
       } catch (e: any) {
         if (!cancelled) setError(e.message || String(e));

@@ -66,6 +66,7 @@ async def lifespan(app: FastAPI):
             )
 
         scheduler_task = asyncio.create_task(start_scheduler())
+        app.state.scheduler_running = True
         logger.info("Audit scheduler started (Supabase PostgreSQL detected)")
 
         # Pool monitor — logs a one-line snapshot of pool state every 30s,
@@ -163,7 +164,16 @@ async def lifespan(app: FastAPI):
 
         pool_monitor_task = asyncio.create_task(_pool_monitor())
     else:
-        logger.info("Audit scheduler skipped (SQLite mode — no Supabase tables)")
+        # Reachable in two cases: not a Postgres DB, or WORKER_ENABLED=0 (an
+        # API-only instance that deliberately does not claim audits/jobs).
+        # The old "SQLite mode" wording was wrong for the worker-gate case.
+        if settings.is_postgres:
+            logger.info(
+                "Audit scheduler not started on this instance (WORKER_ENABLED=0) "
+                "— serving API only"
+            )
+        else:
+            logger.info("Audit scheduler skipped (non-Postgres DB — no Supabase tables)")
         pool_monitor_task = None
 
     yield
@@ -188,25 +198,23 @@ app = FastAPI(
     title=settings.app_name,
     version=settings.app_version,
     description="""
-## SERP Batch Processing API (Lite)
+LLM Insights backend — the audit pipeline plus the SERP/LLM collection
+gateway behind app.llm-insights.com.
 
-Lightweight version without Docker/Celery/Redis.
-Uses SQLite and FastAPI background tasks.
+**Two surfaces:**
 
-### Features:
-- **Batch Processing**: Submit up to 1000 prompts per job
-- **Async Processing**: Jobs run in background asyncio tasks
-- **Progress Tracking**: Monitor job progress in real-time
-- **Webhook Notifications**: Get notified when jobs complete
-- **Retry Logic**: Automatic retries for failed queries
+- **Audits** (`/api/v1/audits/*`) — trigger and drive brand-visibility
+  audits: a tick-based pipeline (fetching → polling → extracting_competitors
+  → analyzing_sentiment → finalizing → completed) over ChatGPT/SearchGPT,
+  Perplexity, Gemini, Google AI Overview/Mode, Bing Copilot and Grok, with
+  provider fallback (BrightData / DataForSEO / OneSearch SERP).
+- **Jobs** (`/api/v1/jobs/*`) — the partner-facing SERP/LLM collection
+  gateway: submit prompt batches, poll status, download merged/converted
+  results. Protected by `X-API-Key`.
 
-### Quick Start:
-```bash
-pip install -r requirements.txt
-cp .env.example .env
-# Edit .env with your SERP_API_KEY
-uvicorn app.main:app --reload
-```
+**Runtime:** FastAPI + asyncpg against Supabase Postgres, deployed in Docker.
+`WORKER_ENABLED` gates whether an instance runs the scheduler (claims audits
+and jobs) or serves the API only.
     """,
     docs_url="/docs",
     redoc_url="/redoc",
@@ -214,11 +222,15 @@ uvicorn app.main:app --reload
     lifespan=lifespan,
 )
 
-# CORS middleware
+# CORS middleware. Auth is a header (X-API-Key), not a cookie, so we do not
+# need credentialed CORS — and `allow_origins=["*"]` together with
+# `allow_credentials=True` is spec-invalid (Starlette then reflects any Origin
+# while sending Allow-Credentials: true). Drop credentials to keep the
+# wildcard honest.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -331,13 +343,24 @@ async def health_check():
         db_status = f"unhealthy: {str(e)}"
     
     active_jobs = len(job_processor.get_active_job_ids())
-    overall = "healthy" if db_status == "healthy" else "degraded"
-    
-    return HealthResponse(
+    db_ok = db_status == "healthy"
+    overall = "healthy" if db_ok else "unhealthy"
+    scheduler_running = bool(getattr(app.state, "scheduler_running", False))
+
+    body = HealthResponse(
         status=overall,
         version=settings.app_version,
         database=db_status,
         active_jobs=active_jobs,
+        worker_enabled=settings.worker_enabled,
+        scheduler_running=scheduler_running,
+    )
+    # Return 503 when the DB is unreachable so uptime monitors, load
+    # balancers and Docker healthchecks (which key on the status CODE,
+    # not the JSON body) actually see the instance as down.
+    return JSONResponse(
+        status_code=status.HTTP_200_OK if db_ok else status.HTTP_503_SERVICE_UNAVAILABLE,
+        content=body.model_dump(),
     )
 
 
@@ -355,13 +378,20 @@ async def dashboard():
 
 @app.get("/api", tags=["Root"])
 async def api_info():
-    """API root endpoint."""
+    """API root endpoint — surface map and doc links."""
     return {
         "name": settings.app_name,
         "version": settings.app_version,
         "docs": "/docs",
+        "redoc": "/redoc",
+        "openapi": "/openapi.json",
         "health": "/health",
-        "dashboard": "/dashboard",
+        "surfaces": {
+            "audits": "/api/v1/audits",
+            "jobs": "/api/v1/jobs",
+            "api_keys": "/api/v1/api-keys",
+            "serp": "/api/v1/serp",
+        },
     }
 
 

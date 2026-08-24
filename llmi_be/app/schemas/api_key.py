@@ -68,7 +68,8 @@ class ApiKeyUsageResponse(BaseModel):
     total_prompts: int
     last_used_at: Optional[datetime] = None
     created_at: datetime
-    # Today's usage
-    requests_today: int = 0
-    jobs_today: int = 0
-    prompts_today: int = 0
+    # Today's usage — null when per-day tracking is unavailable (this
+    # service keeps no usage-log table), never a fabricated 0.
+    requests_today: Optional[int] = None
+    jobs_today: Optional[int] = None
+    prompts_today: Optional[int] = None

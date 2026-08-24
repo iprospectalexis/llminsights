@@ -157,8 +157,9 @@ async def get_api_key_usage(
             detail=f"API key {key_id} not found",
         )
 
-    # TODO: Calculate today's usage from a separate usage log table
-    # For now, return total stats
+    # Per-day usage is not tracked (no usage-log table on this service), so
+    # return null for the "today" fields instead of a fabricated 0 that reads
+    # as real consumption against daily_limit.
     return ApiKeyUsageResponse(
         id=api_key.id,
         name=api_key.name,
@@ -167,9 +168,9 @@ async def get_api_key_usage(
         total_prompts=api_key.total_prompts,
         last_used_at=api_key.last_used_at,
         created_at=api_key.created_at,
-        requests_today=0,  # TODO: Implement daily tracking
-        jobs_today=0,
-        prompts_today=0,
+        requests_today=None,
+        jobs_today=None,
+        prompts_today=None,
     )
 
 

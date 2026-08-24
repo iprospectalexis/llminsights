@@ -69,15 +69,19 @@ class WebhookService:
             try:
                 logger.info(f"Sending webhook for job {job_id} to {url} (attempt {attempt + 1})")
                 
+                _headers = {
+                    "Content-Type": "application/json",
+                    "User-Agent": "SERP-SaaS-API/1.0",
+                }
+                # httpx raises when a header value is None; only attach the
+                # secret when one is configured (unset in some deployments).
+                if settings.webhook_secret:
+                    _headers["X-Webhook-Secret"] = settings.webhook_secret
                 async with httpx.AsyncClient(timeout=self.timeout) as client:
                     response = await client.post(
                         url,
                         json=payload.model_dump(mode='json'),
-                        headers={
-                            "Content-Type": "application/json",
-                            "User-Agent": "SERP-SaaS-API/1.0",
-                            "X-Webhook-Secret": settings.webhook_secret,
-                        },
+                        headers=_headers,
                     )
                     response.raise_for_status()
                 

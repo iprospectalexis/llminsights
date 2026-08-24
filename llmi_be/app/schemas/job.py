@@ -130,6 +130,8 @@ class HealthResponse(BaseModel):
     version: str
     database: str
     active_jobs: int
+    worker_enabled: bool = True
+    scheduler_running: bool = False
 
 
 class WebhookPayload(BaseModel):

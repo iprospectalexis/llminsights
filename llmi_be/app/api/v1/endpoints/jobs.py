@@ -248,7 +248,11 @@ async def delete_job(
             detail="Access denied to this job",
         )
 
-    if job.status not in [JobStatus.PENDING.value, JobStatus.PROCESSING.value]:
+    if job.status not in [
+        JobStatus.PENDING.value,
+        JobStatus.GETTING_RESULTS.value,
+        JobStatus.PROCESSING_RESULTS.value,
+    ]:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Cannot cancel job in {job.status} status",
@@ -315,6 +319,7 @@ async def retry_job(
         geo_targeting=job.geo_targeting,
         source=job.source,
         provider=job.provider,
+        web_search=job.web_search,  # preserve the original run's search mode
         webhook_url=job.webhook_url,
         status=JobStatus.PENDING.value,
         total_prompts=len(job.failed_queries),

@@ -335,7 +335,10 @@ async def fetch_onesearch_results(job_id: str) -> Optional[list[dict]]:
             all_results.extend(page_results)
 
             pagination = data.get("pagination", {})
-            total_pages = pagination.get("pages", 1)
+            # The /jobs/{id}/results producer emits "total_pages"; older
+            # payloads used "pages". Read both or the loop stops after page 1
+            # and silently truncates any job with >500 results.
+            total_pages = pagination.get("total_pages", pagination.get("pages", 1))
             if page >= total_pages:
                 break
             page += 1
@@ -570,6 +573,11 @@ async def run_audit(req: RunAuditRequest, background_tasks: BackgroundTasks):
                 "status": "failed",
                 "pipeline_state": "failed",
                 "current_step": None,
+                # A failed audit must carry WHY (hardened pipeline invariant) —
+                # a NULL error_message forces log archaeology and can read as a
+                # green/blank state in the UI.
+                "error_message": f"Job trigger failed: {str(e)[:500]}",
+                "finished_at": datetime.now(timezone.utc),
             })
 
     background_tasks.add_task(_trigger_jobs)
@@ -661,7 +669,9 @@ async def resume_audit(audit_id: str):
     await db.update_audit(audit_id, {
         "locked_by": None,
         "locked_at": None,
-        "last_activity_at": datetime.now(timezone.utc).isoformat(),
+        # datetime object, NOT .isoformat(): update_audit binds this straight
+        # into a timestamptz column and asyncpg's codec rejects a str.
+        "last_activity_at": datetime.now(timezone.utc),
         "error_message": None,
     })
 
@@ -723,6 +733,7 @@ async def reprocess_audit(audit_id: str, from_stage: str = "extracting_competito
                    f"only completed or failed audits",
         )
 
+    _now = datetime.now(timezone.utc)
     update: dict = {
         "pipeline_state": from_stage,
         "status": "running",
@@ -730,7 +741,15 @@ async def reprocess_audit(audit_id: str, from_stage: str = "extracting_competito
         "current_step": _LEGACY_STEP[from_stage],
         "locked_by": None,
         "locked_at": None,
-        "last_activity_at": datetime.now(timezone.utc).isoformat(),
+        # datetime, not isoformat str (asyncpg timestamptz codec).
+        "last_activity_at": _now,
+        # Re-stamp the state clock: the scheduler's zombie sweep auto-fails
+        # any audit sitting in extracting_competitors/analyzing_sentiment/
+        # finalizing with pipeline_state_entered_at older than 45 min. A
+        # reprocessed audit finished long ago, so without this it is killed
+        # ~60s later, before the re-entered stage can run.
+        "pipeline_state_entered_at": _now,
+        "consecutive_batch_failures": 0,
         "finished_at": None,
         "error_message": None,
     }
@@ -902,7 +921,11 @@ async def retry_audit_llm(audit_id: str, req: RetryLlmRequest):
             WHERE audit_id = :aid
               AND llm = :llm
               AND (answer_text IS NULL OR answer_text = '')
-              AND raw_response_data IS NULL
+              -- Retry rows that were never scraped: raw_response_data is NULL,
+              -- OR it holds a trigger-failure sentinel {"error": ...} written
+              -- by run_audit when the provider job never started. Rows that
+              -- DID scrape carry real payload columns, not an 'error' key.
+              AND (raw_response_data IS NULL OR raw_response_data ? 'error')
               AND organic_results IS NULL
         """), {"aid": audit_id, "llm": llm})).mappings().all()
 
