@@ -12,7 +12,7 @@ import { supabase } from '../lib/supabase';
 import { DOMAIN_CATEGORIES, categoryChipClass } from '../lib/domainCategories';
 import { normalizeBrandKey, buildBrandDomainMapFromCitations } from '../lib/brandDomains';
 import { buildPageBrandIndex, findBrandsInText } from '../lib/pageBrands';
-import { TrendChip, trendDelta, TrendData } from '../components/ui/TrendChip';
+import { TrendChip, Sparkline, trendDelta, TrendData, TrendPoint } from '../components/ui/TrendChip';
 import { BrandFavicon } from '../components/ui/BrandFavicon';
 import { LoadingSpinner } from '../components/ui/LoadingSpinner';
 import { queryCache } from '../lib/queryCache';
@@ -1484,6 +1484,8 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
       ready: false as const,
       domainTrend: (_d: string) => null as TrendData | null,
       pageTrend: (_u: string) => null as TrendData | null,
+      domainSeries: (_d: string) => null as TrendPoint[] | null,
+      pageSeries: (_u: string) => null as TrendPoint[] | null,
     };
     if (!auditsData || auditsData.length < 2) return empty;
 
@@ -1495,9 +1497,11 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
 
     const candidates = (auditsData || [])
       .filter(a => a.status === 'completed' && (answeredByAudit.get(a.id) || 0) > 0)
-      .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
+      .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
     if (candidates.length < 2) return empty;
-    const [last, prev] = candidates;
+    const last = candidates[candidates.length - 1];
+    const prev = candidates[candidates.length - 2];
+    const windowIds = new Set(candidates.map(a => a.id));
 
     // Same cited-tier rules as the tables themselves.
     const isCited = (c: any) => {
@@ -1510,38 +1514,49 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
 
     // Count RESPONSES citing the item (unique audit-prompt-llm), not raw
     // citation rows -- several links to one page in one answer are one vote.
-    type Slots = { last: Set<string>; prev: Set<string> };
-    const domainSets = new Map<string, Slots>();
-    const pageSets = new Map<string, Slots>();
-    const bump = (map: Map<string, Slots>, key: string, slot: 'last' | 'prev', rk: string) => {
+    // Per key: auditId -> Set(responseKey), across the whole audit window,
+    // feeding both the sparkline series and the last-vs-prev chip.
+    type PerAudit = Map<string, Set<string>>;
+    const domainSets = new Map<string, PerAudit>();
+    const pageSets = new Map<string, PerAudit>();
+    const bump = (map: Map<string, PerAudit>, key: string, auditId: string, rk: string) => {
       let e = map.get(key);
-      if (!e) { e = { last: new Set(), prev: new Set() }; map.set(key, e); }
-      e[slot].add(rk);
+      if (!e) { e = new Map(); map.set(key, e); }
+      let set = e.get(auditId);
+      if (!set) { set = new Set(); e.set(auditId, set); }
+      set.add(rk);
     };
     filteredCitations.forEach(c => {
-      if (!c.audit_id || !isCited(c)) return;
-      const slot = c.audit_id === last.id ? 'last' : c.audit_id === prev.id ? 'prev' : null;
-      if (!slot) return;
+      if (!c.audit_id || !windowIds.has(c.audit_id) || !isCited(c)) return;
       const rk = c.audit_id + '-' + c.prompt_id + '-' + c.llm;
-      if (c.domain) bump(domainSets, c.domain, slot, rk);
-      if (c.page_url) bump(pageSets, normalizeUrl(c.page_url), slot, rk);
+      if (c.domain) bump(domainSets, c.domain, c.audit_id, rk);
+      if (c.page_url) bump(pageSets, normalizeUrl(c.page_url), c.audit_id, rk);
     });
 
-    const lastTotal = answeredByAudit.get(last.id) || 0;
-    const prevTotal = answeredByAudit.get(prev.id) || 0;
-    const toTrend = (e?: Slots): TrendData => ({
-      lastCount: e ? e.last.size : 0,
-      lastTotal,
-      prevCount: e ? e.prev.size : 0,
-      prevTotal,
+    const countIn = (e: PerAudit | undefined, auditId: string) => {
+      const set = e ? e.get(auditId) : undefined;
+      return set ? set.size : 0;
+    };
+    const toTrend = (e?: PerAudit): TrendData => ({
+      lastCount: countIn(e, last.id),
+      lastTotal: answeredByAudit.get(last.id) || 0,
+      prevCount: countIn(e, prev.id),
+      prevTotal: answeredByAudit.get(prev.id) || 0,
       lastDate: last.created_at,
       prevDate: prev.created_at,
+    });
+    const toSeries = (e?: PerAudit): TrendPoint[] => candidates.map(a2 => {
+      const total = answeredByAudit.get(a2.id) || 0;
+      const count = countIn(e, a2.id);
+      return { date: a2.created_at, count, total, share: total > 0 ? (count / total) * 100 : 0 };
     });
 
     return {
       ready: true as const,
       domainTrend: (d: string) => toTrend(domainSets.get(d)),
       pageTrend: (u: string) => toTrend(pageSets.get(u)),
+      domainSeries: (d: string) => toSeries(domainSets.get(d)),
+      pageSeries: (u: string) => toSeries(pageSets.get(u)),
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [filteredCitations, filteredLlmResponses, auditsData, filters.llms]);
@@ -3154,6 +3169,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
         pageBrandsComention: pb?.comention || [],
         brandsCount: pb?.exact.length || 0,
         trend: auditTrendIndex.ready ? auditTrendIndex.pageTrend(normalizeUrl(p.page_url)) : null,
+        sparkSeries: auditTrendIndex.ready ? auditTrendIndex.pageSeries(normalizeUrl(p.page_url)) : null,
       };
     }).map((p: any) => ({ ...p, trendDelta: p.trend ? trendDelta(p.trend) : 0 }));
 
@@ -3334,6 +3350,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
           ? (domain.sentimentSum / domain.sentimentCount).toFixed(2)
           : 'N/A',
         trend: auditTrendIndex.ready ? auditTrendIndex.domainTrend(domain.domain) : null,
+        sparkSeries: auditTrendIndex.ready ? auditTrendIndex.domainSeries(domain.domain) : null,
       };
     })
     .map((d: any) => ({ ...d, trendDelta: d.trend ? trendDelta(d.trend) : 0 }))
@@ -6182,7 +6199,10 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                         <td className="py-3 px-2 text-center text-gray-900 dark:text-gray-100">{page.mentions}</td>
                         {auditTrendIndex.ready && (
                           <td className="py-3 px-2 text-center">
-                            <TrendChip trend={page.trend} />
+                            <span className="inline-flex items-center gap-1.5">
+                              <Sparkline series={page.sparkSeries} />
+                              <TrendChip trend={page.trend} />
+                            </span>
                           </td>
                         )}
                         <td className="py-3 px-2 text-center text-gray-900 dark:text-gray-100">{page.more_count || 0}</td>
@@ -6352,7 +6372,10 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                         <td className="py-3 px-2 text-center text-gray-900 dark:text-gray-100">{domain.mentions}</td>
                         {auditTrendIndex.ready && (
                           <td className="py-3 px-2 text-center">
-                            <TrendChip trend={domain.trend} />
+                            <span className="inline-flex items-center gap-1.5">
+                              <Sparkline series={domain.sparkSeries} />
+                              <TrendChip trend={domain.trend} />
+                            </span>
                           </td>
                         )}
                         <td className="py-3 px-2 text-center text-gray-900 dark:text-gray-100">

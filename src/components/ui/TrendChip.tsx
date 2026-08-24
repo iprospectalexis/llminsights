@@ -24,6 +24,50 @@ export function trendDelta(t: TrendData): number {
   return pct(t.lastCount, t.lastTotal) - pct(t.prevCount, t.prevTotal);
 }
 
+// One point per completed audit in the loaded window (oldest -> newest).
+export interface TrendPoint {
+  date?: string;
+  count: number;   // responses citing the item in that audit
+  total: number;   // answered responses in that audit (filters applied)
+  share: number;   // count/total, 0..100
+}
+
+// Tiny neutral line of the citing share across the audit window. The line is
+// deliberately recessive (one gray hue, both themes) — polarity is already
+// encoded by the TrendChip next to it; exact values live in the tooltip.
+export function Sparkline({ series }: { series: TrendPoint[] | null | undefined }) {
+  if (!series || series.length < 2) return null;
+  const W = 64, H = 20, PAD = 3;
+  const max = Math.max(...series.map(pt => pt.share), 1);
+  const x = (i: number) => PAD + (i * (W - 2 * PAD)) / (series.length - 1);
+  const y = (v: number) => H - PAD - (v / max) * (H - 2 * PAD);
+  const pts = series.map((pt, i) => x(i).toFixed(1) + ',' + y(pt.share).toFixed(1)).join(' ');
+  const last = series[series.length - 1];
+  const title = series
+    .map(pt => (pt.date ? fmtDate(pt.date) + ': ' : '') + pt.share.toFixed(1) + '% (' + pt.count + '/' + pt.total + ')')
+    .join('\n');
+  return (
+    <svg
+      width={W}
+      height={H}
+      viewBox={'0 0 ' + W + ' ' + H}
+      role="img"
+      className="text-gray-400 dark:text-gray-500 shrink-0 cursor-help"
+    >
+      <title>{title}</title>
+      <polyline
+        points={pts}
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <circle cx={x(series.length - 1)} cy={y(last.share)} r="2" fill="currentColor" />
+    </svg>
+  );
+}
+
 export function TrendChip({ trend }: { trend: TrendData | null | undefined }) {
   if (!trend) return null;
   const { lastCount, lastTotal, prevCount, prevTotal, lastDate, prevDate } = trend;
