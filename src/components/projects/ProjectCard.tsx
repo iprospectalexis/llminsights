@@ -1,4 +1,5 @@
 import React from 'react';
+import { Link } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { Card, CardContent, CardHeader } from '../ui/Card';
 import { Button } from '../ui/Button';
@@ -48,7 +49,14 @@ export const ProjectCard: React.FC<ProjectCardProps> = ({
       transition={{ duration: 0.2 }}
       className="h-full group"
     >
-      <Card className="h-full border-gray-200/50 dark:border-gray-700/50 bg-gradient-to-br from-white via-white to-gray-50/30 dark:from-gray-800 dark:via-gray-800 dark:to-gray-900/30 backdrop-blur-sm hover:shadow-2xl hover:shadow-gray-200/40 dark:hover:shadow-gray-900/40 transition-all duration-300">
+      <Card className="relative h-full border-gray-200/50 dark:border-gray-700/50 bg-gradient-to-br from-white via-white to-gray-50/30 dark:from-gray-800 dark:via-gray-800 dark:to-gray-900/30 backdrop-blur-sm hover:shadow-2xl hover:shadow-gray-200/40 dark:hover:shadow-gray-900/40 transition-all duration-300">
+        {/* Stretched link: makes the whole card a real <a> so the browser's
+            "open in new tab" / middle-click work. Buttons sit above (z-20). */}
+        <Link
+          to={`/projects/${project.id}/overview`}
+          aria-label={`Open ${project.name}`}
+          className="absolute inset-0 z-10 rounded-2xl"
+        />
         <CardHeader className="pb-4">
           <div className="flex items-start justify-between">
             <div className="flex-1">
@@ -72,7 +80,7 @@ export const ProjectCard: React.FC<ProjectCardProps> = ({
                 </div>
                 <div className="flex-1 min-w-0">
                   <h3
-                    className="text-lg font-bold text-gray-900 dark:text-gray-100 cursor-pointer hover:text-brand-primary transition-colors truncate"
+                    className="text-lg font-bold text-gray-900 dark:text-gray-100 group-hover:text-brand-primary transition-colors truncate"
                     onClick={() => onViewProject(project.id)}
                   >
                     {project.name}
@@ -86,7 +94,7 @@ export const ProjectCard: React.FC<ProjectCardProps> = ({
                     e.stopPropagation();
                     onDelete(project.id);
                   }}
-                  className="p-2 text-gray-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-xl transition-all duration-200 opacity-0 group-hover:opacity-100"
+                  className="relative z-20 p-2 text-gray-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-xl transition-all duration-200 opacity-0 group-hover:opacity-100"
                   title="Delete project"
                 >
                   <Trash2 className="w-4 h-4" />
@@ -167,7 +175,7 @@ export const ProjectCard: React.FC<ProjectCardProps> = ({
               </div>
             </div>
 
-            <div className="flex gap-2">
+            <div className="relative z-20 flex gap-2">
               <Button
                 variant="gradient"
                 size="sm"

@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { Button } from '../components/ui/Button';
 import { Card, CardContent, CardHeader } from '../components/ui/Card';
@@ -494,7 +494,14 @@ export const ProjectsPage: React.FC = () => {
                 whileHover={{ y: -2 }}
                 className="group"
               >
-                <div className="bg-gradient-to-br from-white via-white to-gray-50/30 dark:from-gray-800 dark:via-gray-800 dark:to-gray-900/30 backdrop-blur-sm border border-gray-200/50 dark:border-gray-700/50 rounded-2xl p-6 hover:shadow-2xl hover:shadow-gray-200/40 dark:hover:shadow-gray-900/40 transition-all duration-300">
+                <div className="relative bg-gradient-to-br from-white via-white to-gray-50/30 dark:from-gray-800 dark:via-gray-800 dark:to-gray-900/30 backdrop-blur-sm border border-gray-200/50 dark:border-gray-700/50 rounded-2xl p-6 hover:shadow-2xl hover:shadow-gray-200/40 dark:hover:shadow-gray-900/40 transition-all duration-300">
+                  {/* Stretched link: whole row is a real <a> (right-click /
+                      middle-click open in new tab); controls sit above at z-20. */}
+                  <Link
+                    to={`/projects/${project.id}/overview`}
+                    aria-label={`Open ${project.name}`}
+                    className="absolute inset-0 z-10 rounded-2xl"
+                  />
                   <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between sm:gap-6">
                     <div className="flex items-center gap-4 flex-1 min-w-0">
                       <div className="relative flex-shrink-0">
@@ -517,7 +524,7 @@ export const ProjectsPage: React.FC = () => {
 
                       <div className="flex-1 min-w-0">
                         <h3
-                          className="text-xl font-bold text-gray-900 dark:text-gray-100 cursor-pointer hover:text-brand-primary transition-colors truncate mb-1"
+                          className="text-xl font-bold text-gray-900 dark:text-gray-100 group-hover:text-brand-primary transition-colors truncate mb-1"
                           onClick={() => handleViewProject(project.id)}
                         >
                           {project.name}
@@ -593,7 +600,7 @@ export const ProjectsPage: React.FC = () => {
                         </div>
                       </div>
 
-                      <div className="flex gap-2">
+                      <div className="relative z-20 flex gap-2">
                         <Button
                           variant="gradient"
                           size="sm"
