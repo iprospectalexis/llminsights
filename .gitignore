@@ -35,3 +35,25 @@ __pycache__/
 # Data
 llmi_be/serp_jobs.db
 llmi_be/results/
+
+# Python virtualenvs and caches
+llmi_be/venv311/
+llmi_be/venv/
+**/__pycache__/
+*.pyc
+llmi_be/*.db
+llmi_be/uvicorn
+
+# Root-level scratch ops/diagnostic scripts (not part of the app)
+/apply_*.py
+/diagnose_*.py
+/backfill_*.py
+/cleanup_*.py
+/find_*.py
+/fetch_*.py
+/export_*.py
+/test_*.py
+/*.xlsx
+llmi_be/aio_results_sample.json
+llmi_be/test_dataforseo_*.py
+llmi_be/diag_*.py
