@@ -1,4 +1,6 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
+
+from app.api.deps import verify_audit_access
 
 from app.api.v1.endpoints.jobs import router as jobs_router
 from app.api.v1.endpoints.api_keys import router as api_keys_router
@@ -23,6 +25,10 @@ api_router.include_router(
     audits_router,
     prefix="/audits",
     tags=["Audits"],
+    # Every audits endpoint requires a signed-in Supabase user (the browser
+    # sends its session token) or the master API key (ops). POST /audits/run
+    # spends provider credits, so this surface must not stay open.
+    dependencies=[Depends(verify_audit_access)],
 )
 
 api_router.include_router(

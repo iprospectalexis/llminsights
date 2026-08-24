@@ -6,6 +6,8 @@
  * The base URL is always relative so the same build works everywhere.
  */
 
+import { supabase } from './supabase';
+
 const BASE = import.meta.env.VITE_BACKEND_URL || '/api';
 
 interface RequestOptions {
@@ -26,6 +28,17 @@ async function request<T = unknown>(path: string, opts: RequestOptions = {}): Pr
 
   if (apiKey) {
     reqHeaders['X-API-Key'] = apiKey;
+  } else {
+    // The audits surface is protected: it accepts the signed-in user's
+    // Supabase session, which the backend validates against Supabase Auth.
+    // Attached to every call (harmless for the public SERP endpoints).
+    try {
+      const { data } = await supabase.auth.getSession();
+      const token = data.session?.access_token;
+      if (token) reqHeaders['Authorization'] = `Bearer ${token}`;
+    } catch {
+      // No session (public pages such as the GEO lead form) - send nothing.
+    }
   }
 
   const res = await fetch(`${BASE}${path}`, {

@@ -128,6 +128,30 @@ class Settings(BaseSettings):
             return self.database_url_override
         return f"sqlite+aiosqlite:///{self.database_path}"
 
+    # ── Audits API authentication ────────────────────────────────────────
+    # The audits surface is called by the browser with the user's Supabase
+    # session (Authorization: Bearer <access_token>), validated by asking
+    # Supabase Auth who the token belongs to. No JWT secret needed — the
+    # anon key + the project URL are already present for the frontend build.
+    supabase_url: str = ""          # env: SUPABASE_URL or VITE_SUPABASE_URL
+    supabase_anon_key: str = ""     # env: SUPABASE_ANON_KEY or VITE_SUPABASE_ANON_KEY
+    # Escape hatch: set AUDITS_AUTH_REQUIRED=0 to disable enforcement without
+    # a redeploy if something goes wrong in production.
+    audits_auth_required: bool = True
+
+    @property
+    def supabase_auth_base(self) -> str:
+        """Supabase project URL, falling back to the VITE_* build variables."""
+        import os
+        url = (self.supabase_url or os.environ.get("VITE_SUPABASE_URL", "")).strip()
+        return url.rstrip("/")
+
+    @property
+    def supabase_auth_key(self) -> str:
+        import os
+        return (self.supabase_anon_key
+                or os.environ.get("VITE_SUPABASE_ANON_KEY", "")).strip()
+
     @property
     def is_postgres(self) -> bool:
         return 'postgresql' in self.database_url
