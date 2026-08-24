@@ -12,6 +12,7 @@ import { supabase } from '../lib/supabase';
 import { DOMAIN_CATEGORIES, categoryChipClass } from '../lib/domainCategories';
 import { normalizeBrandKey, buildBrandDomainMapFromCitations } from '../lib/brandDomains';
 import { buildPageBrandIndex, findBrandsInText } from '../lib/pageBrands';
+import { TrendChip, trendDelta, TrendData } from '../components/ui/TrendChip';
 import { BrandFavicon } from '../components/ui/BrandFavicon';
 import { LoadingSpinner } from '../components/ui/LoadingSpinner';
 import { queryCache } from '../lib/queryCache';
@@ -1473,6 +1474,78 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     [filteredLlmResponses, filteredCitations, brands, competitors]
   );
 
+  // Trend vs the previous audit (Domains / Pages tabs). Compares the last
+  // two COMPLETED audits that have answered responses under the active
+  // filters, on the SHARE of answered responses citing each domain / page --
+  // robust to partial collections and the x1 -> x3 Avalanche switch, unlike
+  // raw citation counts. Absolute numbers go to the chip tooltip.
+  const auditTrendIndex = useMemo(() => {
+    const empty = {
+      ready: false as const,
+      domainTrend: (_d: string) => null as TrendData | null,
+      pageTrend: (_u: string) => null as TrendData | null,
+    };
+    if (!auditsData || auditsData.length < 2) return empty;
+
+    const answeredByAudit = new Map<string, number>();
+    filteredLlmResponses.forEach(r => {
+      if (!r.audit_id || !r.answer_text) return;
+      answeredByAudit.set(r.audit_id, (answeredByAudit.get(r.audit_id) || 0) + 1);
+    });
+
+    const candidates = (auditsData || [])
+      .filter(a => a.status === 'completed' && (answeredByAudit.get(a.id) || 0) > 0)
+      .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
+    if (candidates.length < 2) return empty;
+    const [last, prev] = candidates;
+
+    // Same cited-tier rules as the tables themselves.
+    const isCited = (c: any) => {
+      if (filters.llms === 'searchgpt') return c.cited === true;
+      if (filters.llms === 'all') {
+        return c.llm === 'searchgpt' ? c.cited === true : (c.cited === true || c.cited == null);
+      }
+      return c.cited === true || c.cited == null;
+    };
+
+    // Count RESPONSES citing the item (unique audit-prompt-llm), not raw
+    // citation rows -- several links to one page in one answer are one vote.
+    type Slots = { last: Set<string>; prev: Set<string> };
+    const domainSets = new Map<string, Slots>();
+    const pageSets = new Map<string, Slots>();
+    const bump = (map: Map<string, Slots>, key: string, slot: 'last' | 'prev', rk: string) => {
+      let e = map.get(key);
+      if (!e) { e = { last: new Set(), prev: new Set() }; map.set(key, e); }
+      e[slot].add(rk);
+    };
+    filteredCitations.forEach(c => {
+      if (!c.audit_id || !isCited(c)) return;
+      const slot = c.audit_id === last.id ? 'last' : c.audit_id === prev.id ? 'prev' : null;
+      if (!slot) return;
+      const rk = c.audit_id + '-' + c.prompt_id + '-' + c.llm;
+      if (c.domain) bump(domainSets, c.domain, slot, rk);
+      if (c.page_url) bump(pageSets, normalizeUrl(c.page_url), slot, rk);
+    });
+
+    const lastTotal = answeredByAudit.get(last.id) || 0;
+    const prevTotal = answeredByAudit.get(prev.id) || 0;
+    const toTrend = (e?: Slots): TrendData => ({
+      lastCount: e ? e.last.size : 0,
+      lastTotal,
+      prevCount: e ? e.prev.size : 0,
+      prevTotal,
+      lastDate: last.created_at,
+      prevDate: prev.created_at,
+    });
+
+    return {
+      ready: true as const,
+      domainTrend: (d: string) => toTrend(domainSets.get(d)),
+      pageTrend: (u: string) => toTrend(pageSets.get(u)),
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filteredCitations, filteredLlmResponses, auditsData, filters.llms]);
+
   const extractDomain = (url: string): string => {
     try {
       const urlObj = new URL(url);
@@ -2667,6 +2740,9 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
       'Category': page.category || 'Unknown',
       'Brands': (page.pageBrands || []).map((b: any) => b.brand_name).join(', '),
       'Citations (Cited)': page.mentions,
+      'Trend vs prev audit (pt)': page.trend ? Number(page.trendDelta.toFixed(1)) : '',
+      'Last audit (cited / answers)': page.trend ? page.trend.lastCount + '/' + page.trend.lastTotal : '',
+      'Previous audit (cited / answers)': page.trend ? page.trend.prevCount + '/' + page.trend.prevTotal : '',
       'Citations (More)': page.more_count || 0,
       'Total Citations': page.mentions + (page.more_count || 0),
       'All Sources': page.all_sources_count || 0
@@ -2689,6 +2765,9 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
       'Domain': domain.domain,
       'Category': domain.category || 'Unknown',
       'Citations (Cited)': domain.mentions,
+      'Trend vs prev audit (pt)': domain.trend ? Number(domain.trendDelta.toFixed(1)) : '',
+      'Last audit (cited / answers)': domain.trend ? domain.trend.lastCount + '/' + domain.trend.lastTotal : '',
+      'Previous audit (cited / answers)': domain.trend ? domain.trend.prevCount + '/' + domain.trend.prevTotal : '',
       'Cited Prompts': domain.citedPrompts || 0,
       '% of Cited Prompts': `${domain.citedPromptsPercentage}%`,
       'Cited Pages': domain.citedPages || 0,
@@ -3074,8 +3153,9 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
         pageBrands: pb?.exact || [],
         pageBrandsComention: pb?.comention || [],
         brandsCount: pb?.exact.length || 0,
+        trend: auditTrendIndex.ready ? auditTrendIndex.pageTrend(normalizeUrl(p.page_url)) : null,
       };
-    });
+    }).map((p: any) => ({ ...p, trendDelta: p.trend ? trendDelta(p.trend) : 0 }));
 
     // Apply sorting
     return pages.sort((a: any, b: any) => {
@@ -3253,8 +3333,10 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
         avgSentiment: domain.sentimentCount > 0
           ? (domain.sentimentSum / domain.sentimentCount).toFixed(2)
           : 'N/A',
+        trend: auditTrendIndex.ready ? auditTrendIndex.domainTrend(domain.domain) : null,
       };
     })
+    .map((d: any) => ({ ...d, trendDelta: d.trend ? trendDelta(d.trend) : 0 }))
     .filter((d: any) => domainCategoryFilter === 'all' || d.category === domainCategoryFilter)
     .sort((a: any, b: any) => {
       let aValue = a[domainSortConfig.column];
@@ -5979,6 +6061,18 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                           {renderSortIcon('mentions', pageSortConfig)}
                         </button>
                       </th>
+                      {auditTrendIndex.ready && (
+                        <th className="text-center py-3 px-2 text-gray-900 dark:text-gray-100">
+                          <button
+                            onClick={() => handlePageSort('trendDelta')}
+                            title="Change vs the previous audit: share of answered responses citing this page, in percentage points"
+                            className="flex items-center gap-1 hover:text-brand-primary transition-colors mx-auto"
+                          >
+                            Trend
+                            {renderSortIcon('trendDelta', pageSortConfig)}
+                          </button>
+                        </th>
+                      )}
                       <th className="text-center py-3 px-2 text-gray-900 dark:text-gray-100">
                         <button
                           onClick={() => handlePageSort('more_count')}
@@ -6086,6 +6180,11 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                           )}
                         </td>
                         <td className="py-3 px-2 text-center text-gray-900 dark:text-gray-100">{page.mentions}</td>
+                        {auditTrendIndex.ready && (
+                          <td className="py-3 px-2 text-center">
+                            <TrendChip trend={page.trend} />
+                          </td>
+                        )}
                         <td className="py-3 px-2 text-center text-gray-900 dark:text-gray-100">{page.more_count || 0}</td>
                         <td className="py-3 px-2 text-center text-gray-900 dark:text-gray-100 font-semibold">{page.mentions + (page.more_count || 0)}</td>
                         <td className="py-3 px-2 text-center text-gray-900 dark:text-gray-100">{page.all_sources_count || 0}</td>
@@ -6155,6 +6254,18 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                           {renderSortIcon('mentions', domainSortConfig)}
                         </button>
                       </th>
+                      {auditTrendIndex.ready && (
+                        <th className="text-center py-3 px-2 text-gray-900 dark:text-gray-100">
+                          <button
+                            onClick={() => handleDomainSort('trendDelta')}
+                            title="Change vs the previous audit: share of answered responses citing this domain, in percentage points"
+                            className="flex items-center gap-1 hover:text-brand-primary transition-colors mx-auto"
+                          >
+                            Trend
+                            {renderSortIcon('trendDelta', domainSortConfig)}
+                          </button>
+                        </th>
+                      )}
                       <th className="text-center py-3 px-2 text-gray-900 dark:text-gray-100">
                         <button
                           onClick={() => handleDomainSort('citedPrompts')}
@@ -6239,6 +6350,11 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                           </span>
                         </td>
                         <td className="py-3 px-2 text-center text-gray-900 dark:text-gray-100">{domain.mentions}</td>
+                        {auditTrendIndex.ready && (
+                          <td className="py-3 px-2 text-center">
+                            <TrendChip trend={domain.trend} />
+                          </td>
+                        )}
                         <td className="py-3 px-2 text-center text-gray-900 dark:text-gray-100">
                           {domain.citedPrompts || 0}
                         </td>
