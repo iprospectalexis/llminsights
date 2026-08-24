@@ -10,13 +10,33 @@ import { Input } from '../components/ui/Input';
 import { Progress } from '../components/ui/Progress';
 import { supabase } from '../lib/supabase';
 import { DOMAIN_CATEGORIES, categoryChipClass } from '../lib/domainCategories';
+
+// Fixed color per domain category — shared by the Overview donut and the
+// Domains Insights charts, so a category never changes hue between views.
+const CATEGORY_CHART_COLORS: Record<string, string> = {
+  'Own Brand': 'rgb(var(--brand-primary))',
+  Competitor: '#f43f5e',
+  Corporate: '#3b82f6',
+  'News/Media': '#a855f7',
+  'Review/Comparison': '#f59e0b',
+  'Marketplace/Retail': '#f97316',
+  'Social Media': '#ec4899',
+  'Community/Forum': '#14b8a6',
+  Video: '#ef4444',
+  'Encyclopedia/Reference': '#6366f1',
+  Education: '#06b6d4',
+  'Government/NGO': '#10b981',
+  'Blogs/Personal': '#84cc16',
+  Other: '#9ca3af',
+  Unknown: '#d1d5db',
+};
 import { normalizeBrandKey, buildBrandDomainMapFromCitations } from '../lib/brandDomains';
 import { buildPageBrandIndex, findBrandsInText } from '../lib/pageBrands';
 import { TrendChip, Sparkline, trendDelta, TrendData, TrendPoint } from '../components/ui/TrendChip';
 import { BrandFavicon } from '../components/ui/BrandFavicon';
 import { LoadingSpinner } from '../components/ui/LoadingSpinner';
 import { queryCache } from '../lib/queryCache';
-import { Calendar, FileText, ChartBar as BarChart3, Globe, Users, Play, ArrowLeft, Brain, Download, Settings as SettingsIcon, PencilLine, X, MessageSquare, Crown, TrendingUp, Lightbulb, Trash2, Info, Settings, CalendarCheck, ArrowUpDown, ArrowUp, ArrowDown, BadgeCheck, MessageCircle, List, ChevronDown, Smile, ShoppingBag, Map as MapIcon, Megaphone } from 'lucide-react';
+import { Calendar, FileText, ChartBar as BarChart3, Globe, Users, Play, ArrowLeft, Brain, Download, Settings as SettingsIcon, PencilLine, X, MessageSquare, Crown, TrendingUp, TrendingDown, Lightbulb, Trash2, Info, Settings, CalendarCheck, ArrowUpDown, ArrowUp, ArrowDown, BadgeCheck, MessageCircle, List, ChevronDown, Smile, ShoppingBag, Map as MapIcon, Megaphone } from 'lucide-react';
 import { SentimentDashboard } from '../components/sentiment/SentimentDashboard';
 import { PieChart, Pie, Cell, ResponsiveContainer, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, LineChart, Line, Legend } from 'recharts';
 import { RadarChart, Radar, PolarGrid, PolarAngleAxis, PolarRadiusAxis } from 'recharts';
@@ -295,6 +315,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
   // Domains tab. Own Brand / Competitor are computed per project on top.
   const [domainCategoryMap, setDomainCategoryMap] = useState<Record<string, string>>({});
   const [domainCategoryFilter, setDomainCategoryFilter] = useState<string>('all');
+  const [domainsView, setDomainsView] = useState<'performance' | 'insights'>('performance');
 
   // Ads dashboard (lazy-loaded on tab open). Ads are collected since the
   // rich-results deploy — older audits have ads=null because the field
@@ -1486,6 +1507,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
       pageTrend: (_u: string) => null as TrendData | null,
       domainSeries: (_d: string) => null as TrendPoint[] | null,
       pageSeries: (_u: string) => null as TrendPoint[] | null,
+      audits: [] as { id: string; date: string; total: number }[],
     };
     if (!auditsData || auditsData.length < 2) return empty;
 
@@ -1557,6 +1579,9 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
       pageTrend: (u: string) => toTrend(pageSets.get(u)),
       domainSeries: (d: string) => toSeries(domainSets.get(d)),
       pageSeries: (u: string) => toSeries(pageSets.get(u)),
+      audits: candidates.map(a2 => ({
+        id: a2.id, date: a2.created_at, total: answeredByAudit.get(a2.id) || 0,
+      })),
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [filteredCitations, filteredLlmResponses, auditsData, filters.llms]);
@@ -3217,6 +3242,91 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
 
     return domainCategoryMap[rawDomain] || domainCategoryMap[domain] || 'Unknown';
   };
+
+  // Data for the Domains Insights view — one memoized pass over
+  // filteredCitations (movers/shakers, category pie, category dynamics),
+  // instead of the Performance table's per-domain rescans.
+  const domainsInsights = useMemo(() => {
+    if (!auditTrendIndex.ready) return null;
+    const audits = auditTrendIndex.audits;
+    const windowIds = new Set(audits.map(a => a.id));
+
+    const isCited = (c: any) => {
+      if (filters.llms === 'searchgpt') return c.cited === true;
+      if (filters.llms === 'all') {
+        return c.llm === 'searchgpt' ? c.cited === true : (c.cited === true || c.cited == null);
+      }
+      return c.cited === true || c.cited == null;
+    };
+
+    const catOf = new Map<string, string>();
+    const domains = new Set<string>();
+    const catCounts = new Map<string, number>();
+    const catResp = new Map<string, Map<string, Set<string>>>();
+
+    filteredCitations.forEach((c: any) => {
+      if (!c.domain || !isCited(c)) return;
+      let cat = catOf.get(c.domain);
+      if (!cat) { cat = getDomainDisplayCategory(c.domain); catOf.set(c.domain, cat); }
+      catCounts.set(cat, (catCounts.get(cat) || 0) + 1);
+      domains.add(c.domain);
+      if (c.audit_id && windowIds.has(c.audit_id)) {
+        let per = catResp.get(cat);
+        if (!per) { per = new Map(); catResp.set(cat, per); }
+        let set = per.get(c.audit_id);
+        if (!set) { set = new Set(); per.set(c.audit_id, set); }
+        set.add(c.audit_id + '-' + c.prompt_id + '-' + c.llm);
+      }
+    });
+
+    // Movers / Shakers: best and worst citing-share dynamics at the last
+    // audit. A domain qualifies with 2+ citing answers in at least one of
+    // the two compared audits — a 0-to-1 flicker is noise, not a move.
+    type MoverRow = { domain: string; category: string; trend: TrendData; series: TrendPoint[] | null; delta: number };
+    const ranked: MoverRow[] = [];
+    domains.forEach(d => {
+      const trend = auditTrendIndex.domainTrend(d);
+      if (!trend || Math.max(trend.lastCount, trend.prevCount) < 2) return;
+      ranked.push({
+        domain: d,
+        category: catOf.get(d) || 'Unknown',
+        trend,
+        series: auditTrendIndex.domainSeries(d),
+        delta: trendDelta(trend),
+      });
+    });
+    const movers = ranked.filter(r => r.delta > 0.5).sort((a, b) => b.delta - a.delta).slice(0, 8);
+    const shakers = ranked.filter(r => r.delta < -0.5).sort((a, b) => a.delta - b.delta).slice(0, 8);
+
+    const totalCited = Array.from(catCounts.values()).reduce((x, y) => x + y, 0);
+    const pie = Array.from(catCounts.entries())
+      .map(([name, value]) => ({
+        name, value,
+        percentage: totalCited > 0 ? Math.round((value / totalCited) * 100) : 0,
+      }))
+      .sort((x, y) => y.value - x.value);
+
+    // Category dynamics: share of answered responses citing each category,
+    // per audit in the window. Top 6 categories keep the chart legible.
+    const topCats = Array.from(catResp.entries())
+      .map(([cat, per]) => ({ cat, vol: Array.from(per.values()).reduce((x, st) => x + st.size, 0) }))
+      .sort((x, y) => y.vol - x.vol)
+      .slice(0, 6)
+      .map(x => x.cat);
+    const dynamics = audits.map(a => {
+      const point: any = {
+        date: new Date(a.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
+      };
+      topCats.forEach(cat => {
+        const set = catResp.get(cat)?.get(a.id);
+        point[cat] = a.total > 0 ? Number((((set?.size || 0) / a.total) * 100).toFixed(1)) : 0;
+      });
+      return point;
+    });
+
+    return { movers, shakers, pie, totalCited, topCats, dynamics };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filteredCitations, auditTrendIndex, domainCategoryMap, brands, competitors, project?.domain, filters.llms]);
 
   const getFilteredDomainStats = () => {
     const domainStats = filteredCitations.reduce((acc, citation) => {
@@ -5593,23 +5703,6 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                     counts.set(cat, (counts.get(cat) || 0) + 1);
                   });
                   const totalCited = Array.from(counts.values()).reduce((a, b) => a + b, 0);
-                  const CATEGORY_CHART_COLORS: Record<string, string> = {
-                    'Own Brand': 'rgb(var(--brand-primary))',
-                    Competitor: '#f43f5e',
-                    Corporate: '#3b82f6',
-                    'News/Media': '#a855f7',
-                    'Review/Comparison': '#f59e0b',
-                    'Marketplace/Retail': '#f97316',
-                    'Social Media': '#ec4899',
-                    'Community/Forum': '#14b8a6',
-                    Video: '#ef4444',
-                    'Encyclopedia/Reference': '#6366f1',
-                    Education: '#06b6d4',
-                    'Government/NGO': '#10b981',
-                    'Blogs/Personal': '#84cc16',
-                    Other: '#9ca3af',
-                    Unknown: '#d1d5db',
-                  };
                   const pieData = Array.from(counts.entries())
                     .map(([name, value]) => ({
                       name,
@@ -6218,8 +6311,23 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
 
           {activeTab === 'domains' && (
             <div>
-              <div className="flex items-center justify-between mb-4">
-                <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100">Domain Performance</h3>
+              <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
+                <div className="inline-flex items-center rounded-xl bg-gray-100 dark:bg-gray-800 p-1">
+                  {([['performance', 'Domains Performance'], ['insights', 'Domains Insights']] as const).map(([key, label]) => (
+                    <button
+                      key={key}
+                      onClick={() => setDomainsView(key)}
+                      className={`px-4 py-1.5 rounded-lg text-sm font-medium transition-colors ${
+                        domainsView === key
+                          ? 'bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 shadow-sm'
+                          : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200'
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                {domainsView === 'performance' && (
                 <div className="flex items-center gap-3">
                   <select
                     value={domainCategoryFilter}
@@ -6242,7 +6350,9 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                     Export to Excel
                   </button>
                 </div>
+                )}
               </div>
+              {domainsView === 'performance' && (
               <div className="overflow-x-auto">
                 <table className="w-full text-sm">
                   <thead>
@@ -6411,6 +6521,163 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                   </tbody>
                 </table>
               </div>
+              )}
+
+              {domainsView === 'insights' && !domainsInsights && (
+                <div className="flex items-center justify-center h-48 text-gray-500 dark:text-gray-400 text-sm">
+                  Need at least two completed audits with data to build insights
+                </div>
+              )}
+              {domainsView === 'insights' && domainsInsights && (
+                <div className="space-y-6">
+                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                    {([
+                      { title: 'Movers', desc: 'Biggest citing-share gains vs the previous audit', rows: domainsInsights.movers, up: true },
+                      { title: 'Shakers', desc: 'Biggest citing-share losses vs the previous audit', rows: domainsInsights.shakers, up: false },
+                    ] as const).map(sec => (
+                      <div key={sec.title} className="bg-white dark:bg-gray-800 rounded-2xl border border-gray-200 dark:border-gray-700 p-6">
+                        <div className="flex items-center gap-2 mb-1">
+                          {sec.up
+                            ? <TrendingUp className="w-4 h-4 text-emerald-500" />
+                            : <TrendingDown className="w-4 h-4 text-red-500" />}
+                          <h4 className="text-sm font-semibold text-gray-900 dark:text-gray-100">{sec.title}</h4>
+                        </div>
+                        <p className="text-xs text-gray-500 dark:text-gray-400 mb-4">{sec.desc}</p>
+                        {sec.rows.length === 0 ? (
+                          <p className="text-sm text-gray-400 dark:text-gray-500 py-8 text-center">No significant moves</p>
+                        ) : (
+                          <div className="space-y-2.5">
+                            {sec.rows.map(r => (
+                              <div key={r.domain} className="flex items-center gap-2.5 min-w-0">
+                                <img
+                                  src={`https://www.google.com/s2/favicons?domain=${r.domain}&sz=32`}
+                                  alt=""
+                                  className="w-4 h-4 flex-shrink-0"
+                                  onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
+                                />
+                                <button
+                                  onClick={() => navigate(`/projects/${project.id}/domains/${encodeURIComponent(r.domain)}`)}
+                                  className="text-sm font-medium text-brand-primary hover:underline truncate"
+                                >
+                                  {r.domain}
+                                </button>
+                                <span className={`${categoryChipClass(r.category)} hidden sm:inline-flex flex-shrink-0`}>
+                                  {r.category}
+                                </span>
+                                <span className="ml-auto inline-flex items-center gap-1.5 flex-shrink-0">
+                                  <Sparkline series={r.series} />
+                                  <TrendChip trend={r.trend} />
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                    <div className="bg-white dark:bg-gray-800 rounded-2xl border border-gray-200 dark:border-gray-700 p-6">
+                      <h4 className="text-sm font-semibold text-gray-900 dark:text-gray-100 mb-1">Domain categories distribution</h4>
+                      <p className="text-xs text-gray-500 dark:text-gray-400 mb-4">Cited sources by category, current filters</p>
+                      {domainsInsights.totalCited === 0 ? (
+                        <p className="text-sm text-gray-400 dark:text-gray-500 py-8 text-center">No citation data</p>
+                      ) : (
+                        <>
+                          <div className="h-64">
+                            <ResponsiveContainer width="100%" height="100%">
+                              <PieChart>
+                                <Pie
+                                  data={domainsInsights.pie}
+                                  cx="50%"
+                                  cy="50%"
+                                  labelLine={false}
+                                  innerRadius={55}
+                                  outerRadius={90}
+                                  dataKey="value"
+                                  paddingAngle={2}
+                                  cornerRadius={6}
+                                >
+                                  {domainsInsights.pie.map(entry => (
+                                    <Cell
+                                      key={entry.name}
+                                      fill={CATEGORY_CHART_COLORS[entry.name] || '#9ca3af'}
+                                      stroke="rgb(var(--bg-surface))"
+                                      strokeWidth={2}
+                                    />
+                                  ))}
+                                </Pie>
+                                <Tooltip
+                                  contentStyle={{
+                                    backgroundColor: 'rgb(var(--bg-surface))',
+                                    border: '1px solid rgb(var(--border))',
+                                    borderRadius: '12px',
+                                    boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)',
+                                    fontFamily: 'Plus Jakarta Sans'
+                                  }}
+                                  formatter={(value: any, name: string, props: any) => [
+                                    `${value} (${props.payload.percentage}%)`,
+                                    name
+                                  ]}
+                                />
+                              </PieChart>
+                            </ResponsiveContainer>
+                          </div>
+                          <div className="mt-3 flex flex-wrap gap-x-3 gap-y-1.5">
+                            {domainsInsights.pie.slice(0, 8).map(entry => (
+                              <span key={entry.name} className="inline-flex items-center gap-1.5 text-xs text-gray-700 dark:text-gray-300">
+                                <span
+                                  className="w-2.5 h-2.5 rounded-full inline-block flex-shrink-0"
+                                  style={{ backgroundColor: CATEGORY_CHART_COLORS[entry.name] || '#9ca3af' }}
+                                />
+                                {entry.name} · {entry.percentage}%
+                              </span>
+                            ))}
+                            {domainsInsights.pie.length > 8 && (
+                              <span className="text-xs text-gray-400 dark:text-gray-500">+{domainsInsights.pie.length - 8} more</span>
+                            )}
+                          </div>
+                        </>
+                      )}
+                    </div>
+
+                    <div className="bg-white dark:bg-gray-800 rounded-2xl border border-gray-200 dark:border-gray-700 p-6">
+                      <h4 className="text-sm font-semibold text-gray-900 dark:text-gray-100 mb-1">Categories dynamics</h4>
+                      <p className="text-xs text-gray-500 dark:text-gray-400 mb-4">Share of answers citing each category, per audit</p>
+                      <div className="h-72">
+                        <ResponsiveContainer width="100%" height="100%">
+                          <LineChart data={domainsInsights.dynamics} margin={{ top: 5, right: 10, left: -10, bottom: 0 }}>
+                            <CartesianGrid strokeDasharray="3 3" stroke="rgb(var(--border))" />
+                            <XAxis dataKey="date" tick={{ fontSize: 11 }} stroke="rgb(var(--text-secondary))" />
+                            <YAxis tick={{ fontSize: 11 }} unit="%" stroke="rgb(var(--text-secondary))" />
+                            <Tooltip
+                              contentStyle={{
+                                backgroundColor: 'rgb(var(--bg-surface))',
+                                border: '1px solid rgb(var(--border))',
+                                borderRadius: '12px',
+                                boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)',
+                                fontFamily: 'Plus Jakarta Sans'
+                              }}
+                              formatter={(value: any, name: string) => [`${value}%`, name]}
+                            />
+                            <Legend wrapperStyle={{ fontSize: 11 }} />
+                            {domainsInsights.topCats.map(cat => (
+                              <Line
+                                key={cat}
+                                type="monotone"
+                                dataKey={cat}
+                                stroke={CATEGORY_CHART_COLORS[cat] || '#9ca3af'}
+                                strokeWidth={2}
+                                dot={false}
+                              />
+                            ))}
+                          </LineChart>
+                        </ResponsiveContainer>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
