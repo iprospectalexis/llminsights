@@ -3328,6 +3328,77 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [filteredCitations, auditTrendIndex, domainCategoryMap, brands, competitors, project?.domain, filters.llms]);
 
+  // Movers/Shakers horizon. 'last' compares against the previous audit from
+  // client-side data; the day modes need a baseline far outside the loaded
+  // 5-audit window, so they fetch two compared audits per domain from the
+  // project_domain_movers RPC (cached per period+filters).
+  const [moversPeriod, setMoversPeriod] = useState<'last' | '7' | '14' | '30' | '90'>('last');
+  const [moversRemote, setMoversRemote] = useState<{ key: string; rows: any[] } | null>(null);
+  const [moversLoading, setMoversLoading] = useState(false);
+
+  const moversKey = `${moversPeriod}|${filters.llms}|${promptGroupsKey}`;
+  useEffect(() => {
+    if (moversPeriod === 'last' || !id) return;
+    if (activeTab !== 'domains' || domainsView !== 'insights') return;
+    if (moversRemote?.key === moversKey) return;
+    let cancelled = false;
+    (async () => {
+      setMoversLoading(true);
+      const { data, error } = await supabase.rpc('project_domain_movers', {
+        p_project_id: id,
+        p_llm: filters.llms !== 'all' ? filters.llms : null,
+        p_groups: filters.promptGroups.length > 0 ? filters.promptGroups : null,
+        p_days: Number(moversPeriod),
+      });
+      if (cancelled) return;
+      if (error) {
+        console.error('project_domain_movers RPC:', error);
+        setMoversRemote({ key: moversKey, rows: [] });
+      } else {
+        setMoversRemote({ key: moversKey, rows: data || [] });
+      }
+      setMoversLoading(false);
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [moversPeriod, id, activeTab, domainsView, moversKey]);
+
+  // The rows both cards render for the active period. Null = still loading.
+  const activeMovers = useMemo(() => {
+    if (moversPeriod === 'last') {
+      return domainsInsights
+        ? { movers: domainsInsights.movers, shakers: domainsInsights.shakers }
+        : { movers: [], shakers: [] };
+    }
+    if (!moversRemote || moversRemote.key !== moversKey || moversLoading) return null;
+    const ranked: any[] = [];
+    moversRemote.rows.forEach((r: any) => {
+      const trend: TrendData = {
+        lastCount: Number(r.last_count) || 0,
+        lastTotal: Number(r.last_total) || 0,
+        prevCount: Number(r.prev_count) || 0,
+        prevTotal: Number(r.prev_total) || 0,
+        lastDate: r.last_date,
+        prevDate: r.prev_date,
+      };
+      // Same noise gate as the 'last' mode.
+      if (Math.max(trend.lastCount, trend.prevCount) < 2) return;
+      ranked.push({
+        domain: r.domain,
+        category: getDomainDisplayCategory(r.domain),
+        trend,
+        series: auditTrendIndex.ready ? auditTrendIndex.domainSeries(r.domain) : null,
+        delta: trendDelta(trend),
+      });
+    });
+    return {
+      movers: ranked.filter(r => r.delta > 0.5).sort((x, y) => y.delta - x.delta).slice(0, 8),
+      shakers: ranked.filter(r => r.delta < -0.5).sort((x, y) => x.delta - y.delta).slice(0, 8),
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [moversPeriod, moversKey, moversRemote, moversLoading, domainsInsights,
+      auditTrendIndex, domainCategoryMap, brands, competitors, project?.domain]);
+
   const getFilteredDomainStats = () => {
     const domainStats = filteredCitations.reduce((acc, citation) => {
       if (!citation.domain) return acc;
@@ -6532,22 +6603,47 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                 <div className="space-y-6">
                   <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
                     {([
-                      { title: 'Movers', desc: 'Biggest citing-share gains vs the previous audit', rows: domainsInsights.movers, up: true },
-                      { title: 'Shakers', desc: 'Biggest citing-share losses vs the previous audit', rows: domainsInsights.shakers, up: false },
-                    ] as const).map(sec => (
+                      { title: 'Movers', desc: 'Biggest citing-share gains', up: true },
+                      { title: 'Shakers', desc: 'Biggest citing-share losses', up: false },
+                    ] as const).map(sec => {
+                      const rows = activeMovers ? (sec.up ? activeMovers.movers : activeMovers.shakers) : null;
+                      return (
                       <div key={sec.title} className="bg-white dark:bg-gray-800 rounded-2xl border border-gray-200 dark:border-gray-700 p-6">
-                        <div className="flex items-center gap-2 mb-1">
-                          {sec.up
-                            ? <TrendingUp className="w-4 h-4 text-emerald-500" />
-                            : <TrendingDown className="w-4 h-4 text-red-500" />}
-                          <h4 className="text-sm font-semibold text-gray-900 dark:text-gray-100">{sec.title}</h4>
+                        <div className="flex items-center justify-between gap-2 mb-1 flex-wrap">
+                          <div className="flex items-center gap-2">
+                            {sec.up
+                              ? <TrendingUp className="w-4 h-4 text-emerald-500" />
+                              : <TrendingDown className="w-4 h-4 text-red-500" />}
+                            <h4 className="text-sm font-semibold text-gray-900 dark:text-gray-100">{sec.title}</h4>
+                          </div>
+                          <div className="inline-flex items-center rounded-lg bg-gray-100 dark:bg-gray-900/60 p-0.5">
+                            {(['last', '7', '14', '30', '90'] as const).map(pp => (
+                              <button
+                                key={pp}
+                                onClick={() => setMoversPeriod(pp)}
+                                className={`px-2 py-0.5 rounded-md text-[11px] font-medium transition-colors ${
+                                  moversPeriod === pp
+                                    ? 'bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 shadow-sm'
+                                    : 'text-gray-500 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200'
+                                }`}
+                              >
+                                {pp === 'last' ? 'Last' : `${pp}d`}
+                              </button>
+                            ))}
+                          </div>
                         </div>
-                        <p className="text-xs text-gray-500 dark:text-gray-400 mb-4">{sec.desc}</p>
-                        {sec.rows.length === 0 ? (
+                        <p className="text-xs text-gray-500 dark:text-gray-400 mb-4">
+                          {sec.desc} vs {moversPeriod === 'last'
+                            ? 'the previous audit'
+                            : `the audit ~${moversPeriod} days before the last one`}
+                        </p>
+                        {rows === null ? (
+                          <p className="text-sm text-gray-400 dark:text-gray-500 py-8 text-center">Loading…</p>
+                        ) : rows.length === 0 ? (
                           <p className="text-sm text-gray-400 dark:text-gray-500 py-8 text-center">No significant moves</p>
                         ) : (
                           <div className="space-y-2.5">
-                            {sec.rows.map(r => (
+                            {rows.map((r: any) => (
                               <div key={r.domain} className="flex items-center gap-2.5 min-w-0">
                                 <img
                                   src={`https://www.google.com/s2/favicons?domain=${r.domain}&sz=32`}
@@ -6573,7 +6669,8 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                           </div>
                         )}
                       </div>
-                    ))}
+                      );
+                    })}
                   </div>
 
                   <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
