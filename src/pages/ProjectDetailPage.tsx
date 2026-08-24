@@ -3261,6 +3261,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
 
     const catOf = new Map<string, string>();
     const domains = new Set<string>();
+    const pageMeta = new Map<string, { domain: string; sampleUrl: string; title: string | null }>();
     const catCounts = new Map<string, number>();
     const catResp = new Map<string, Map<string, Set<string>>>();
 
@@ -3276,6 +3277,17 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
         let set = per.get(c.audit_id);
         if (!set) { set = new Set(); per.set(c.audit_id, set); }
         set.add(c.audit_id + '-' + c.prompt_id + '-' + c.llm);
+      }
+      if (c.page_url) {
+        const u = normalizeUrl(c.page_url);
+        let m = pageMeta.get(u);
+        if (!m) { m = { domain: c.domain, sampleUrl: c.page_url, title: null }; pageMeta.set(u, m); }
+        if (!m.title) {
+          const t = c.citation_text;
+          if (t && t !== 'No description available' && t !== 'No description' && !/^https?:\/\//i.test(t)) {
+            m.title = t;
+          }
+        }
       }
     });
 
@@ -3297,6 +3309,25 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     });
     const movers = ranked.filter(r => r.delta > 0.5).sort((a, b) => b.delta - a.delta).slice(0, 8);
     const shakers = ranked.filter(r => r.delta < -0.5).sort((a, b) => a.delta - b.delta).slice(0, 8);
+
+    // Pages Movers/Shakers, same rules keyed by normalized URL.
+    const pageRanked: any[] = [];
+    pageMeta.forEach((meta, u) => {
+      const trend = auditTrendIndex.pageTrend(u);
+      if (!trend || Math.max(trend.lastCount, trend.prevCount) < 2) return;
+      pageRanked.push({
+        url: u,
+        sampleUrl: meta.sampleUrl,
+        title: meta.title,
+        domain: meta.domain,
+        category: catOf.get(meta.domain) || getDomainDisplayCategory(meta.domain),
+        trend,
+        series: auditTrendIndex.pageSeries(u),
+        delta: trendDelta(trend),
+      });
+    });
+    const pageMovers = pageRanked.filter(r => r.delta > 0.5).sort((x, y) => y.delta - x.delta).slice(0, 8);
+    const pageShakers = pageRanked.filter(r => r.delta < -0.5).sort((x, y) => x.delta - y.delta).slice(0, 8);
 
     const totalCited = Array.from(catCounts.values()).reduce((x, y) => x + y, 0);
     const pie = Array.from(catCounts.entries())
@@ -3324,7 +3355,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
       return point;
     });
 
-    return { movers, shakers, pie, totalCited, topCats, dynamics };
+    return { movers, shakers, pageMovers, pageShakers, pie, totalCited, topCats, dynamics };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [filteredCitations, auditTrendIndex, domainCategoryMap, brands, competitors, project?.domain, filters.llms]);
 
@@ -3397,6 +3428,77 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [moversPeriod, moversKey, moversRemote, moversLoading, domainsInsights,
+      auditTrendIndex, domainCategoryMap, brands, competitors, project?.domain]);
+
+  // Pages tab: Performance / Insights sub-view, and the Movers/Shakers
+  // horizon for pages (same mechanics as domains, RPC project_page_movers).
+  const [pagesView, setPagesView] = useState<'performance' | 'insights'>('performance');
+  const [pagesMoversPeriod, setPagesMoversPeriod] = useState<'last' | '7' | '14' | '30' | '90'>('last');
+  const [pagesMoversRemote, setPagesMoversRemote] = useState<{ key: string; rows: any[] } | null>(null);
+  const [pagesMoversLoading, setPagesMoversLoading] = useState(false);
+
+  const pagesMoversKey = `${pagesMoversPeriod}|${filters.llms}|${promptGroupsKey}`;
+  useEffect(() => {
+    if (pagesMoversPeriod === 'last' || !id) return;
+    if (activeTab !== 'pages' || pagesView !== 'insights') return;
+    if (pagesMoversRemote?.key === pagesMoversKey) return;
+    let cancelled = false;
+    (async () => {
+      setPagesMoversLoading(true);
+      const { data, error } = await supabase.rpc('project_page_movers', {
+        p_project_id: id,
+        p_llm: filters.llms !== 'all' ? filters.llms : null,
+        p_groups: filters.promptGroups.length > 0 ? filters.promptGroups : null,
+        p_days: Number(pagesMoversPeriod),
+      });
+      if (cancelled) return;
+      if (error) {
+        console.error('project_page_movers RPC:', error);
+        setPagesMoversRemote({ key: pagesMoversKey, rows: [] });
+      } else {
+        setPagesMoversRemote({ key: pagesMoversKey, rows: data || [] });
+      }
+      setPagesMoversLoading(false);
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pagesMoversPeriod, id, activeTab, pagesView, pagesMoversKey]);
+
+  const activePageMovers = useMemo(() => {
+    if (pagesMoversPeriod === 'last') {
+      return domainsInsights
+        ? { movers: domainsInsights.pageMovers, shakers: domainsInsights.pageShakers }
+        : { movers: [], shakers: [] };
+    }
+    if (!pagesMoversRemote || pagesMoversRemote.key !== pagesMoversKey || pagesMoversLoading) return null;
+    const ranked: any[] = [];
+    pagesMoversRemote.rows.forEach((r: any) => {
+      const trend: TrendData = {
+        lastCount: Number(r.last_count) || 0,
+        lastTotal: Number(r.last_total) || 0,
+        prevCount: Number(r.prev_count) || 0,
+        prevTotal: Number(r.prev_total) || 0,
+        lastDate: r.last_date,
+        prevDate: r.prev_date,
+      };
+      if (Math.max(trend.lastCount, trend.prevCount) < 2) return;
+      ranked.push({
+        url: r.page_url,
+        sampleUrl: r.sample_url || `https://${r.page_url}`,
+        title: r.title || null,
+        domain: r.domain,
+        category: getDomainDisplayCategory(r.domain),
+        trend,
+        series: auditTrendIndex.ready ? auditTrendIndex.pageSeries(r.page_url) : null,
+        delta: trendDelta(trend),
+      });
+    });
+    return {
+      movers: ranked.filter(r => r.delta > 0.5).sort((x, y) => y.delta - x.delta).slice(0, 8),
+      shakers: ranked.filter(r => r.delta < -0.5).sort((x, y) => x.delta - y.delta).slice(0, 8),
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pagesMoversPeriod, pagesMoversKey, pagesMoversRemote, pagesMoversLoading, domainsInsights,
       auditTrendIndex, domainCategoryMap, brands, competitors, project?.domain]);
 
   const getFilteredDomainStats = () => {
@@ -6176,8 +6278,23 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
 
           {activeTab === 'pages' && (
             <div>
-              <div className="flex items-center justify-between mb-4">
-                <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100">Page Citations</h3>
+              <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
+                <div className="inline-flex items-center rounded-xl bg-gray-100 dark:bg-gray-800 p-1">
+                  {([['performance', 'Pages Performance'], ['insights', 'Pages Insights']] as const).map(([key, label]) => (
+                    <button
+                      key={key}
+                      onClick={() => setPagesView(key)}
+                      className={`px-4 py-1.5 rounded-lg text-sm font-medium transition-colors ${
+                        pagesView === key
+                          ? 'bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 shadow-sm'
+                          : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200'
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                {pagesView === 'performance' && (
                 <button
                   onClick={exportPagesToExcel}
                   className="inline-flex items-center gap-2 px-3 py-2 bg-brand-primary hover:bg-brand-primary/90 text-white rounded-lg transition-colors text-sm"
@@ -6185,7 +6302,9 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                   <Download className="w-4 h-4" />
                   Export to Excel
                 </button>
+                )}
               </div>
+              {pagesView === 'performance' && (
               <div className="overflow-x-auto">
                 <table className="w-full text-sm">
                   <thead>
@@ -6377,6 +6496,96 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                   </tbody>
                 </table>
               </div>
+              )}
+
+              {pagesView === 'insights' && !auditTrendIndex.ready && (
+                <div className="flex items-center justify-center h-48 text-gray-500 dark:text-gray-400 text-sm">
+                  Need at least two completed audits with data to build insights
+                </div>
+              )}
+              {pagesView === 'insights' && auditTrendIndex.ready && (
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                  {([
+                    { title: 'Movers', desc: 'Biggest citing-share gains', up: true },
+                    { title: 'Shakers', desc: 'Biggest citing-share losses', up: false },
+                  ] as const).map(sec => {
+                    const rows = activePageMovers ? (sec.up ? activePageMovers.movers : activePageMovers.shakers) : null;
+                    return (
+                    <div key={sec.title} className="bg-white dark:bg-gray-800 rounded-2xl border border-gray-200 dark:border-gray-700 p-6">
+                      <div className="flex items-center justify-between gap-2 mb-1 flex-wrap">
+                        <div className="flex items-center gap-2">
+                          {sec.up
+                            ? <TrendingUp className="w-4 h-4 text-emerald-500" />
+                            : <TrendingDown className="w-4 h-4 text-red-500" />}
+                          <h4 className="text-sm font-semibold text-gray-900 dark:text-gray-100">{sec.title}</h4>
+                        </div>
+                        <div className="inline-flex items-center rounded-lg bg-gray-100 dark:bg-gray-900/60 p-0.5">
+                          {(['last', '7', '14', '30', '90'] as const).map(pp => (
+                            <button
+                              key={pp}
+                              onClick={() => setPagesMoversPeriod(pp)}
+                              className={`px-2 py-0.5 rounded-md text-[11px] font-medium transition-colors ${
+                                pagesMoversPeriod === pp
+                                  ? 'bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 shadow-sm'
+                                  : 'text-gray-500 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200'
+                              }`}
+                            >
+                              {pp === 'last' ? 'Last' : `${pp}d`}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                      <p className="text-xs text-gray-500 dark:text-gray-400 mb-4">
+                        {sec.desc} vs {pagesMoversPeriod === 'last'
+                          ? 'the previous audit'
+                          : `the audit ~${pagesMoversPeriod} days before the last one`}
+                      </p>
+                      {rows === null ? (
+                        <p className="text-sm text-gray-400 dark:text-gray-500 py-8 text-center">Loading…</p>
+                      ) : rows.length === 0 ? (
+                        <p className="text-sm text-gray-400 dark:text-gray-500 py-8 text-center">No significant moves</p>
+                      ) : (
+                        <div className="space-y-2.5">
+                          {rows.map((r: any) => (
+                            <div key={r.url} className="flex items-center gap-2.5 min-w-0">
+                              <img
+                                src={`https://www.google.com/s2/favicons?domain=${r.domain}&sz=32`}
+                                alt=""
+                                className="w-4 h-4 flex-shrink-0"
+                                onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
+                              />
+                              <div className="min-w-0 flex-1">
+                                {r.title && (
+                                  <div className="text-xs font-medium text-gray-900 dark:text-gray-100 truncate" title={r.title}>
+                                    {r.title}
+                                  </div>
+                                )}
+                                <a
+                                  href={r.sampleUrl}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  title={r.sampleUrl}
+                                  className="block text-xs text-brand-primary hover:underline truncate"
+                                >
+                                  {r.url}
+                                </a>
+                              </div>
+                              <span className={`${categoryChipClass(r.category)} hidden xl:inline-flex flex-shrink-0`}>
+                                {r.category}
+                              </span>
+                              <span className="inline-flex items-center gap-1.5 flex-shrink-0">
+                                <Sparkline series={r.series} />
+                                <TrendChip trend={r.trend} />
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           )}
 
