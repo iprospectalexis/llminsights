@@ -36,6 +36,7 @@ interface DomainCitation {
   total_citations: number;
   first_seen: string;
   last_seen: string;
+  prev_total_citations: number | null;
   category: string;
 }
 
@@ -47,9 +48,10 @@ interface PaginationInfo {
 }
 
 const DATE_FRAMES = [
-  { id: 'all', label: 'All time' },
+  { id: '14', label: 'Last 14 days' },
   { id: '30', label: 'Last 30 days' },
   { id: '90', label: 'Last 90 days' },
+  { id: 'all', label: 'All time' },
 ] as const;
 
 type DateFrame = (typeof DATE_FRAMES)[number]['id'];
@@ -61,6 +63,8 @@ export function TopSourcesPage() {
   // Default to 30 days: the all-time aggregate is heavy and rarely the question.
   const [dateFrame, setDateFrame] = useState<DateFrame>('30');
   const [categoryFilter, setCategoryFilter] = useState<string>('all');
+  const [countryFilter, setCountryFilter] = useState<string>('all');
+  const [countries, setCountries] = useState<string[]>([]);
   const [domainSearch, setDomainSearch] = useState('');
   const [sortBy, setSortBy] = useState<'cited_count' | 'more_count' | 'total_citations'>('total_citations');
   const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('desc');
@@ -71,13 +75,22 @@ export function TopSourcesPage() {
     totalPages: 0,
   });
 
+  // Country options come from project settings (RLS-scoped).
+  useEffect(() => {
+    (async () => {
+      const { data } = await supabase.from('projects').select('country').not('country', 'is', null);
+      const set = new Set<string>((data || []).map((r: any) => String(r.country)).filter(Boolean));
+      setCountries(Array.from(set).sort());
+    })();
+  }, []);
+
   useEffect(() => {
     const timeoutId = setTimeout(() => {
       fetchDomainCitations();
     }, 300);
 
     return () => clearTimeout(timeoutId);
-  }, [selectedLLM, dateFrame, categoryFilter, domainSearch, sortBy, sortOrder, pagination.page]);
+  }, [selectedLLM, dateFrame, categoryFilter, countryFilter, domainSearch, sortBy, sortOrder, pagination.page]);
 
   const fetchDomainCitations = async () => {
     setDomainLoading(true);
@@ -98,6 +111,7 @@ export function TopSourcesPage() {
         p_limit: pagination.pageSize,
         p_offset: (pagination.page - 1) * pagination.pageSize,
         p_category: categoryFilter !== 'all' ? categoryFilter : null,
+        p_country: countryFilter !== 'all' ? countryFilter : null,
       });
 
       if (error) {
@@ -114,6 +128,7 @@ export function TopSourcesPage() {
         total_citations: Number(r.total_citations),
         first_seen: r.first_seen,
         last_seen: r.last_seen,
+        prev_total_citations: r.prev_total_citations == null ? null : Number(r.prev_total_citations),
         category: r.category || 'Unknown',
       })));
 
@@ -242,6 +257,26 @@ export function TopSourcesPage() {
                   </div>
                 </div>
 
+                {/* Country */}
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+                    Country
+                  </label>
+                  <select
+                    value={countryFilter}
+                    onChange={(e) => {
+                      setCountryFilter(e.target.value);
+                      setPagination(prev => ({ ...prev, page: 1 }));
+                    }}
+                    className="px-3 py-2 rounded-lg text-sm font-medium bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-300 border border-gray-300 dark:border-gray-600 focus:outline-none focus:ring-2 focus:ring-brand-primary"
+                  >
+                    <option value="all">All countries</option>
+                    {countries.map(c => (
+                      <option key={c} value={c}>{c}</option>
+                    ))}
+                  </select>
+                </div>
+
                 {/* Category */}
                 <div>
                   <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
@@ -353,6 +388,14 @@ export function TopSourcesPage() {
                               <ArrowUpDown className="w-3 h-3" />
                             </div>
                           </th>
+                          {dateFrame !== 'all' && (
+                            <th
+                              className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider"
+                              title={`Total citations vs the previous ${dateFrame} days`}
+                            >
+                              Trend
+                            </th>
+                          )}
                         </tr>
                       </thead>
                       <tbody className="bg-white dark:bg-gray-900 divide-y divide-gray-200 dark:divide-gray-700">
@@ -403,6 +446,35 @@ export function TopSourcesPage() {
                             <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900 dark:text-white font-semibold">
                               {citation.total_citations}
                             </td>
+                            {dateFrame !== 'all' && (
+                              <td className="px-6 py-4 whitespace-nowrap text-sm">
+                                {(() => {
+                                  const prev = citation.prev_total_citations;
+                                  const cur = citation.total_citations;
+                                  if (prev == null) return null;
+                                  const base = 'inline-flex items-center gap-0.5 px-2 py-0.5 rounded-full text-xs font-medium cursor-help';
+                                  const title = `Previous ${dateFrame} days: ${prev} \u2192 current: ${cur}`;
+                                  if (prev === 0 && cur > 0) {
+                                    return <span title={title} className={`${base} bg-violet-100 text-violet-700 dark:bg-violet-900/40 dark:text-violet-300`}>NEW</span>;
+                                  }
+                                  const delta = prev > 0 ? Math.round(((cur - prev) / prev) * 100) : 0;
+                                  if (Math.abs(delta) < 5) {
+                                    return <span title={title} className={`${base} bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400`}>{'\u2013'}</span>;
+                                  }
+                                  const up = delta > 0;
+                                  return (
+                                    <span
+                                      title={title}
+                                      className={`${base} ${up
+                                        ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300'
+                                        : 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300'}`}
+                                    >
+                                      {up ? '\u25b2 +' : '\u25bc '}{delta}%
+                                    </span>
+                                  );
+                                })()}
+                              </td>
+                            )}
                           </tr>
                         ))}
                       </tbody>
