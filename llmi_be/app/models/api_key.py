@@ -28,6 +28,7 @@ class ApiKey(Base):
     key_hash = Column(String(64), unique=True, nullable=False, index=True)
     key_prefix = Column(String(12), nullable=False)  # First 12 chars for identification
     name = Column(String(100), nullable=False)  # Partner/key name
+    description = Column(String(500), nullable=True)  # Optional free-text note
 
     # Access control
     is_active = Column(Boolean, default=True, nullable=False)
