@@ -30,7 +30,7 @@ Two REST surfaces live here:
 
 | Surface | Prefix | Auth | Purpose |
 |---|---|---|---|
-| **Audits** | `/api/v1/audits` | *(none today — see Security)* | Trigger & drive brand-visibility audits |
+| **Audits** | `/api/v1/audits` | Supabase session (Bearer) or master `X-API-Key` | Trigger & drive brand-visibility audits |
 | **Jobs** | `/api/v1/jobs` | `X-API-Key` | Partner SERP/LLM batch collection gateway |
 | **API keys** | `/api/v1/api-keys` | `X-API-Key` (admin) | Manage partner keys |
 | **SERP** | `/api/v1/serp` | mixed (token / IP allowlist) | Lead capture, preview, usage |
@@ -74,8 +74,10 @@ curl -H "X-API-Key: <key>" https://app.llm-insights.com/api/v1/jobs
   `max_prompts_per_job` and usage counters. Missing key → **401**, invalid →
   **403**, inactive/expired → **403**.
 
-> ⚠️ The **audits** surface currently has **no** auth dependency. See
-> [API_REFERENCE.md#security](API_REFERENCE.md#security-open-items).
+The **audits** surface authenticates differently: the browser sends the
+signed-in user's Supabase session (`Authorization: Bearer <access_token>`),
+which the backend validates against Supabase Auth; the master `X-API-Key`
+also works (ops). `AUDITS_AUTH_REQUIRED=0` is the emergency off switch.
 
 ---
 

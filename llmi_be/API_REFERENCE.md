@@ -14,7 +14,16 @@ ISO-8601 UTC.
 
 ## 1. REST — Audits `/api/v1/audits`
 
-> No auth dependency today (see [Security](#security-open-items)).
+**Auth (since 2026-08-25):** every audits endpoint requires ONE of:
+
+- `Authorization: Bearer <supabase access_token>` — the signed-in user's
+  session; the backend validates it against Supabase Auth (`GET /auth/v1/user`)
+  and caches positives for 60s. This is what the frontend sends automatically.
+- `X-API-Key: <master key>` — ops scripts and monitoring.
+
+Missing/invalid credentials → **401**; Supabase Auth unreachable → **503**
+(fail closed). Escape hatch: `AUDITS_AUTH_REQUIRED=0` in the environment
+disables enforcement without a redeploy.
 
 ### POST `/audits/run` — start an audit
 Body **RunAuditRequest**:
@@ -76,6 +85,12 @@ Scheduler liveness / last tick.
 
 The partner-facing SERP/LLM collection gateway.
 
+**Partner base URLs:** canonical `https://app.llm-insights.com/api/v1` (TLS).
+The legacy standalone service that lived on `http://<vps>:8000` was retired on
+2026-08-25; that port is now a Caddy compatibility listener proxying to this
+same backend — existing partner keys and the webhook secret carried over
+unchanged (smalk_ai migrated this way with zero action on their side).
+
 ### POST `/jobs` — create
 Body **JobCreate**:
 
@@ -121,6 +136,12 @@ Job lifecycle: `pending → getting_results → processing_results → completed
 | DELETE | `/api-keys/{id}` | delete |
 | POST | `/api-keys/{id}/activate` · `/deactivate` | toggle |
 | GET | `/api-keys/{id}/usage` | totals; per-day fields are `null` (not tracked), never a fake 0 |
+
+> **Known limitation:** `POST /api-keys` currently 500s against the prod
+> table — `group_id` and `created_by` are NOT NULL there (the table is owned
+> by the frontend key-management flow) and the REST create does not populate
+> them. Create keys through the frontend, or by SQL following
+> `llmi_be/migrate_smalk_key.py`. Read/list/update/usage endpoints work.
 
 ---
 
@@ -175,27 +196,25 @@ orphaned.
 
 ---
 
-## Security — open items
+## Security — resolved & open items
 
-These are known and **not yet fixed** (need a decision / larger change):
+**Resolved 2026-08-25:**
 
-1. **Audits surface is unauthenticated.** `/api/v1/audits/*` — including
-   `POST /audits/run` (spends provider credits, ×3 with `avalanche`) — has no
-   auth dependency and is reachable at `https://app.llm-insights.com`. The
-   browser calls it without a key, so adding `X-API-Key` would break the UI.
-   Recommended fix: verify the caller's Supabase session — either add
-   `SUPABASE_JWT_SECRET` to the backend and validate the JWT, or introspect the
-   bearer token via Supabase Auth (`GET /auth/v1/user`) — and have the frontend
-   attach its access token. Until then, a valid `projectId` UUID is the only
-   thing gating a credit-spending call.
-2. **Manual `/audits/{id}/poll`** runs `process_step` outside the scheduler's
+- ~~Audits surface unauthenticated~~ — now requires a Supabase session or the
+  master key (see section 1). Verified externally: `POST /audits/run` without
+  credentials returns 401.
+- ~~Stale host uvicorn on VPS `:8000`~~ — the legacy standalone backend
+  (`llmi-backend.service`, `/root/llmi_backend`) is stopped and disabled; its
+  port now proxies to the containerized backend. Its 56 GB SQLite is kept as
+  an archive pending deletion.
+
+**Still open:**
+
+1. **Manual `/audits/{id}/poll`** runs `process_step` outside the scheduler's
    CAS lock/in-flight guard; a manual poll can race a scheduler tick on the
    same audit.
-3. **No stalled-job recovery** for the `jobs` table (only audits are recovered
+2. **No stalled-job recovery** for the `jobs` table (only audits are recovered
    on startup); a crash can strand a job in `getting_results`/`processing_results`.
-4. **`WORKER_ENABLED=0` is not enforced on `POST /jobs`** — an API-only
+3. **`WORKER_ENABLED=0` is not enforced on `POST /jobs`** — an API-only
    instance still processes a job POSTed directly to it.
-
-A stale zombie uvicorn (`/root/llmi_backend`, pre-Docker) also listens on the
-VPS host `:8000` and is internet-reachable; it should be stopped and its port
-closed.
+4. **`POST /api-keys` broken against the prod table** (see section 3 note).
