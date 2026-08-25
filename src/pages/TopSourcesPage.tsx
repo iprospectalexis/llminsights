@@ -18,15 +18,8 @@ const LLM_NAMES = {
   'grok': 'Grok',
 };
 
-const LLM_ICONS = {
-  searchgpt: 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/SearchGPT.PNG',
-  perplexity: 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/Perplexity.png',
-  gemini: 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/Gemini.png',
-  'google-ai-overview': 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/google_ai_overview.png',
-  'google-ai-mode': 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/google_ai_mode.png',
-  'bing-copilot': 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/bing_copilot.png',
-  'grok': 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/Grok-icon.png',
-};
+// Shared icon set (served from /public — see src/lib/llm-display.ts).
+import { LLM_ICONS } from '../lib/llm-display';
 
 interface DomainCitation {
   domain: string;
@@ -186,14 +179,14 @@ export function TopSourcesPage() {
                 Citation statistics aggregated by domain
               </p>
 
-              {/* Filters */}
-              <div className="flex flex-col sm:flex-row gap-4 mt-4">
-                {/* LLM Icon Selector */}
-                <div className="flex-1">
+              {/* Filters: LLM picker on its own row; date/country/category/search
+                  share the second row so the search box gets real width. */}
+              <div className="mt-4 space-y-4">
+                <div>
                   <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
                     Filter by LLM
                   </label>
-                  <div className="flex items-center gap-3">
+                  <div className="flex items-center gap-2 flex-wrap">
                     <button
                       onClick={() => {
                         setSelectedLLM('all');
@@ -214,107 +207,109 @@ export function TopSourcesPage() {
                           setSelectedLLM(llm);
                           setPagination({ ...pagination, page: 1 });
                         }}
-                        className={`p-2 rounded-lg transition-all ${
+                        className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm transition-all ${
                           selectedLLM === llm
-                            ? 'ring-2 ring-brand-primary bg-white dark:bg-gray-800 shadow-md'
-                            : 'bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-700'
+                            ? 'ring-2 ring-brand-primary bg-white dark:bg-gray-800 shadow-md text-gray-900 dark:text-gray-100'
+                            : 'bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-700'
                         }`}
                         title={LLM_NAMES[llm as keyof typeof LLM_NAMES]}
                       >
                         <img
                           src={iconUrl}
                           alt={LLM_NAMES[llm as keyof typeof LLM_NAMES]}
-                          className="w-8 h-8 object-contain"
+                          className="w-5 h-5 object-contain"
                         />
+                        <span className="hidden xl:inline">{LLM_NAMES[llm as keyof typeof LLM_NAMES]}</span>
                       </button>
                     ))}
                   </div>
                 </div>
 
-                {/* Date frame */}
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-                    Date range
-                  </label>
-                  <div className="flex items-center gap-2">
-                    {DATE_FRAMES.map(frame => (
-                      <button
-                        key={frame.id}
-                        type="button"
-                        onClick={() => {
-                          setDateFrame(frame.id);
-                          setPagination(prev => ({ ...prev, page: 1 }));
-                        }}
-                        className={`px-4 py-2 rounded-lg font-medium text-sm transition-all ${
-                          dateFrame === frame.id
-                            ? 'bg-brand-primary text-white shadow-md'
-                            : 'bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-300 border border-gray-300 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-700'
-                        }`}
-                      >
-                        {frame.label}
-                      </button>
-                    ))}
+                <div className="flex flex-wrap items-end gap-4">
+                  {/* Date range */}
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+                      Date range
+                    </label>
+                    <div className="inline-flex items-center rounded-xl bg-gray-100 dark:bg-gray-800 p-1">
+                      {DATE_FRAMES.map(frame => (
+                        <button
+                          key={frame.id}
+                          onClick={() => {
+                            setDateFrame(frame.id);
+                            setPagination(prev => ({ ...prev, page: 1 }));
+                          }}
+                          className={`px-3 py-1.5 rounded-lg text-sm font-medium whitespace-nowrap transition-colors ${
+                            dateFrame === frame.id
+                              ? 'bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 shadow-sm'
+                              : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200'
+                          }`}
+                        >
+                          {frame.label}
+                        </button>
+                      ))}
+                    </div>
                   </div>
-                </div>
 
-                {/* Country */}
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-                    Country
-                  </label>
-                  <select
-                    value={countryFilter}
-                    onChange={(e) => {
-                      setCountryFilter(e.target.value);
-                      setPagination(prev => ({ ...prev, page: 1 }));
-                    }}
-                    className="px-3 py-2 rounded-lg text-sm font-medium bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-300 border border-gray-300 dark:border-gray-600 focus:outline-none focus:ring-2 focus:ring-brand-primary"
-                  >
-                    <option value="all">All countries</option>
-                    {countries.map(c => (
-                      <option key={c} value={c}>{c}</option>
-                    ))}
-                  </select>
-                </div>
-
-                {/* Category */}
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-                    Category
-                  </label>
-                  <select
-                    value={categoryFilter}
-                    onChange={(e) => {
-                      setCategoryFilter(e.target.value);
-                      setPagination(prev => ({ ...prev, page: 1 }));
-                    }}
-                    className="px-3 py-2 rounded-lg text-sm font-medium bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-300 border border-gray-300 dark:border-gray-600 focus:outline-none focus:ring-2 focus:ring-brand-primary"
-                  >
-                    <option value="all">All categories</option>
-                    {DOMAIN_CATEGORIES.map(cat => (
-                      <option key={cat} value={cat}>{cat}</option>
-                    ))}
-                    <option value="Unknown">Unknown</option>
-                  </select>
-                </div>
-
-                {/* Domain Search */}
-                <div className="flex-1">
-                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-                    Search domain
-                  </label>
-                  <div className="relative">
-                    <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-5 h-5 text-gray-400" />
-                    <Input
-                      type="text"
-                      placeholder="Enter domain name..."
-                      value={domainSearch}
+                  {/* Country */}
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+                      Country
+                    </label>
+                    <select
+                      value={countryFilter}
                       onChange={(e) => {
-                        setDomainSearch(e.target.value);
-                        setPagination({ ...pagination, page: 1 });
+                        setCountryFilter(e.target.value);
+                        setPagination(prev => ({ ...prev, page: 1 }));
                       }}
-                      className="pl-10"
-                    />
+                      className="px-3 py-2 rounded-lg text-sm font-medium bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-300 border border-gray-300 dark:border-gray-600 focus:outline-none focus:ring-2 focus:ring-brand-primary"
+                    >
+                      <option value="all">All countries</option>
+                      {countries.map(c => (
+                        <option key={c} value={c}>{c}</option>
+                      ))}
+                    </select>
+                  </div>
+
+                  {/* Category */}
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+                      Category
+                    </label>
+                    <select
+                      value={categoryFilter}
+                      onChange={(e) => {
+                        setCategoryFilter(e.target.value);
+                        setPagination(prev => ({ ...prev, page: 1 }));
+                      }}
+                      className="px-3 py-2 rounded-lg text-sm font-medium bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-300 border border-gray-300 dark:border-gray-600 focus:outline-none focus:ring-2 focus:ring-brand-primary"
+                    >
+                      <option value="all">All categories</option>
+                      {DOMAIN_CATEGORIES.map(cat => (
+                        <option key={cat} value={cat}>{cat}</option>
+                      ))}
+                      <option value="Unknown">Unknown</option>
+                    </select>
+                  </div>
+
+                  {/* Domain Search */}
+                  <div className="flex-1 min-w-[220px]">
+                    <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+                      Search domain
+                    </label>
+                    <div className="relative">
+                      <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-5 h-5 text-gray-400" />
+                      <Input
+                        type="text"
+                        placeholder="Enter domain name..."
+                        value={domainSearch}
+                        onChange={(e) => {
+                          setDomainSearch(e.target.value);
+                          setPagination({ ...pagination, page: 1 });
+                        }}
+                        className="pl-10"
+                      />
+                    </div>
                   </div>
                 </div>
               </div>

@@ -5,14 +5,16 @@
  * here so adding a new LLM updates everywhere at once.
  */
 
+// Served from our own /public — the previous raw.githubusercontent.com URLs
+// were blocked by some corporate proxies, leaving every LLM icon blank.
 export const LLM_ICONS: Record<string, string> = {
-  searchgpt: 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/SearchGPT.PNG',
-  perplexity: 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/Perplexity.png',
-  gemini: 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/Gemini.png',
-  'google-ai-overview': 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/Google.png',
-  'google-ai-mode': 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/Google.png',
-  'bing-copilot': 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/bing_copilot.png',
-  grok: 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/Grok-icon.png',
+  searchgpt: '/llm/searchgpt.png',
+  perplexity: '/llm/perplexity.png',
+  gemini: '/llm/gemini.png',
+  'google-ai-overview': '/llm/google-ai-overview.png',
+  'google-ai-mode': '/llm/google-ai-mode.png',
+  'bing-copilot': '/llm/bing-copilot.png',
+  grok: '/llm/grok.png',
 };
 
 const LLM_DISPLAY_NAME: Record<string, string> = {
