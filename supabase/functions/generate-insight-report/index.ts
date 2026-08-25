@@ -63,23 +63,49 @@ Deno.serve(async (req: Request) => {
       throw new Error('No audits found for this project');
     }
 
-    // Fetch only the most recent audit to reduce data
-    const { data: recentAudit, error: recentAuditError } = await supabase
+    // Pick the most recent COMPLETED audit that actually contains answers
+    // for the target LLM. The old code took the latest audit of the project
+    // regardless of status or LLM coverage — a quick searchgpt-only run
+    // would leave every other LLM with zero responses, so reports "only
+    // worked for ChatGPT".
+    const { data: completedAudits, error: completedErr } = await supabase
       .from('audits')
-      .select('id')
+      .select('id, created_at')
       .eq('project_id', projectId)
+      .eq('status', 'completed')
       .order('created_at', { ascending: false })
-      .limit(1)
-      .single();
+      .limit(25);
 
-    if (recentAuditError) throw recentAuditError;
+    if (completedErr) throw completedErr;
+    if (!completedAudits || completedAudits.length === 0) {
+      throw new Error('No completed audits found for this project');
+    }
 
-    // Fetch all llm_responses with prompts for the most recent audit and target LLM
+    const completedIds = completedAudits.map(a => a.id);
+    const { data: respAudits, error: respAuditsErr } = await supabase
+      .from('llm_responses')
+      .select('audit_id')
+      .in('audit_id', completedIds)
+      .eq('llm', targetLlm)
+      .not('answer_text', 'is', null)
+      .neq('answer_text', '');
+
+    if (respAuditsErr) throw respAuditsErr;
+    const auditsWithData = new Set((respAudits || []).map(r => r.audit_id));
+    const recentAudit = completedAudits.find(a => auditsWithData.has(a.id));
+    if (!recentAudit) {
+      throw new Error(`No completed audit contains ${targetLlm} answers for this project (checked the last ${completedAudits.length} completed audits)`);
+    }
+    console.log(`Using audit ${recentAudit.id} (${recentAudit.created_at}) for ${targetLlm}`);
+
+    // Fetch all answered llm_responses with prompts for that audit
     let responsesQuery = supabase
       .from('llm_responses')
       .select('id, audit_id, llm, answer_text, answer_competitors, created_at, prompt_id, prompts(prompt_text, prompt_group)')
       .eq('audit_id', recentAudit.id)
       .eq('llm', targetLlm)
+      .not('answer_text', 'is', null)
+      .neq('answer_text', '')
       .order('created_at', { ascending: false });
 
     const { data: allResponses, error: responsesError } = await responsesQuery;
