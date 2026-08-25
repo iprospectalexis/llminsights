@@ -322,6 +322,19 @@ async def _scheduler_tick():
                     WHERE pipeline_state IN ('extracting_competitors','analyzing_sentiment','finalizing')
                       AND pipeline_state_entered_at IS NOT NULL
                       AND pipeline_state_entered_at < now() - interval '45 minutes'
+                      -- An audit waiting on an in-flight OpenAI Batch is NOT a
+                      -- zombie: the Batch API's completion window is 24h and
+                      -- the handler heartbeats on every poll. Scheduled audits
+                      -- were auto-failed at 45 min while their batches went on
+                      -- to complete successfully (2026-08-25: 4 audits).
+                      -- Batch-waiting audits get a 6h ceiling instead.
+                      AND (
+                        (
+                          (competitors_batch_id IS NULL OR competitors_batch_id = 'applied')
+                          AND (sentiment_batch_id IS NULL OR sentiment_batch_id = 'applied')
+                        )
+                        OR pipeline_state_entered_at < now() - interval '6 hours'
+                      )
                     RETURNING id, pipeline_state
                 """))
                 zombies = zombie_result.fetchall()
