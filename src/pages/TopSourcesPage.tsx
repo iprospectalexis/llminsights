@@ -58,7 +58,8 @@ export function TopSourcesPage() {
   const [domainCitations, setDomainCitations] = useState<DomainCitation[]>([]);
   const [domainLoading, setDomainLoading] = useState(true);
   const [selectedLLM, setSelectedLLM] = useState<string>('all');
-  const [dateFrame, setDateFrame] = useState<DateFrame>('all');
+  // Default to 30 days: the all-time aggregate is heavy and rarely the question.
+  const [dateFrame, setDateFrame] = useState<DateFrame>('30');
   const [categoryFilter, setCategoryFilter] = useState<string>('all');
   const [domainSearch, setDomainSearch] = useState('');
   const [sortBy, setSortBy] = useState<'cited_count' | 'more_count' | 'total_citations'>('total_citations');
