@@ -33,6 +33,17 @@ const CATEGORY_CHART_COLORS: Record<string, string> = {
 import { normalizeBrandKey, buildBrandDomainMapFromCitations } from '../lib/brandDomains';
 import { buildPageBrandIndex, findBrandsInText } from '../lib/pageBrands';
 import { TrendChip, Sparkline, trendDelta, TrendData, TrendPoint } from '../components/ui/TrendChip';
+import { LLM_ICONS as MATRIX_LLM_ICONS } from '../lib/llm-display';
+
+const LLM_NAME_LABELS: Record<string, string> = {
+  searchgpt: 'ChatGPT',
+  'google-ai-mode': 'Google AI Mode',
+  'google-ai-overview': 'Google AI Overviews',
+  gemini: 'Google Gemini',
+  grok: 'Grok',
+  'bing-copilot': 'Microsoft Copilot',
+  perplexity: 'Perplexity',
+};
 import { BrandFavicon } from '../components/ui/BrandFavicon';
 import { LoadingSpinner } from '../components/ui/LoadingSpinner';
 import { queryCache } from '../lib/queryCache';
@@ -316,6 +327,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
   const [domainCategoryMap, setDomainCategoryMap] = useState<Record<string, string>>({});
   const [domainCategoryFilter, setDomainCategoryFilter] = useState<string>('all');
   const [domainsView, setDomainsView] = useState<'performance' | 'insights'>('performance');
+  const [mentionsMetric, setMentionsMetric] = useState<'rate' | 'count'>('rate');
 
   // Ads dashboard (lazy-loaded on tab open). Ads are collected since the
   // rich-results deploy — older audits have ads=null because the field
@@ -3794,6 +3806,92 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
   };
 
   // Calculate brand mentions data based on filtered responses
+  // Matrix View data: brand x LLM mention counts/rates from the extracted
+  // answer_competitors (not substring matching), across the loaded window
+  // under the active filters. One pass over responses.
+  const MATRIX_LLM_ORDER = ['searchgpt', 'google-ai-mode', 'google-ai-overview', 'gemini', 'grok', 'bing-copilot', 'perplexity'];
+  const mentionsMatrix = useMemo(() => {
+    const answered = filteredLlmResponses.filter(r => r.answer_text && r.answer_text !== '');
+    const llms = MATRIX_LLM_ORDER.filter(l => answered.some(r => r.llm === l));
+    const denom: Record<string, number> = {};
+    llms.forEach(l => { denom[l] = answered.filter(r => r.llm === l).length; });
+
+    const keyOf = (x: string) => normalizeBrandKey(x || '');
+    const defs = [
+      ...brands.map(b => ({ ...b, is_competitor: false })),
+      ...competitors.map(b => ({ ...b, is_competitor: true })),
+    ]
+      .filter(b => b.brand_name)
+      .map(b => ({
+        brand: b.brand_name,
+        is_competitor: !!b.is_competitor,
+        keys: Array.from(new Set([keyOf(b.brand_name), ...(((b as any).aliases || []) as string[]).map(keyOf)])).filter(Boolean),
+      }));
+
+    const counts: Record<string, Record<string, number>> = {};
+    defs.forEach(d => { counts[d.brand] = {}; llms.forEach(l => { counts[d.brand][l] = 0; }); });
+
+    answered.forEach(resp => {
+      if (!llms.includes(resp.llm)) return;
+      const bl = resp.answer_competitors?.brands;
+      if (!Array.isArray(bl)) return;
+      const present = new Set(
+        bl.map((x: any) => keyOf(typeof x === 'string' ? x : x?.name)).filter(Boolean)
+      );
+      if (present.size === 0) return;
+      defs.forEach(d => {
+        for (const k of d.keys) {
+          if (present.has(k)) { counts[d.brand][resp.llm]++; break; }
+        }
+      });
+    });
+
+    const rows = defs.map(d => {
+      const cells: Record<string, { count: number; rate: number }> = {};
+      let total = 0;
+      llms.forEach(l => {
+        const c = counts[d.brand][l] || 0;
+        total += c;
+        cells[l] = { count: c, rate: denom[l] > 0 ? (c / denom[l]) * 100 : 0 };
+      });
+      return { brand: d.brand, is_competitor: d.is_competitor, cells, total };
+    })
+    .filter(r => !r.is_competitor || r.total > 0)
+    .sort((x, y) => {
+      if (x.is_competitor !== y.is_competitor) return x.is_competitor ? 1 : -1;
+      return y.total - x.total;
+    });
+
+    let maxCount = 0, maxRate = 0;
+    rows.forEach(r => llms.forEach(l => {
+      maxCount = Math.max(maxCount, r.cells[l].count);
+      maxRate = Math.max(maxRate, r.cells[l].rate);
+    }));
+
+    return { llms, denom, rows, maxCount, maxRate };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filteredLlmResponses, brands, competitors]);
+
+  const exportMentionsMatrix = () => {
+    const { llms, rows } = mentionsMatrix;
+    const data = rows.map(r => {
+      const row: Record<string, any> = {
+        Brand: r.brand,
+        Type: r.is_competitor ? 'Competitor' : 'Own brand',
+      };
+      llms.forEach(l => {
+        row[LLM_NAME_LABELS[l] || l] = mentionsMetric === 'rate'
+          ? Number(r.cells[l].rate.toFixed(1))
+          : r.cells[l].count;
+      });
+      return row;
+    });
+    const ws = xlsxUtils.json_to_sheet(data);
+    const wb = xlsxUtils.book_new();
+    xlsxUtils.book_append_sheet(wb, ws, 'Mentions matrix');
+    xlsxWriteFile(wb, `${project?.name || 'project'}_mentions_matrix_${new Date().toISOString().split('T')[0]}.xlsx`);
+  };
+
   const getBrandMentionsData = () => {
     const allBrands = [...brands, ...competitors];
 
@@ -7370,219 +7468,111 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
 
           {activeTab === 'mentions' && (
             <div className="space-y-8">
-              {/* Brand Mentions Analysis Table */}
+              {/* Matrix View: brand x LLM heatmap */}
               <Card className="overflow-hidden">
                 <CardHeader>
-                  <h3 className="text-xl font-bold text-gray-900 dark:text-gray-100">
-                    Brand Mentions Analysis
-                  </h3>
-                  <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">
-                    Analysis of how often your brands and competitors are mentioned across LLM responses
-                  </p>
+                  <div className="flex items-start justify-between flex-wrap gap-3">
+                    <div>
+                      <h3 className="text-xl font-bold text-gray-900 dark:text-gray-100">
+                        Matrix View
+                      </h3>
+                      <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">
+                        Analyze your brand's presence across AI platforms
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={exportMentionsMatrix}
+                        title="Export to Excel"
+                        className="p-2 rounded-lg text-gray-500 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors"
+                      >
+                        <Download className="w-4 h-4" />
+                      </button>
+                      <select
+                        value={mentionsMetric}
+                        onChange={(e) => setMentionsMetric(e.target.value as 'rate' | 'count')}
+                        className="px-3 py-2 rounded-lg text-sm font-medium bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-300 border border-gray-300 dark:border-gray-600 focus:outline-none focus:ring-2 focus:ring-brand-primary"
+                      >
+                        <option value="rate">Mention Rate</option>
+                        <option value="count">Mentions</option>
+                      </select>
+                      <span className="text-sm text-gray-500 dark:text-gray-400">by</span>
+                      <span className="px-3 py-2 rounded-lg text-sm font-medium bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300">
+                        Brands
+                      </span>
+                    </div>
+                  </div>
                 </CardHeader>
                 <CardContent className="p-0">
-                  <div className="overflow-x-auto">
-                    <table className="w-full">
-                      <thead>
-                        <tr className="bg-gradient-to-r from-gray-50 to-gray-100/50 dark:from-gray-800 dark:to-gray-700/50 border-b border-gray-200 dark:border-gray-700">
-                          <th className="text-left py-4 px-6 font-semibold text-xs uppercase tracking-wider text-gray-700 dark:text-gray-300">
-                            <div className="flex items-center gap-2">
-                              Brand
-                              <div className="group relative">
-                                <Info className="w-3.5 h-3.5 text-gray-400 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-400 cursor-help transition-colors" />
-                                <div className="absolute top-full left-0 mt-2 w-64 p-3 bg-gray-900 text-white text-xs normal-case tracking-normal rounded-lg shadow-xl opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 pointer-events-none z-10">
-                                  <div className="font-semibold mb-1">Brand Name</div>
-                                  <div>The name of the brand being analyzed in LLM responses</div>
-                                </div>
-                              </div>
-                            </div>
-                          </th>
-                          <th className="text-left py-4 px-6 font-semibold text-xs uppercase tracking-wider text-gray-700 dark:text-gray-300">
-                            <div className="flex items-center gap-2">
-                              Type
-                              <div className="group relative">
-                                <Info className="w-3.5 h-3.5 text-gray-400 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-400 cursor-help transition-colors" />
-                                <div className="absolute top-full left-0 mt-2 w-64 p-3 bg-gray-900 text-white text-xs normal-case tracking-normal rounded-lg shadow-xl opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 pointer-events-none z-10">
-                                  <div className="font-semibold mb-1">Brand Type</div>
-                                  <div>Indicates whether this is your own brand or a competitor</div>
-                                </div>
-                              </div>
-                            </div>
-                          </th>
-                          <th className="text-center py-4 px-6 font-semibold text-xs uppercase tracking-wider text-gray-700 dark:text-gray-300">
-                            <div className="flex items-center justify-center gap-2">
-                              Prompts
-                              <div className="group relative">
-                                <Info className="w-3.5 h-3.5 text-gray-400 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-400 cursor-help transition-colors" />
-                                <div className="absolute top-full left-1/2 -translate-x-1/2 mt-2 w-64 p-3 bg-gray-900 text-white text-xs normal-case tracking-normal rounded-lg shadow-xl opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 pointer-events-none z-10">
-                                  <div className="font-semibold mb-1">Total Mentions</div>
-                                  <div className="mb-2">Total number of times this brand was mentioned across all LLM responses</div>
-                                  <div className="text-white/70 italic">Formula: Count of responses mentioning brand</div>
-                                </div>
-                              </div>
-                            </div>
-                          </th>
-                          <th className="text-center py-4 px-6 font-semibold text-xs uppercase tracking-wider text-gray-700 dark:text-gray-300">
-                            <div className="flex items-center justify-center gap-2">
-                              SearchGPT
-                              <div className="group relative">
-                                <Info className="w-3.5 h-3.5 text-gray-400 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-400 cursor-help transition-colors" />
-                                <div className="absolute top-full left-1/2 -translate-x-1/2 mt-2 w-64 p-3 bg-gray-900 text-white text-xs normal-case tracking-normal rounded-lg shadow-xl opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 pointer-events-none z-10">
-                                  <div className="font-semibold mb-1">SearchGPT Mentions</div>
-                                  <div>Number of mentions in SearchGPT responses</div>
-                                </div>
-                              </div>
-                            </div>
-                          </th>
-                          <th className="text-center py-4 px-6 font-semibold text-xs uppercase tracking-wider text-gray-700 dark:text-gray-300">
-                            <div className="flex items-center justify-center gap-2">
-                              Perplexity
-                              <div className="group relative">
-                                <Info className="w-3.5 h-3.5 text-gray-400 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-400 cursor-help transition-colors" />
-                                <div className="absolute top-full left-1/2 -translate-x-1/2 mt-2 w-64 p-3 bg-gray-900 text-white text-xs normal-case tracking-normal rounded-lg shadow-xl opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 pointer-events-none z-10">
-                                  <div className="font-semibold mb-1">Perplexity Mentions</div>
-                                  <div>Number of mentions in Perplexity AI responses</div>
-                                </div>
-                              </div>
-                            </div>
-                          </th>
-                          <th className="text-center py-4 px-6 font-semibold text-xs uppercase tracking-wider text-gray-700 dark:text-gray-300">
-                            <div className="flex items-center justify-center gap-2">
-                              Gemini
-                              <div className="group relative">
-                                <Info className="w-3.5 h-3.5 text-gray-400 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-400 cursor-help transition-colors" />
-                                <div className="absolute top-full left-1/2 -translate-x-1/2 mt-2 w-64 p-3 bg-gray-900 text-white text-xs normal-case tracking-normal rounded-lg shadow-xl opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 pointer-events-none z-10">
-                                  <div className="font-semibold mb-1">Gemini Mentions</div>
-                                  <div>Number of mentions in Google Gemini responses</div>
-                                </div>
-                              </div>
-                            </div>
-                          </th>
-                          <th className="text-center py-4 px-6 font-semibold text-xs uppercase tracking-wider text-gray-700 dark:text-gray-300">
-                            <div className="flex items-center justify-center gap-2">
-                              Mention Rate
-                              <div className="group relative">
-                                <Info className="w-3.5 h-3.5 text-gray-400 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-400 cursor-help transition-colors" />
-                                <div className="absolute top-full left-1/2 -translate-x-1/2 mt-2 w-72 p-3 bg-gray-900 text-white text-xs normal-case tracking-normal rounded-lg shadow-xl opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 pointer-events-none z-10">
-                                  <div className="font-semibold mb-1">Mention Rate</div>
-                                  <div className="mb-2">Percentage of responses that mention this brand</div>
-                                  <div className="text-white/70 italic">Formula: (Mentions / Total responses) × 100</div>
-                                </div>
-                              </div>
-                            </div>
-                          </th>
-                          {project.sentiment && (
-                            <th className="text-center py-4 px-6 font-semibold text-xs uppercase tracking-wider text-gray-700 dark:text-gray-300">
-                              <div className="flex items-center justify-center gap-2">
-                                Avg Sentiment
-                                <div className="group relative">
-                                  <Info className="w-3.5 h-3.5 text-gray-400 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-400 cursor-help transition-colors" />
-                                  <div className="absolute top-full right-0 mt-2 w-72 p-3 bg-gray-900 text-white text-xs normal-case tracking-normal rounded-lg shadow-xl opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 pointer-events-none z-10">
-                                    <div className="font-semibold mb-1">Average Sentiment</div>
-                                    <div className="mb-2">Average sentiment score for this brand across all mentions</div>
-                                    <div className="text-white/70 italic">Scale: -1 (negative) to +1 (positive)</div>
-                                  </div>
-                                </div>
-                              </div>
+                  {mentionsMatrix.rows.length === 0 || mentionsMatrix.llms.length === 0 ? (
+                    <p className="text-sm text-gray-400 dark:text-gray-500 py-10 text-center">
+                      No mention data for the current filters
+                    </p>
+                  ) : (
+                    <div className="overflow-x-auto">
+                      <table className="w-full">
+                        <thead>
+                          <tr className="border-b border-gray-200 dark:border-gray-700">
+                            <th className="text-left py-3.5 px-6 text-xs font-semibold uppercase tracking-wider text-gray-600 dark:text-gray-300 min-w-[190px]">
+                              Brands
                             </th>
-                          )}
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-gray-100 dark:divide-gray-800">
-                        {getBrandMentionsData().map((brand, index) => (
-                          <tr
-                            key={brand.brand_name}
-                            className="group hover:bg-gradient-to-r hover:from-gray-50 hover:to-transparent dark:hover:from-gray-800/50 dark:hover:to-transparent transition-all duration-200"
-                          >
-                            <td className="py-4 px-6">
-                              <div className="flex items-center gap-3">
-                                {getBrandDomain(brand.brand_name) ? (
-                                  <div className="w-10 h-10 rounded-xl flex items-center justify-center bg-white dark:bg-gray-700 border border-gray-200 dark:border-gray-600 shadow-sm">
-                                    <BrandFavicon name={brand.brand_name} domain={getBrandDomain(brand.brand_name)} size={24} />
-                                  </div>
-                                ) : (
-                                  <div className={`w-10 h-10 rounded-xl flex items-center justify-center font-bold text-sm shadow-sm ${
-                                    brand.is_competitor
-                                      ? 'bg-gradient-to-br from-red-100 to-red-200 dark:from-red-900/30 dark:to-red-800/20 text-red-700 dark:text-red-400'
-                                      : 'bg-gradient-to-br from-emerald-100 to-emerald-200 dark:from-emerald-900/30 dark:to-emerald-800/20 text-emerald-700 dark:text-emerald-400'
-                                  }`}>
-                                    {brand.brand_name.charAt(0).toUpperCase()}
-                                  </div>
-                                )}
-                                <div className="font-semibold text-gray-900 dark:text-gray-100">
-                                  {brand.brand_name}
+                            {mentionsMatrix.llms.map(l => (
+                              <th key={l} className="py-3.5 px-3 text-xs font-semibold text-gray-600 dark:text-gray-300 min-w-[108px]">
+                                <div className="flex items-center justify-center gap-1.5">
+                                  <img src={MATRIX_LLM_ICONS[l]} alt="" className="w-4 h-4 object-contain" />
+                                  <span className="normal-case">{LLM_NAME_LABELS[l] || l}</span>
                                 </div>
-                              </div>
-                            </td>
-                            <td className="py-4 px-6">
-                              <span className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-xl shadow-sm ${
-                                brand.is_competitor
-                                  ? 'bg-gradient-to-r from-red-100 to-red-50 dark:from-red-900/30 dark:to-red-800/20 text-red-700 dark:text-red-400 border border-red-200 dark:border-red-800/30'
-                                  : 'bg-gradient-to-r from-emerald-100 to-emerald-50 dark:from-emerald-900/30 dark:to-emerald-800/20 text-emerald-700 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800/30'
-                              }`}>
-                                <div className={`w-1.5 h-1.5 rounded-full ${
-                                  brand.is_competitor
-                                    ? 'bg-red-500 dark:bg-red-400'
-                                    : 'bg-emerald-500 dark:bg-emerald-400'
-                                }`} />
-                                {brand.is_competitor ? 'Competitor' : 'Own Brand'}
-                              </span>
-                            </td>
-                            <td className="py-4 px-6 text-center">
-                              <div className="inline-flex items-center justify-center w-12 h-12 rounded-xl bg-gradient-to-br from-blue-50 to-blue-100/50 dark:from-blue-900/20 dark:to-blue-800/10 border border-blue-200/50 dark:border-blue-800/30">
-                                <span className="text-lg font-bold text-blue-700 dark:text-blue-400">
-                                  {brand.total_mentions}
-                                </span>
-                              </div>
-                            </td>
-                            <td className="py-4 px-6 text-center">
-                              <span className="text-base font-medium text-gray-700 dark:text-gray-300">
-                                {brand.searchgpt_mentions}
-                              </span>
-                            </td>
-                            <td className="py-4 px-6 text-center">
-                              <span className="text-base font-medium text-gray-700 dark:text-gray-300">
-                                {brand.perplexity_mentions}
-                              </span>
-                            </td>
-                            <td className="py-4 px-6 text-center">
-                              <span className="text-base font-medium text-gray-700 dark:text-gray-300">
-                                {brand.gemini_mentions}
-                              </span>
-                            </td>
-                            <td className="py-4 px-6 text-center">
-                              <div className={`inline-flex items-center justify-center px-4 py-2 rounded-xl font-bold text-sm shadow-sm ${
-                                brand.mention_rate >= 50
-                                  ? 'bg-gradient-to-r from-emerald-100 to-emerald-50 dark:from-emerald-900/30 dark:to-emerald-800/20 text-emerald-700 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800/30'
-                                  : brand.mention_rate >= 25
-                                  ? 'bg-gradient-to-r from-amber-100 to-amber-50 dark:from-amber-900/30 dark:to-amber-800/20 text-amber-700 dark:text-amber-400 border border-amber-200 dark:border-amber-800/30'
-                                  : 'bg-gradient-to-r from-red-100 to-red-50 dark:from-red-900/30 dark:to-red-800/20 text-red-700 dark:text-red-400 border border-red-200 dark:border-red-800/30'
-                              }`}>
-                                {brand.mention_rate}%
-                              </div>
-                            </td>
-                            {project.sentiment && (
-                              <td className="py-4 px-6 text-center">
-                                {brand.avg_sentiment !== null ? (
-                                  <div className={`inline-flex items-center justify-center px-4 py-2 rounded-xl font-bold text-sm shadow-sm ${
-                                    brand.avg_sentiment > 0.2
-                                      ? 'bg-gradient-to-r from-emerald-100 to-emerald-50 dark:from-emerald-900/30 dark:to-emerald-800/20 text-emerald-700 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800/30'
-                                      : brand.avg_sentiment < -0.2
-                                      ? 'bg-gradient-to-r from-red-100 to-red-50 dark:from-red-900/30 dark:to-red-800/20 text-red-700 dark:text-red-400 border border-red-200 dark:border-red-800/30'
-                                      : 'bg-gradient-to-r from-amber-100 to-amber-50 dark:from-amber-900/30 dark:to-amber-800/20 text-amber-700 dark:text-amber-400 border border-amber-200 dark:border-amber-800/30'
-                                  }`}>
-                                    {brand.avg_sentiment > 0 ? '+' : ''}{brand.avg_sentiment.toFixed(2)}
-                                  </div>
-                                ) : (
-                                  <span className="text-gray-400 text-sm">-</span>
-                                )}
-                              </td>
-                            )}
+                                <div className="mt-0.5 text-[10px] font-normal text-gray-400 dark:text-gray-500">
+                                  {mentionsMatrix.denom[l]} answers
+                                </div>
+                              </th>
+                            ))}
                           </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
+                        </thead>
+                        <tbody>
+                          {mentionsMatrix.rows.map(r => (
+                            <tr key={r.brand} className="border-b border-gray-100 dark:border-gray-800">
+                              <td className="py-2.5 px-6">
+                                <div className="flex items-center gap-2.5 min-w-0">
+                                  <BrandFavicon name={r.brand} domain={getBrandDomain(r.brand)} size={20} />
+                                  <span className="font-medium text-sm text-gray-900 dark:text-gray-100 truncate">
+                                    {r.brand}
+                                  </span>
+                                  {!r.is_competitor && (
+                                    <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300 flex-shrink-0">
+                                      You
+                                    </span>
+                                  )}
+                                </div>
+                              </td>
+                              {mentionsMatrix.llms.map(l => {
+                                const cell = r.cells[l];
+                                const value = mentionsMetric === 'rate' ? cell.rate : cell.count;
+                                const max = mentionsMetric === 'rate' ? mentionsMatrix.maxRate : mentionsMatrix.maxCount;
+                                const alpha = max > 0 ? Math.min(1, 0.04 + (value / max) * 0.92) : 0.04;
+                                const darkText = alpha < 0.45;
+                                const label = mentionsMetric === 'rate'
+                                  ? `${cell.rate.toFixed(1)}%`
+                                  : String(cell.count);
+                                return (
+                                  <td
+                                    key={l}
+                                    className="py-3 px-3 text-center text-sm font-semibold"
+                                    style={{ backgroundColor: `rgba(37, 99, 235, ${value === 0 ? 0.02 : alpha})` }}
+                                    title={`${r.brand} \u00b7 ${LLM_NAME_LABELS[l] || l}: mentioned in ${cell.count} of ${mentionsMatrix.denom[l]} answers (${cell.rate.toFixed(1)}%)`}
+                                  >
+                                    <span className={darkText ? 'text-gray-800 dark:text-gray-100' : 'text-white'}>
+                                      {value === 0 ? (mentionsMetric === 'rate' ? '0%' : '0') : label}
+                                    </span>
+                                  </td>
+                                );
+                              })}
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
                 </CardContent>
               </Card>
 
