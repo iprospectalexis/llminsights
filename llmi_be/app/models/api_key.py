@@ -4,7 +4,7 @@ import hashlib
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import Column, String, Integer, DateTime, Boolean
+from sqlalchemy import Column, String, Integer, DateTime, Boolean, Uuid
 from app.database import Base
 
 
@@ -22,7 +22,12 @@ class ApiKey(Base):
     """API Key model for partner access management."""
     __tablename__ = "api_keys"
 
-    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    # Native uuid in prod Postgres (the table is shared with the frontend
+    # key-management flow). as_uuid=False keeps ids as str in Python, which
+    # the rest of the codebase (jobs.owner_id varchar joins, responses)
+    # expects. String(36) here made asyncpg cast $n::VARCHAR against uuid
+    # and 500 every DB-key request ("operator does not exist: uuid = varchar").
+    id = Column(Uuid(as_uuid=False), primary_key=True, default=lambda: str(uuid.uuid4()))
 
     # Key identification
     key_hash = Column(String(64), unique=True, nullable=False, index=True)
@@ -40,21 +45,25 @@ class ApiKey(Base):
     total_requests = Column(Integer, default=0)
     total_jobs = Column(Integer, default=0)
     total_prompts = Column(Integer, default=0)
-    last_used_at = Column(DateTime, nullable=True)
+    last_used_at = Column(DateTime(timezone=True), nullable=True)
 
     # Timestamps
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    expires_at = Column(DateTime, nullable=True)  # None = never expires
+    created_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=True)  # None = never expires
 
     def __repr__(self):
         return f"<ApiKey(id={self.id}, name={self.name}, active={self.is_active})>"
 
     @property
     def is_expired(self) -> bool:
-        """Check if the key has expired."""
+        """Check if the key has expired (tz-safe: the column is timestamptz)."""
         if self.expires_at is None:
             return False
-        return datetime.utcnow() > self.expires_at
+        from datetime import timezone
+        exp = self.expires_at
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) > exp
 
     @property
     def is_valid(self) -> bool:
