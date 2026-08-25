@@ -27,6 +27,7 @@ import { TeamPage } from './pages/TeamPage';
 import { AccountPage } from './pages/AccountPage';
 import { StatusPage } from './pages/StatusPage';
 import { BarometersPage } from './pages/BarometersPage';
+import { BarometerAdsPage } from './pages/BarometerAdsPage';
 import { TopSourcesPage } from './pages/TopSourcesPage';
 import { SettingsPage } from './pages/SettingsPage';
 import { CostsPage } from './pages/admin/CostsPage';
@@ -77,6 +78,7 @@ function App() {
             <Route path="status" element={<StatusPage />} />
             <Route path="barometers" element={<BarometersPage />} />
             <Route path="barometers/top-sources" element={<TopSourcesPage />} />
+            <Route path="barometers/ads" element={<BarometerAdsPage />} />
             <Route path="settings" element={<SettingsPage />} />
             <Route path="admin/costs" element={<CostsPage />} />
             <Route path="tickets" element={<TicketsPage />} />

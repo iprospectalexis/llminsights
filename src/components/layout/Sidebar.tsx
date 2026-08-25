@@ -780,6 +780,18 @@ export const Sidebar: React.FC<SidebarProps> = ({ user, userProfile, isOpen, onT
                         >
                           Top Sources
                         </NavLink>
+                        <NavLink
+                          to="/barometers/ads"
+                          className={`
+                            flex items-center pl-12 pr-3 py-2 text-sm font-medium rounded-xl transition-all duration-200
+                            ${location.pathname === '/barometers/ads'
+                              ? 'bg-rose-100 text-rose-700 dark:bg-rose-900/30 dark:text-rose-300'
+                              : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800'
+                            }
+                          `}
+                        >
+                          Ads
+                        </NavLink>
                       </motion.div>
                     )}
                   </AnimatePresence>
