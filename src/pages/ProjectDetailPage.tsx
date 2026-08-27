@@ -34,6 +34,7 @@ import { normalizeBrandKey, buildBrandDomainMapFromCitations } from '../lib/bran
 import { buildPageBrandIndex, findBrandsInText } from '../lib/pageBrands';
 import { TrendChip, Sparkline, trendDelta, TrendData, TrendPoint } from '../components/ui/TrendChip';
 import { LLM_ICONS as MATRIX_LLM_ICONS } from '../lib/llm-display';
+import { CitationSankey } from '../components/CitationSankey';
 
 const LLM_NAME_LABELS: Record<string, string> = {
   searchgpt: 'ChatGPT',
@@ -49,7 +50,7 @@ import { LoadingSpinner } from '../components/ui/LoadingSpinner';
 import { queryCache } from '../lib/queryCache';
 import { Calendar, FileText, ChartBar as BarChart3, Globe, Users, Play, ArrowLeft, Brain, Download, Settings as SettingsIcon, PencilLine, X, MessageSquare, Crown, TrendingUp, TrendingDown, Lightbulb, Trash2, Info, Settings, CalendarCheck, ArrowUpDown, ArrowUp, ArrowDown, BadgeCheck, MessageCircle, List, ChevronDown, Smile, ShoppingBag, Map as MapIcon, Megaphone, Workflow } from 'lucide-react';
 import { SentimentDashboard } from '../components/sentiment/SentimentDashboard';
-import { PieChart, Pie, Cell, ResponsiveContainer, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, LineChart, Line, Legend, Sankey } from 'recharts';
+import { PieChart, Pie, Cell, ResponsiveContainer, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, LineChart, Line, Legend } from 'recharts';
 import { RadarChart, Radar, PolarGrid, PolarAngleAxis, PolarRadiusAxis } from 'recharts';
 import { AuditProgressToast } from '../components/audit/AuditProgressToast';
 import { ProjectScheduledAuditsSettings } from '../components/projects/ProjectScheduledAuditsSettings';
@@ -7642,79 +7643,11 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                     <p className="text-sm text-gray-500 dark:text-gray-400 py-10 text-center">{cfError}</p>
                   ) : !citationFunnel ? (
                     <p className="text-sm text-gray-500 dark:text-gray-400 py-10 text-center">No data</p>
-                  ) : (() => {
-                    const f = citationFunnel;
-                    const NODES = [
-                      { name: `All Prompts (${f.total})`, color: '#ec4899' },
-                      { name: `Web Search Enabled (${f.webSearch})`, color: '#ec4899' },
-                      { name: `Web Search Disabled (${f.noSearch})`, color: '#6b7280' },
-                      { name: `Present in Sources (${f.present})`, color: '#f97316' },
-                      { name: `Absent in Sources (${f.absent})`, color: '#fbbf24' },
-                      { name: `Citations (${f.cited})`, color: '#38bdf8' },
-                      { name: `More / Supplemental (${f.moreOnly})`, color: '#fbbf24' },
-                      { name: `Main Citations (${f.mainCit})`, color: '#38bdf8' },
-                      { name: `Supporting Citations (${f.supporting})`, color: '#60a5fa' },
-                    ];
-                    const L = (source: number, target: number, value: number) => ({ source, target, value });
-                    const links = [
-                      L(0, 1, f.webSearch), L(0, 2, f.noSearch),
-                      L(1, 3, f.present), L(1, 4, f.absent),
-                      L(3, 5, f.cited), L(3, 6, f.moreOnly),
-                      L(5, 7, f.mainCit), L(5, 8, f.supporting),
-                    ].filter(l => l.value > 0);
-                    const usedIdx = new Set<number>();
-                    links.forEach(l => { usedIdx.add(l.source); usedIdx.add(l.target); });
-                    const idxMap = new Map<number, number>();
-                    const nodes = NODES.filter((_, i) => usedIdx.has(i)).map((n, newIdx) => {
-                      idxMap.set(NODES.indexOf(n), newIdx);
-                      return n;
-                    });
-                    const data = {
-                      nodes,
-                      links: links.map(l => ({ source: idxMap.get(l.source)!, target: idxMap.get(l.target)!, value: l.value })),
-                    };
-                    const NodeShape = (props: any) => {
-                      const { x, y, width, height, payload } = props;
-                      return (
-                        <g>
-                          <rect x={x} y={y} width={width} height={height} fill={payload.color} rx={2} />
-                          <text
-                            x={x + width + 8}
-                            y={y + height / 2}
-                            dominantBaseline="middle"
-                            className="fill-gray-800 dark:fill-gray-100"
-                            fontSize={13}
-                            fontWeight={600}
-                          >
-                            {payload.name}
-                          </text>
-                        </g>
-                      );
-                    };
-                    return (
-                      <div className="h-[440px]">
-                        <ResponsiveContainer width="100%" height="100%">
-                          <Sankey
-                            data={data}
-                            node={<NodeShape />}
-                            nodePadding={42}
-                            nodeWidth={12}
-                            margin={{ top: 16, right: 220, bottom: 16, left: 8 }}
-                            link={{ stroke: '#94a3b8', strokeOpacity: 0.35 }}
-                          >
-                            <Tooltip
-                              contentStyle={{
-                                backgroundColor: 'rgb(var(--bg-surface))',
-                                border: '1px solid rgb(var(--border))',
-                                borderRadius: '12px',
-                                fontFamily: 'Plus Jakarta Sans'
-                              }}
-                            />
-                          </Sankey>
-                        </ResponsiveContainer>
-                      </div>
-                    );
-                  })()}
+                  ) : (
+                    <div className="h-[440px]">
+                      <CitationSankey f={citationFunnel} />
+                    </div>
+                  )}
                 </CardContent>
               </Card>
 
