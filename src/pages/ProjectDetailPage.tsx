@@ -3881,12 +3881,13 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
           (domainMode === 'subdomains' && host.endsWith(`.${projectDomain}`));
       } catch { return false; }
     };
-    const urlsOf = (v: any): string[] => {
+    const itemsOf = (v: any): any[] => {
       let arr = v;
       if (typeof arr === 'string') { try { arr = JSON.parse(arr); } catch { return []; } }
-      if (!Array.isArray(arr)) return [];
-      return arr.map((x: any) => (typeof x === 'string' ? x : x?.url)).filter(Boolean);
+      return Array.isArray(arr) ? arr : [];
     };
+    const urlsOf = (v: any): string[] =>
+      itemsOf(v).map((x: any) => (typeof x === 'string' ? x : x?.url)).filter(Boolean);
 
     let webSearch = 0, noSearch = 0, present = 0, absent = 0;
     let cited = 0, moreOnly = 0, mainCit = 0, supporting = 0;
@@ -3894,8 +3895,15 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     cfData.rows.forEach(r => {
       const la = urlsOf(r.links_attached);
       const ss = urlsOf(r.search_sources);
-      const ssm = urlsOf(r.search_sources_more);
-      const cit = urlsOf(r.citations);
+      const ssmPanel = urlsOf(r.search_sources_more);
+      // The citations column carries a cited flag per entry: cited=false is
+      // the "More" tier embedded in the snapshot (present even when the
+      // expanded panels were not captured).
+      const citItems = itemsOf(r.citations);
+      const citUsed = citItems.filter((x: any) => x?.cited !== false).map((x: any) => x?.url).filter(Boolean);
+      const citMore = citItems.filter((x: any) => x?.cited === false).map((x: any) => x?.url).filter(Boolean);
+      const cit = citUsed.concat(citMore);
+      const ssm = ssmPanel.length > 0 ? ssmPanel : citMore;
       // BrightData snapshots come in variants: some carry the full source
       // panels, others only links_attached, others only the citations panel
       // (verified on raw files: citations = the in-text links deduped by
@@ -3906,7 +3914,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
         ss.length > 0 || ssm.length > 0 || cit.length > 0 || !!r.web_search_query;
       if (!searched) { noSearch++; return; }
       webSearch++;
-      const mainSet = la.length > 0 ? la : cit;      // in-text links (or their deduped panel)
+      const mainSet = la.length > 0 ? la : citUsed;  // in-text links (or their deduped panel)
       const usedSet = ss.length > 0 ? ss : mainSet;  // used-sources panel when captured
       const inMain = mainSet.some(isOwn);
       const inUsedPanel = usedSet.some(isOwn);
@@ -7703,7 +7711,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                     <li><b>Present in Sources</b> &mdash; your domain appears anywhere in the retrieved set: answer links, the sources panel, or the &laquo;More&raquo; list.</li>
                     <li><b>Citations</b> &mdash; your domain is in the used-sources panel or the answer itself; <b>More / Supplemental</b> &mdash; retrieved but only in the &laquo;More&raquo; list.</li>
                     <li><b>Main Citations</b> &mdash; linked inside the answer text; <b>Supporting</b> &mdash; in the used-sources panel without an in-text link.</li>
-                    <li>Snapshot variants: when a capture lacks the expanded panels, the funnel falls back to the answer's Citations panel (verified equal to the in-text links deduped by domain); Supporting is then indistinguishable and shows 0.</li>
+                    <li>Snapshot variants: when a capture lacks the expanded panels, the funnel falls back to the answer's Citations panel &mdash; entries flagged cited are the used tier, entries flagged not-cited feed &laquo;More&raquo;; Supporting is then indistinguishable and shows 0.</li>
                     <li>Scope: the latest completed audit with SearchGPT answers, one row per prompt&nbsp;&times;&nbsp;run. Full source panels are collected since Aug&nbsp;19, 2026.</li>
                   </ul>
                 </CardContent>
