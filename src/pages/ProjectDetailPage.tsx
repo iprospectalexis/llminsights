@@ -437,28 +437,45 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
         if (e1) throw e1;
         const ids = (auds || []).map(a2 => a2.id);
         if (ids.length === 0) throw new Error('No completed audits yet');
-        // Panels only — no answer_text (egress): the server-side filter
-        // keeps answered rows.
-        const { data: rows, error: e2 } = await supabase
-          .from('llm_responses')
-          .select('id, audit_id, prompt_id, links_attached, citations, search_sources, search_sources_more, web_search_query')
-          .in('audit_id', ids)
-          .eq('llm', 'searchgpt')
-          .not('answer_text', 'is', null)
-          .neq('answer_text', '');
-        if (e2) throw e2;
-        const byAudit = new Map<string, any[]>();
-        (rows || []).forEach(r => {
-          const arr = byAudit.get(r.audit_id) || [];
-          arr.push(r);
-          byAudit.set(r.audit_id, arr);
-        });
-        const chosen = (auds || []).find(a2 => (byAudit.get(a2.id) || []).length > 0);
+        // Pick the newest audit that HAS searchgpt answers first (cheap HEAD
+        // counts), THEN page through that single audit's rows. Fetching all
+        // 10 audits in one query silently hit PostgREST's 1000-row cap: on a
+        // 135-prompt project only 8 rows of the newest audit survived the
+        // cut and the funnel showed "All Prompts (8)".
+        let chosen: any = null;
+        for (const a2 of auds || []) {
+          const { count, error: eh } = await supabase
+            .from('llm_responses')
+            .select('id', { count: 'exact', head: true })
+            .eq('audit_id', a2.id)
+            .eq('llm', 'searchgpt')
+            .not('answer_text', 'is', null)
+            .neq('answer_text', '');
+          if (eh) throw eh;
+          if ((count || 0) > 0) { chosen = a2; break; }
+        }
         if (cancelled) return;
         if (!chosen) {
           setCfError('No completed audit contains SearchGPT answers for this project');
         } else {
-          setCfData({ auditId: chosen.id, auditDate: chosen.created_at, rows: byAudit.get(chosen.id)! });
+          const rows: any[] = [];
+          const PAGE = 1000;
+          for (let from = 0; ; from += PAGE) {
+            const { data: page, error: e2 } = await supabase
+              .from('llm_responses')
+              .select('id, audit_id, prompt_id, links_attached, citations, search_sources, search_sources_more, web_search_query')
+              .eq('audit_id', chosen.id)
+              .eq('llm', 'searchgpt')
+              .not('answer_text', 'is', null)
+              .neq('answer_text', '')
+              .order('id', { ascending: true })
+              .range(from, from + PAGE - 1);
+            if (e2) throw e2;
+            rows.push(...(page || []));
+            if (!page || page.length < PAGE) break;
+          }
+          if (cancelled) return;
+          setCfData({ auditId: chosen.id, auditDate: chosen.created_at, rows });
         }
       } catch (e: any) {
         if (!cancelled) setCfError(e.message || String(e));
