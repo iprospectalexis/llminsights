@@ -441,7 +441,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
         // keeps answered rows.
         const { data: rows, error: e2 } = await supabase
           .from('llm_responses')
-          .select('id, audit_id, prompt_id, links_attached, search_sources, search_sources_more, web_search_query')
+          .select('id, audit_id, prompt_id, links_attached, citations, search_sources, search_sources_more, web_search_query')
           .in('audit_id', ids)
           .eq('llm', 'searchgpt')
           .not('answer_text', 'is', null)
@@ -3895,12 +3895,21 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
       const la = urlsOf(r.links_attached);
       const ss = urlsOf(r.search_sources);
       const ssm = urlsOf(r.search_sources_more);
-      const searched = la.some(u => u.includes('utm_source=chatgpt.com')) ||
-        ss.length > 0 || ssm.length > 0 || !!r.web_search_query;
+      const cit = urlsOf(r.citations);
+      // BrightData snapshots come in variants: some carry the full source
+      // panels, others only links_attached, others only the citations panel
+      // (verified on raw files: citations = the in-text links deduped by
+      // domain, so it is a legitimate "used in answer" signal).
+      const searched =
+        la.some(u => u.includes('utm_source=chatgpt.com')) ||
+        cit.some(u => u.includes('utm_source=chatgpt.com')) ||
+        ss.length > 0 || ssm.length > 0 || cit.length > 0 || !!r.web_search_query;
       if (!searched) { noSearch++; return; }
       webSearch++;
-      const inMain = la.some(isOwn);
-      const inUsedPanel = ss.some(isOwn);
+      const mainSet = la.length > 0 ? la : cit;      // in-text links (or their deduped panel)
+      const usedSet = ss.length > 0 ? ss : mainSet;  // used-sources panel when captured
+      const inMain = mainSet.some(isOwn);
+      const inUsedPanel = usedSet.some(isOwn);
       const inMore = ssm.some(isOwn);
       if (!inMain && !inUsedPanel && !inMore) { absent++; return; }
       present++;
@@ -7694,7 +7703,8 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                     <li><b>Present in Sources</b> &mdash; your domain appears anywhere in the retrieved set: answer links, the sources panel, or the &laquo;More&raquo; list.</li>
                     <li><b>Citations</b> &mdash; your domain is in the used-sources panel or the answer itself; <b>More / Supplemental</b> &mdash; retrieved but only in the &laquo;More&raquo; list.</li>
                     <li><b>Main Citations</b> &mdash; linked inside the answer text; <b>Supporting</b> &mdash; in the used-sources panel without an in-text link.</li>
-                    <li>Scope: the latest completed audit with SearchGPT answers, one row per prompt&nbsp;&times;&nbsp;run. Source panels are collected since Aug&nbsp;19, 2026 &mdash; older audits show everything as &laquo;Absent&raquo;.</li>
+                    <li>Snapshot variants: when a capture lacks the expanded panels, the funnel falls back to the answer's Citations panel (verified equal to the in-text links deduped by domain); Supporting is then indistinguishable and shows 0.</li>
+                    <li>Scope: the latest completed audit with SearchGPT answers, one row per prompt&nbsp;&times;&nbsp;run. Full source panels are collected since Aug&nbsp;19, 2026.</li>
                   </ul>
                 </CardContent>
               </Card>
