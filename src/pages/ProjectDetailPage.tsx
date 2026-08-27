@@ -47,9 +47,9 @@ const LLM_NAME_LABELS: Record<string, string> = {
 import { BrandFavicon } from '../components/ui/BrandFavicon';
 import { LoadingSpinner } from '../components/ui/LoadingSpinner';
 import { queryCache } from '../lib/queryCache';
-import { Calendar, FileText, ChartBar as BarChart3, Globe, Users, Play, ArrowLeft, Brain, Download, Settings as SettingsIcon, PencilLine, X, MessageSquare, Crown, TrendingUp, TrendingDown, Lightbulb, Trash2, Info, Settings, CalendarCheck, ArrowUpDown, ArrowUp, ArrowDown, BadgeCheck, MessageCircle, List, ChevronDown, Smile, ShoppingBag, Map as MapIcon, Megaphone } from 'lucide-react';
+import { Calendar, FileText, ChartBar as BarChart3, Globe, Users, Play, ArrowLeft, Brain, Download, Settings as SettingsIcon, PencilLine, X, MessageSquare, Crown, TrendingUp, TrendingDown, Lightbulb, Trash2, Info, Settings, CalendarCheck, ArrowUpDown, ArrowUp, ArrowDown, BadgeCheck, MessageCircle, List, ChevronDown, Smile, ShoppingBag, Map as MapIcon, Megaphone, Workflow } from 'lucide-react';
 import { SentimentDashboard } from '../components/sentiment/SentimentDashboard';
-import { PieChart, Pie, Cell, ResponsiveContainer, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, LineChart, Line, Legend } from 'recharts';
+import { PieChart, Pie, Cell, ResponsiveContainer, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, LineChart, Line, Legend, Sankey } from 'recharts';
 import { RadarChart, Radar, PolarGrid, PolarAngleAxis, PolarRadiusAxis } from 'recharts';
 import { AuditProgressToast } from '../components/audit/AuditProgressToast';
 import { ProjectScheduledAuditsSettings } from '../components/projects/ProjectScheduledAuditsSettings';
@@ -328,6 +328,13 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
   const [domainCategoryFilter, setDomainCategoryFilter] = useState<string>('all');
   const [domainsView, setDomainsView] = useState<'performance' | 'insights'>('performance');
   const [mentionsMetric, setMentionsMetric] = useState<'rate' | 'count'>('rate');
+  // Citation Funnel (experimental): lazy-loaded searchgpt source panels for
+  // the latest completed audit that has searchgpt answers.
+  const [cfData, setCfData] = useState<{
+    auditId: string; auditDate: string; rows: any[];
+  } | null>(null);
+  const [cfLoading, setCfLoading] = useState(false);
+  const [cfError, setCfError] = useState<string | null>(null);
 
   // Ads dashboard (lazy-loaded on tab open). Ads are collected since the
   // rich-results deploy — older audits have ads=null because the field
@@ -412,6 +419,56 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
   }>({ loading: false, citations: null, mentions: null });
 
   const promptGroupsKey = filters.promptGroups.join('|');
+
+  useEffect(() => {
+    if (activeTab !== 'citation-funnel' || !id || cfData || cfLoading) return;
+    let cancelled = false;
+    (async () => {
+      setCfLoading(true);
+      setCfError(null);
+      try {
+        const { data: auds, error: e1 } = await supabase
+          .from('audits')
+          .select('id, created_at')
+          .eq('project_id', id)
+          .eq('status', 'completed')
+          .order('created_at', { ascending: false })
+          .limit(10);
+        if (e1) throw e1;
+        const ids = (auds || []).map(a2 => a2.id);
+        if (ids.length === 0) throw new Error('No completed audits yet');
+        // Panels only — no answer_text (egress): the server-side filter
+        // keeps answered rows.
+        const { data: rows, error: e2 } = await supabase
+          .from('llm_responses')
+          .select('id, audit_id, prompt_id, links_attached, search_sources, search_sources_more, web_search_query')
+          .in('audit_id', ids)
+          .eq('llm', 'searchgpt')
+          .not('answer_text', 'is', null)
+          .neq('answer_text', '');
+        if (e2) throw e2;
+        const byAudit = new Map<string, any[]>();
+        (rows || []).forEach(r => {
+          const arr = byAudit.get(r.audit_id) || [];
+          arr.push(r);
+          byAudit.set(r.audit_id, arr);
+        });
+        const chosen = (auds || []).find(a2 => (byAudit.get(a2.id) || []).length > 0);
+        if (cancelled) return;
+        if (!chosen) {
+          setCfError('No completed audit contains SearchGPT answers for this project');
+        } else {
+          setCfData({ auditId: chosen.id, auditDate: chosen.created_at, rows: byAudit.get(chosen.id)! });
+        }
+      } catch (e: any) {
+        if (!cancelled) setCfError(e.message || String(e));
+      } finally {
+        if (!cancelled) setCfLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, id]);
   useEffect(() => {
     if (!id) return;
     let cancelled = false;
@@ -3806,6 +3863,60 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
   };
 
   // Calculate brand mentions data based on filtered responses
+  // Citation Funnel stages for the project's own domain, per prompt of one
+  // searchgpt audit. Source tiers come straight from the ChatGPT interface:
+  // links_attached = links in the answer text; search_sources = the "used"
+  // sources panel; search_sources_more = the supplemental "More" list.
+  // BrightData's web_search_triggered flag is unreliable (observed False on
+  // rows whose links all carry utm_source=chatgpt.com), so search detection
+  // uses the utm marker / panel presence instead.
+  const citationFunnel = useMemo(() => {
+    if (!cfData || !project?.domain) return null;
+    const projectDomain = project.domain.toLowerCase().replace(/^www\./, '');
+    const domainMode = project.domain_mode || 'exact';
+    const isOwn = (u: string) => {
+      try {
+        const host = new URL(u).hostname.toLowerCase().replace(/^www\./, '');
+        return host === projectDomain ||
+          (domainMode === 'subdomains' && host.endsWith(`.${projectDomain}`));
+      } catch { return false; }
+    };
+    const urlsOf = (v: any): string[] => {
+      let arr = v;
+      if (typeof arr === 'string') { try { arr = JSON.parse(arr); } catch { return []; } }
+      if (!Array.isArray(arr)) return [];
+      return arr.map((x: any) => (typeof x === 'string' ? x : x?.url)).filter(Boolean);
+    };
+
+    let webSearch = 0, noSearch = 0, present = 0, absent = 0;
+    let cited = 0, moreOnly = 0, mainCit = 0, supporting = 0;
+
+    cfData.rows.forEach(r => {
+      const la = urlsOf(r.links_attached);
+      const ss = urlsOf(r.search_sources);
+      const ssm = urlsOf(r.search_sources_more);
+      const searched = la.some(u => u.includes('utm_source=chatgpt.com')) ||
+        ss.length > 0 || ssm.length > 0 || !!r.web_search_query;
+      if (!searched) { noSearch++; return; }
+      webSearch++;
+      const inMain = la.some(isOwn);
+      const inUsedPanel = ss.some(isOwn);
+      const inMore = ssm.some(isOwn);
+      if (!inMain && !inUsedPanel && !inMore) { absent++; return; }
+      present++;
+      if (inMain || inUsedPanel) {
+        cited++;
+        if (inMain) mainCit++; else supporting++;
+      } else {
+        moreOnly++;
+      }
+    });
+
+    const total = cfData.rows.length;
+    return { total, webSearch, noSearch, present, absent, cited, moreOnly, mainCit, supporting };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cfData, project?.domain, project?.domain_mode]);
+
   // Matrix View data: brand x LLM mention counts/rates from the extracted
   // answer_competitors (not substring matching), across the loaded window
   // under the active filters. One pass over responses.
@@ -3985,6 +4096,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     { id: 'pages', label: 'Pages', icon: FileText },
     { id: 'domains', label: 'Domains', icon: Globe },
     { id: 'ads', label: 'Ads', icon: Megaphone },
+    { id: 'citation-funnel', label: 'Citation Funnel', icon: Workflow },
     { id: 'mentions', label: 'Mentions', icon: BadgeCheck },
     { id: 'insights', label: 'Insights', icon: Lightbulb },
     { id: 'sentiment', label: 'Sentiment', icon: Smile },
@@ -7463,6 +7575,129 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                   </>
                 );
               })()}
+            </div>
+          )}
+
+          {activeTab === 'citation-funnel' && (
+            <div className="space-y-6">
+              <Card>
+                <CardHeader>
+                  <div className="flex items-start justify-between flex-wrap gap-3">
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <h3 className="text-xl font-bold text-gray-900 dark:text-gray-100">Citation Funnel</h3>
+                        <span className="px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wide bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300 border border-amber-300/60 dark:border-amber-700/40">
+                          Experimental
+                        </span>
+                      </div>
+                      <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">
+                        How your domain travels through ChatGPT's search pipeline: retrieved &rarr; sources panel &rarr; cited in the answer.
+                        {cfData && (
+                          <span className="ml-1 text-gray-500 dark:text-gray-500">
+                            Audit of {new Date(cfData.auditDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })} &middot; SearchGPT only.
+                          </span>
+                        )}
+                      </p>
+                    </div>
+                  </div>
+                </CardHeader>
+                <CardContent>
+                  {cfLoading ? (
+                    <div className="flex items-center justify-center h-64"><LoadingSpinner size="lg" /></div>
+                  ) : cfError ? (
+                    <p className="text-sm text-gray-500 dark:text-gray-400 py-10 text-center">{cfError}</p>
+                  ) : !citationFunnel ? (
+                    <p className="text-sm text-gray-500 dark:text-gray-400 py-10 text-center">No data</p>
+                  ) : (() => {
+                    const f = citationFunnel;
+                    const NODES = [
+                      { name: `All Prompts (${f.total})`, color: '#ec4899' },
+                      { name: `Web Search Enabled (${f.webSearch})`, color: '#ec4899' },
+                      { name: `Web Search Disabled (${f.noSearch})`, color: '#6b7280' },
+                      { name: `Present in Sources (${f.present})`, color: '#f97316' },
+                      { name: `Absent in Sources (${f.absent})`, color: '#fbbf24' },
+                      { name: `Citations (${f.cited})`, color: '#38bdf8' },
+                      { name: `More / Supplemental (${f.moreOnly})`, color: '#fbbf24' },
+                      { name: `Main Citations (${f.mainCit})`, color: '#38bdf8' },
+                      { name: `Supporting Citations (${f.supporting})`, color: '#60a5fa' },
+                    ];
+                    const L = (source: number, target: number, value: number) => ({ source, target, value });
+                    const links = [
+                      L(0, 1, f.webSearch), L(0, 2, f.noSearch),
+                      L(1, 3, f.present), L(1, 4, f.absent),
+                      L(3, 5, f.cited), L(3, 6, f.moreOnly),
+                      L(5, 7, f.mainCit), L(5, 8, f.supporting),
+                    ].filter(l => l.value > 0);
+                    const usedIdx = new Set<number>();
+                    links.forEach(l => { usedIdx.add(l.source); usedIdx.add(l.target); });
+                    const idxMap = new Map<number, number>();
+                    const nodes = NODES.filter((_, i) => usedIdx.has(i)).map((n, newIdx) => {
+                      idxMap.set(NODES.indexOf(n), newIdx);
+                      return n;
+                    });
+                    const data = {
+                      nodes,
+                      links: links.map(l => ({ source: idxMap.get(l.source)!, target: idxMap.get(l.target)!, value: l.value })),
+                    };
+                    const NodeShape = (props: any) => {
+                      const { x, y, width, height, payload } = props;
+                      return (
+                        <g>
+                          <rect x={x} y={y} width={width} height={height} fill={payload.color} rx={2} />
+                          <text
+                            x={x + width + 8}
+                            y={y + height / 2}
+                            dominantBaseline="middle"
+                            className="fill-gray-800 dark:fill-gray-100"
+                            fontSize={13}
+                            fontWeight={600}
+                          >
+                            {payload.name}
+                          </text>
+                        </g>
+                      );
+                    };
+                    return (
+                      <div className="h-[440px]">
+                        <ResponsiveContainer width="100%" height="100%">
+                          <Sankey
+                            data={data}
+                            node={<NodeShape />}
+                            nodePadding={42}
+                            nodeWidth={12}
+                            margin={{ top: 16, right: 220, bottom: 16, left: 8 }}
+                            link={{ stroke: '#94a3b8', strokeOpacity: 0.35 }}
+                          >
+                            <Tooltip
+                              contentStyle={{
+                                backgroundColor: 'rgb(var(--bg-surface))',
+                                border: '1px solid rgb(var(--border))',
+                                borderRadius: '12px',
+                                fontFamily: 'Plus Jakarta Sans'
+                              }}
+                            />
+                          </Sankey>
+                        </ResponsiveContainer>
+                      </div>
+                    );
+                  })()}
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardHeader>
+                  <h4 className="text-sm font-semibold text-gray-900 dark:text-gray-100">How the stages are defined</h4>
+                </CardHeader>
+                <CardContent>
+                  <ul className="text-sm text-gray-600 dark:text-gray-400 space-y-1.5">
+                    <li><b>Web Search Enabled</b> &mdash; the answer carries search-attributed links (utm marker) or a sources panel. ChatGPT's own flag is unreliable and is not used.</li>
+                    <li><b>Present in Sources</b> &mdash; your domain appears anywhere in the retrieved set: answer links, the sources panel, or the &laquo;More&raquo; list.</li>
+                    <li><b>Citations</b> &mdash; your domain is in the used-sources panel or the answer itself; <b>More / Supplemental</b> &mdash; retrieved but only in the &laquo;More&raquo; list.</li>
+                    <li><b>Main Citations</b> &mdash; linked inside the answer text; <b>Supporting</b> &mdash; in the used-sources panel without an in-text link.</li>
+                    <li>Scope: the latest completed audit with SearchGPT answers, one row per prompt&nbsp;&times;&nbsp;run. Source panels are collected since Aug&nbsp;19, 2026 &mdash; older audits show everything as &laquo;Absent&raquo;.</li>
+                  </ul>
+                </CardContent>
+              </Card>
             </div>
           )}
 
