@@ -18,6 +18,7 @@ import {
   BrandRow, ResponseRow, SentimentRow, PromptMeta, AuditMeta, CompetitorStats,
 } from '../utils/competitors';
 import { useDashboardFilters } from '../contexts/DashboardFiltersContext';
+import { DashboardFilterBar } from '../components/filters/DashboardFilterBar';
 import { resolveDateWindow } from '../lib/dashboard-filter-utils';
 import * as XLSX from 'xlsx';
 
@@ -376,7 +377,12 @@ export const ProjectCompetitorsPage: React.FC = () => {
           </div>
         </div>
 
-        {/* Toolbar — date/LLM/group filters live in the global
+        {/* Unified template: filters directly below the header */}
+        <div className="mb-6">
+          <DashboardFilterBar />
+        </div>
+
+        {/* Toolbar — date/LLM/group filters live in the
             DashboardFilterBar above; this row keeps only the page-local
             matrix control + summary count + export. */}
         <div className="flex flex-wrap items-center justify-between gap-3 mb-6">

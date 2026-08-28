@@ -46,7 +46,7 @@ export type DashboardFilters = {
 };
 
 export const DEFAULT_FILTERS: DashboardFilters = {
-  dateRange: 'lastAudit',
+  dateRange: 'last90days',
   customDateRange: { startDate: '', endDate: '' },
   llms: [],
   promptGroups: [],
@@ -71,13 +71,17 @@ export const URL_KEYS = {
 export const LOCAL_STORAGE_KEY = (projectId: string | null | undefined) =>
   `dfilters_v1_${projectId ?? 'global'}`;
 
+/**
+ * Presets the UI offers. `lastAudit` and `all` were retired when the
+ * period selector became the GSC-style button row (7d / 14d / 1m / 3m /
+ * custom): they remain in the type so legacy stored/URL values still
+ * type-check, but hydration coerces them to the default 3-month window.
+ */
 export const VALID_DATE_RANGE_PRESETS: ReadonlyArray<DateRangePreset> = [
-  'lastAudit',
   'last7days',
   'last14days',
   'last30days',
   'last90days',
-  'all',
   'custom',
 ];
 

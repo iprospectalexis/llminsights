@@ -11,6 +11,7 @@ import {
 import { format } from 'date-fns';
 import * as XLSX from 'xlsx';
 import { useDashboardFilters } from '../contexts/DashboardFiltersContext';
+import { DashboardFilterBar } from '../components/filters/DashboardFilterBar';
 import { resolveDateWindow } from '../lib/dashboard-filter-utils';
 
 const LLM_ICONS = {
@@ -403,6 +404,9 @@ export const DomainDetailPage: React.FC = () => {
           Export to Excel
         </Button>
       </motion.div>
+
+      {/* Unified template: filters directly below the header */}
+      <DashboardFilterBar />
 
       {/* Stats Cards */}
       <div className="grid grid-cols-1 md:grid-cols-4 gap-6">

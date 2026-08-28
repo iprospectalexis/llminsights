@@ -6,6 +6,7 @@ import { LoadingSpinner } from '../components/ui/LoadingSpinner';
 import { Button } from '../components/ui/Button';
 import { ProjectDetailPage } from './ProjectDetailPage';
 import { useDashboardFilters } from '../contexts/DashboardFiltersContext';
+import { DashboardFilterBar } from '../components/filters/DashboardFilterBar';
 import * as XLSX from 'xlsx';
 
 const LLM_ICONS = {
@@ -846,6 +847,11 @@ export const ProjectPromptsPage: React.FC = () => {
               </p>
             </div>
           </div>
+        </div>
+
+        {/* Unified template: filters directly below the header */}
+        <div className="mb-6">
+          <DashboardFilterBar />
         </div>
 
         {/* Tabs */}

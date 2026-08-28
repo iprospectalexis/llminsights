@@ -19,6 +19,7 @@ import {
   countActiveFilters,
   filtersEqual,
   hydrate,
+  normalizeDateRangePreset,
   parseFromUrl,
   ProjectMeta,
   serializeToUrl,
@@ -163,8 +164,9 @@ export const DashboardFiltersProvider: React.FC<ProviderProps> = ({
   // it and update local state IFF it differs. The equality check
   // breaks the cycle with the previous effect.
   useEffect(() => {
-    const fromUrl = parseFromUrl(searchParams);
-    if (!fromUrl) return;
+    const parsed = parseFromUrl(searchParams);
+    if (!parsed) return;
+    const fromUrl = normalizeDateRangePreset(parsed);
     setFilters(prev => (filtersEqual(prev, fromUrl) ? prev : fromUrl));
   }, [searchParams]);
 
@@ -196,7 +198,7 @@ export const DashboardFiltersProvider: React.FC<ProviderProps> = ({
         next = DEFAULT_FILTERS;
       }
     }
-    setFilters(next);
+    setFilters(normalizeDateRangePreset(next));
   }, [projectId, searchParams]);
 
   // Pages register their project metadata as it loads.

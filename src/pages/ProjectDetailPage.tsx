@@ -59,6 +59,7 @@ import { getCountryByCode } from '../utils/countries';
 import { useProject } from '../contexts/ProjectContext';
 import { useDashboardFilters } from '../contexts/DashboardFiltersContext';
 import { resolveDateWindow } from '../lib/dashboard-filter-utils';
+import { DashboardFilterBar } from '../components/filters/DashboardFilterBar';
 
 // Explicit filter type. Catches keyboard slips like `promptGroup` vs
 // `promptGroups` — the latter is the real state key (a string[] of
@@ -254,6 +255,16 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
   const setCustomDateRange = useCallback((next: { startDate: string; endDate: string }) => {
     setGlobalFilter('customDateRange', next);
   }, [setGlobalFilter]);
+  // Day-granular key of the selected period. Drives every fetch that
+  // must reload when the user picks another window. Sliced to dates so
+  // the rolling presets (which resolve from `new Date()`) don't produce
+  // a new key on every render.
+  const windowKey = useMemo(() => {
+    const win = resolveDateWindow(globalFilters, null);
+    if (!win) return 'all';
+    return `${win.start.toISOString().slice(0, 10)}|${win.end.toISOString().slice(0, 10)}`;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [globalFilters.dateRange, globalFilters.customDateRange.startDate, globalFilters.customDateRange.endDate]);
   const [availableDates, setAvailableDates] = useState<string[]>([]);
   const [editFormData, setEditFormData] = useState({
     name: '',
@@ -282,6 +293,16 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
   const [processedCitations, setProcessedCitations] = useState<any[]>([]);
   const [lastAuditDate, setLastAuditDate] = useState<string>('');
   const [auditsData, setAuditsData] = useState<any[]>([]);
+  // Lightweight meta for EVERY audit of the project (id/date/status) —
+  // independent of the selected period. Feeds the custom-range picker
+  // and the "which audits fall inside the window" resolution.
+  const [allAuditsMeta, setAllAuditsMeta] = useState<any[]>([]);
+  // True while the window data (responses/citations) reloads after a
+  // period change — the page keeps showing the previous window instead
+  // of flashing the full-page loader.
+  const [windowLoading, setWindowLoading] = useState(false);
+  // Set when a safety cap cut the fetch short (extremely dense window).
+  const [dataTruncated, setDataTruncated] = useState<{ audits: number } | null>(null);
   const [showCompetitorsInTrend, setShowCompetitorsInTrend] = useState(false);
   const [selectedTrendCompetitors, setSelectedTrendCompetitors] = useState<string[]>([]);
   const [showCompetitorsInCitationsTrend, setShowCompetitorsInCitationsTrend] = useState(false);
@@ -411,15 +432,23 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab, id]);
 
-  // Full-history trends for the Overview charts. The page's own data holds
-  // only the 5 most recent audits, so these two series come from server-side
-  // aggregates over the WHOLE project history (project_citations_over_time /
-  // project_mentions_over_time RPCs).
+  // Period trends for the Overview charts: server-side aggregates
+  // (project_citations_over_time / project_mentions_over_time RPCs)
+  // over the selected window — cheaper and more complete than walking
+  // the client-side rows.
   const [trends, setTrends] = useState<{
     loading: boolean; citations: any[] | null; mentions: any[] | null;
   }>({ loading: false, citations: null, mentions: null });
 
   const promptGroupsKey = filters.promptGroups.join('|');
+
+  // A period change invalidates the funnel snapshot (it is built from
+  // the newest completed audit INSIDE the window).
+  useEffect(() => {
+    setCfData(null);
+    setCfError(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [windowKey]);
 
   useEffect(() => {
     if (activeTab !== 'citation-funnel' || !id || cfData || cfLoading) return;
@@ -428,16 +457,23 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
       setCfLoading(true);
       setCfError(null);
       try {
-        const { data: auds, error: e1 } = await supabase
+        const cfWin = resolveDateWindow(globalFilters, null);
+        let candQuery = supabase
           .from('audits')
           .select('id, created_at')
           .eq('project_id', id)
           .eq('status', 'completed')
           .order('created_at', { ascending: false })
           .limit(10);
+        if (cfWin) {
+          candQuery = candQuery
+            .gte('created_at', cfWin.start.toISOString())
+            .lte('created_at', cfWin.end.toISOString());
+        }
+        const { data: auds, error: e1 } = await candQuery;
         if (e1) throw e1;
         const ids = (auds || []).map(a2 => a2.id);
-        if (ids.length === 0) throw new Error('No completed audits yet');
+        if (ids.length === 0) throw new Error('No completed audits in the selected period');
         // Pick the newest audit that HAS searchgpt answers first (cheap HEAD
         // counts), THEN page through that single audit's rows. Fetching all
         // 10 audits in one query silently hit PostgREST's 1000-row cap: on a
@@ -486,19 +522,21 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     })();
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTab, id]);
+  }, [activeTab, id, windowKey, cfData]);
   useEffect(() => {
     if (!id) return;
     let cancelled = false;
     (async () => {
       setTrends(prev => ({ ...prev, loading: true }));
-      const custom = filters.dateRange === 'custom' && customDateRange.startDate && customDateRange.endDate;
+      // The Over-Time charts cover exactly the selected period (default
+      // 3 months) — every preset resolves to a [from, to] window now.
+      const win = resolveDateWindow(globalFilters, null);
       const common = {
         p_project_id: id,
         p_llm: filters.llms !== 'all' ? filters.llms : null,
         p_groups: filters.promptGroups.length > 0 ? filters.promptGroups : null,
-        p_from: custom ? new Date(customDateRange.startDate).toISOString() : null,
-        p_to: custom ? new Date(`${customDateRange.endDate}T23:59:59`).toISOString() : null,
+        p_from: win ? win.start.toISOString() : null,
+        p_to: win ? win.end.toISOString() : null,
       };
       try {
         const [cit, men] = await Promise.all([
@@ -627,10 +665,13 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
 
   useEffect(() => {
     if (id) {
+      // Re-runs when the selected period changes: the whole data window
+      // (audits in period + their responses/citations) is re-fetched.
       fetchProjectData();
       fetchGroups();
     }
-  }, [id]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id, windowKey]);
 
   // Sync activeTab with URL or override
   useEffect(() => {
@@ -736,6 +777,11 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     processedCitations.forEach(c => {
       if (c.checked_at) allAvailable.add(c.checked_at.split('T')[0]);
     });
+    // The custom-range calendar must offer the WHOLE project history,
+    // not just the audits inside the currently-selected window.
+    allAuditsMeta.forEach(a => {
+      if (a.created_at) allAvailable.add(a.created_at.split('T')[0]);
+    });
     setAvailableDates(Array.from(allAvailable).sort());
 
     if (processedCitations.length > 0) {
@@ -817,7 +863,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
       availableDates: Array.from(allAvailable).sort(),
       hasAudits: auditDatesFromAudits.size > 0,
     });
-  }, [processedCitations, auditsData, llmResponses, promptGroups, registerProjectMeta, setLastAuditDateInCtx]);
+  }, [processedCitations, auditsData, allAuditsMeta, llmResponses, promptGroups, registerProjectMeta, setLastAuditDateInCtx]);
 
   const calculateBrandLeadership = () => {
     try {
@@ -1757,9 +1803,18 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
   const fetchProjectData = async () => {
     if (!id) return;
 
-    setLoading(true);
+    // Full-page loader only on the first load of a project; a period
+    // change keeps the previous window on screen behind a small
+    // "reloading" indicator in the filter bar.
+    if (!project || project.id !== id) {
+      setLoading(true);
+    } else {
+      setWindowLoading(true);
+    }
     const abortController = new AbortController();
-    const timeoutId = setTimeout(() => abortController.abort(), 15_000);
+    // Wide windows on dense projects legitimately take a while — the
+    // old 15s guard aborted mid-pagination.
+    const timeoutId = setTimeout(() => abortController.abort(), 60_000);
     try {
       // Fetch project details (with cache for navigation back/forth)
       const cacheKey = `project:${id}:detail`;
@@ -1823,29 +1878,42 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
         });
       }
 
-      // First, get only the most recent 10 audits to avoid timeout
-      const { data: recentAudits, error: auditsError } = await supabase
+      // Unified template: load EVERY audit inside the selected period,
+      // not a fixed "last N". Audit meta for the whole project is cheap
+      // (light columns) and also feeds the custom-range picker with all
+      // dates that actually exist.
+      const { data: allAudits, error: auditsError } = await supabase
         .from('audits')
-        .select('id, created_at, status, current_step')
+        .select('id, created_at, status, current_step, llms')
         .eq('project_id', id)
-        .order('created_at', { ascending: false })
-        .limit(5);
+        .order('created_at', { ascending: false });
 
       if (auditsError) {
         console.error('Error fetching audits:', auditsError);
         setLlmResponses([]);
         setCitations([]);
         setLoading(false);
+        setWindowLoading(false);
         return;
       }
 
-      const recentAuditIds = recentAudits?.map(a => a.id) || [];
+      setAllAuditsMeta(allAudits || []);
+
+      // Keep only the audits inside the active period.
+      const win = resolveDateWindow(globalFilters, null);
+      const windowAudits = (allAudits || []).filter(a => {
+        if (!win) return true;
+        const t = new Date(a.created_at).getTime();
+        return t >= win.start.getTime() && t <= win.end.getTime();
+      });
+      const recentAuditIds = windowAudits.map(a => a.id);
 
       // Store audits data for later use
-      setAuditsData(recentAudits || []);
+      setAuditsData(windowAudits);
 
-      // Check for running audits and store their info
-      const runningAudit = recentAudits?.find(audit => audit.status === 'running');
+      // Check for running audits across the WHOLE project — a running
+      // audit is running regardless of the period being viewed.
+      const runningAudit = (allAudits || []).find(audit => audit.status === 'running');
       if (runningAudit) {
         setRunningAuditInfo({
           status: runningAudit.status,
@@ -1858,9 +1926,10 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
         setRunningAuditInfo(null);
       }
 
-      // Extract available LLMs from completed audits
+      // Extract available LLMs from completed audits (whole project, so
+      // the LLM filter offers stable options across period switches).
       const llmsSet = new Set<string>();
-      recentAudits?.forEach(audit => {
+      (allAudits || []).forEach(audit => {
         if (audit.status === 'completed' && audit.llms) {
           audit.llms.forEach((llm: string) => llmsSet.add(llm));
         }
@@ -1880,8 +1949,14 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
         setLlmResponses([]);
         setCitations([]);
         setAuditDates([]);
+        setDataTruncated(null);
       } else {
-        // Then fetch LLM responses for only these recent audits.
+        // Fetch responses + citations for EVERY audit in the window,
+        // paging past PostgREST's silent 1000-row cap. Audit ids go in
+        // chunks of 60 so the in.() URL stays well under gateway
+        // limits; chunks are walked newest-first so the safety cap
+        // (dense-window runaway guard) keeps the most recent audits.
+        //
         // Cost reduction: we drop only the heavy `raw_response_data`
         // (the big egress win). `all_sources` and `links_attached` MUST
         // stay — they are where several providers keep their citations:
@@ -1890,69 +1965,109 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
         // Perplexity/SearchGPT also use the `citations` column + table.
         // Dropping all_sources/links_attached zeroed out Citation Rate,
         // Pages and Domains for Bing/Google/Grok.
-        const { data: llmResponsesData, error: responsesError } = await supabase
-          .from('llm_responses')
-          .select(`
-            id,
-            audit_id,
-            prompt_id,
-            llm,
-            answer_text,
-            citations,
-            all_sources,
-            links_attached,
-            web_search_query,
-            sentiment_score,
-            sentiment_label,
-            answer_competitors,
-            shopping_visible,
-            is_map,
-            ad_name:ads->>name,
-            created_at,
-            prompts (prompt_text, prompt_group),
-            audits (created_at, llms)
-          `)
-          .in('audit_id', recentAuditIds)
-          .order('created_at', { ascending: false })
-          .abortSignal(abortController.signal);
+        const RESPONSES_CAP = 10000;
+        const CITATIONS_CAP = 60000;
+        const PAGE = 1000;
+        const idChunks: string[][] = [];
+        for (let i = 0; i < recentAuditIds.length; i += 60) {
+          idChunks.push(recentAuditIds.slice(i, i + 60));
+        }
 
-        if (responsesError) {
-          console.error('Error fetching LLM responses:', responsesError);
+        const fetchAllRows = async (
+          buildQuery: (chunk: string[]) => any,
+          cap: number,
+        ): Promise<{ rows: any[]; truncated: boolean }> => {
+          const rows: any[] = [];
+          let truncated = false;
+          let nextChunk = 0;
+          const worker = async () => {
+            while (nextChunk < idChunks.length) {
+              if (rows.length >= cap) { truncated = true; return; }
+              const chunk = idChunks[nextChunk++];
+              for (let from = 0; ; from += PAGE) {
+                const { data: page, error } = await buildQuery(chunk)
+                  .order('id', { ascending: true })
+                  .range(from, from + PAGE - 1)
+                  .abortSignal(abortController.signal);
+                if (error) throw error;
+                rows.push(...(page || []));
+                if (!page || page.length < PAGE) break;
+                if (rows.length >= cap) { truncated = true; return; }
+              }
+            }
+          };
+          await Promise.all(
+            Array.from({ length: Math.min(3, idChunks.length) }, () => worker()),
+          );
+          return { rows, truncated };
+        };
+
+        const [respResult, citResult] = await Promise.allSettled([
+          fetchAllRows(chunk => supabase
+            .from('llm_responses')
+            .select(`
+              id,
+              audit_id,
+              prompt_id,
+              llm,
+              answer_text,
+              citations,
+              all_sources,
+              links_attached,
+              web_search_query,
+              sentiment_score,
+              sentiment_label,
+              answer_competitors,
+              shopping_visible,
+              is_map,
+              ad_name:ads->>name,
+              created_at,
+              prompts (prompt_text, prompt_group),
+              audits (created_at, llms)
+            `)
+            .in('audit_id', chunk), RESPONSES_CAP),
+          fetchAllRows(chunk => supabase
+            .from('citations')
+            .select(`
+              id,
+              audit_id,
+              prompt_id,
+              llm,
+              page_url,
+              domain,
+              citation_text,
+              position,
+              cited,
+              sentiment_score,
+              sentiment_label,
+              checked_at,
+              prompts (prompt_text, prompt_group),
+              audits (created_at, llms)
+            `)
+            .in('audit_id', chunk), CITATIONS_CAP),
+        ]);
+
+        let anyTruncated = false;
+        if (respResult.status === 'fulfilled') {
+          // Restore the pre-pagination contract: newest first.
+          respResult.value.rows.sort((a, b) =>
+            String(b.created_at || '').localeCompare(String(a.created_at || '')));
+          setLlmResponses(respResult.value.rows);
+          anyTruncated = anyTruncated || respResult.value.truncated;
+        } else {
+          console.error('Error fetching LLM responses:', respResult.reason);
           setLlmResponses([]);
-        } else {
-          setLlmResponses(llmResponsesData || []);
         }
-
-        // Fetch citations from the citations table
-        const { data: citationsData, error: citationsError } = await supabase
-          .from('citations')
-          .select(`
-            id,
-            audit_id,
-            prompt_id,
-            llm,
-            page_url,
-            domain,
-            citation_text,
-            position,
-            cited,
-            sentiment_score,
-            sentiment_label,
-            checked_at,
-            prompts (prompt_text, prompt_group),
-            audits (created_at, llms)
-          `)
-          .in('audit_id', recentAuditIds)
-          .order('checked_at', { ascending: false })
-          .limit(500)
-          .abortSignal(abortController.signal);
-
-        if (citationsError) {
-          console.error('Error fetching citations:', citationsError);
+        if (citResult.status === 'fulfilled') {
+          citResult.value.rows.sort((a, b) =>
+            String(b.checked_at || '').localeCompare(String(a.checked_at || '')));
+          setCitations(citResult.value.rows);
+          anyTruncated = anyTruncated || citResult.value.truncated;
+        } else {
+          console.error('Error fetching citations:', citResult.reason);
           setCitations([]);
-        } else {
-          setCitations(citationsData || []);
         }
+        setDataTruncated(anyTruncated ? { audits: windowAudits.length } : null);
       }
       
       // Calculate citation consistency
@@ -1967,6 +2082,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     } finally {
       clearTimeout(timeoutId);
       setLoading(false);
+      setWindowLoading(false);
     }
   };
 
@@ -4221,6 +4337,24 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                 </span>
               ))
             )}
+            {(() => {
+              // Group chips — junction table first, legacy group_id fallback.
+              const groupList = (project.project_groups || [])
+                .map((pg: any) => pg.groups)
+                .filter(Boolean);
+              const shownGroups = groupList.length > 0
+                ? groupList
+                : (project.groups ? [project.groups] : []);
+              return shownGroups.map((g: any, i: number) => (
+                <span
+                  key={g.id || `${g.name}-${i}`}
+                  className="inline-flex items-center px-3 py-1 rounded-full text-sm font-medium bg-amber-100 text-amber-700 dark:bg-amber-900 dark:text-amber-300"
+                >
+                  <Users className="w-3.5 h-3.5 mr-1.5" />
+                  {g.name}
+                </span>
+              ));
+            })()}
             {project.country && (() => {
               const country = getCountryByCode(project.country);
               return country ? (
@@ -4255,6 +4389,17 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
           </Button>
         </div>
       </motion.div>
+
+      {/* Unified template: the filter row sits between the project
+          header and the dashboards. The period buttons select which
+          audits feed EVERY tab below. */}
+      <DashboardFilterBar
+        bleed
+        windowLoading={windowLoading}
+        truncatedNote={dataTruncated
+          ? `Dense window: only the most recent audits of the ${dataTruncated.audits} in this period are loaded`
+          : null}
+      />
 
       {/* Tabs */}
       <Card>
@@ -7239,9 +7384,19 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                   <LoadingSpinner size="lg" />
                 </div>
               ) : (() => {
-                const totalAnswered = adsDash.audits.reduce(
+                // Honor the selected period: the tab's dataset is loaded
+                // once (since ads collection began) and windowed here.
+                const adsWin = resolveDateWindow(globalFilters, null);
+                const inAdsWin = (iso: string | null | undefined) => {
+                  if (!adsWin) return true;
+                  if (!iso) return false;
+                  const t = new Date(iso).getTime();
+                  return t >= adsWin.start.getTime() && t <= adsWin.end.getTime();
+                };
+                const winAudits = adsDash.audits.filter(a => inAdsWin(a.created_at));
+                const totalAnswered = winAudits.reduce(
                   (sum, a) => sum + (adsDash.searchgptStats[a.id]?.answered || 0), 0);
-                const adRows = adsDash.adRows;
+                const adRows = adsDash.adRows.filter(r => inAdsWin(r.created_at));
                 const adRate = totalAnswered > 0 ? Math.round((adRows.length / totalAnswered) * 100) : 0;
 
                 const ownKeys = new Set(brands.map(b => normalizeBrandKey(b.brand_name || '')));
@@ -7292,7 +7447,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
 
                 // Shopping merchants: who sells in the product cards.
                 const merchMap = new Map<string, any>();
-                adsDash.shoppingRows.forEach(r => {
+                adsDash.shoppingRows.filter(r => inAdsWin(r.created_at)).forEach(r => {
                   const perResponse = new Set<string>();
                   (r.shopping || []).forEach((card: any) => {
                     const name = card?.merchants || (card?.link ? extractDomain(card.link) : '');
@@ -7328,7 +7483,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
 
                 const adsByAudit = new Map<string, number>();
                 adRows.forEach(r => adsByAudit.set(r.audit_id, (adsByAudit.get(r.audit_id) || 0) + 1));
-                const evolution = adsDash.audits
+                const evolution = winAudits
                   .filter(a => (adsDash.searchgptStats[a.id]?.answered || 0) > 0)
                   .map(a => {
                     const answered = adsDash.searchgptStats[a.id].answered;

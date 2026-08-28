@@ -103,6 +103,24 @@ function isIsoDate(s: string): boolean {
   return /^\d{4}-\d{2}-\d{2}$/.test(s);
 }
 
+/**
+ * Coerce retired presets to a currently-offered one. `lastAudit` and
+ * `all` used to exist in the dropdown-era picker; anything a user has
+ * in localStorage or an old bookmark maps onto the default 3-month
+ * window. A `custom` without both dates is meaningless — same fate.
+ */
+export function normalizeDateRangePreset(
+  filters: DashboardFilters,
+): DashboardFilters {
+  const retired =
+    filters.dateRange === 'lastAudit' || filters.dateRange === 'all';
+  const emptyCustom =
+    filters.dateRange === 'custom' &&
+    (!filters.customDateRange.startDate || !filters.customDateRange.endDate);
+  if (!retired && !emptyCustom) return filters;
+  return { ...filters, dateRange: DEFAULT_FILTERS.dateRange };
+}
+
 // ── Filter validation against a project's available data ────────────
 
 export type ProjectMeta = {
@@ -136,8 +154,8 @@ export function validateAgainstProject(
   );
 
   let dateRange = filters.dateRange;
-  if (dateRange === 'lastAudit' && !meta.hasAudits) {
-    dateRange = 'all';
+  if (dateRange === 'lastAudit' || dateRange === 'all') {
+    dateRange = DEFAULT_FILTERS.dateRange;
   }
 
   // Avoid allocating a new object if nothing changed — keeps React
@@ -304,7 +322,7 @@ export function hydrate(
   meta?: ProjectMeta,
 ): DashboardFilters {
   const fromUrl = parseFromUrl(searchParams);
-  const base = fromUrl ?? storedValue ?? DEFAULT_FILTERS;
+  const base = normalizeDateRangePreset(fromUrl ?? storedValue ?? DEFAULT_FILTERS);
   return validateAgainstProject(base, meta);
 }
 

@@ -8,6 +8,7 @@ import { Button } from '../components/ui/Button';
 import { supabase } from '../lib/supabase';
 import { useDashboardFilters } from '../contexts/DashboardFiltersContext';
 import { applyFilters as applyDashboardFilters } from '../lib/dashboard-filter-utils';
+import { DashboardFilterBar } from '../components/filters/DashboardFilterBar';
 import { FanOutDiagram } from '../components/prompt/FanOutDiagram';
 import { ResponseRichResults } from '../components/response/ResponseRichResults';
 import {
@@ -665,6 +666,9 @@ export const PromptDetailPage: React.FC = () => {
           </Button>
         </div>
       </motion.div>
+
+      {/* Unified template: filters directly below the header */}
+      <DashboardFilterBar />
 
       {/* Prompt Details Card */}
       <Card>
