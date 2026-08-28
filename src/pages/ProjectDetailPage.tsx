@@ -61,6 +61,7 @@ import { useDashboardFilters } from '../contexts/DashboardFiltersContext';
 import { resolveDateWindow } from '../lib/dashboard-filter-utils';
 import { DashboardFilterBar } from '../components/filters/DashboardFilterBar';
 import { fetchPackedWindow, unpackCitations, unpackResponses } from '../lib/windowPacked';
+import { TabContentSkeleton } from '../components/ui/TabContentSkeleton';
 
 // Explicit filter type. Catches keyboard slips like `promptGroup` vs
 // `promptGroups` — the latter is the real state key (a string[] of
@@ -1987,6 +1988,12 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
           targetLlm: llmsList[0] as any,
         }));
       }
+
+      // The page shell (header, tabs, filter bar) can render now — the
+      // heavy window fetch below shows as widget skeletons instead of
+      // the full-page loader, and never as "no data" empty states.
+      setLoading(false);
+      setWindowLoading(true);
 
       if (recentAuditIds.length === 0) {
         setLlmResponses([]);
@@ -4379,6 +4386,15 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     { id: 'settings', label: 'Settings', icon: Settings },
   ];
 
+  // Widget skeletons instead of "no data" empty states while the
+  // window is (re)loading and nothing is on screen yet. Settings and
+  // Insights don't render window data — they stay interactive.
+  const showTabSkeleton = windowLoading
+    && llmResponses.length === 0
+    && citations.length === 0
+    && activeTab !== 'settings'
+    && activeTab !== 'insights';
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
@@ -4526,6 +4542,14 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
           : null}
       />
 
+      {/* The project has audits, just none inside the selected period —
+          say so instead of letting every widget claim "no data". */}
+      {!windowLoading && auditsData.length === 0 && allAuditsMeta.length > 0 && (
+        <div className="rounded-xl border border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-900/20 px-4 py-2.5 text-sm text-blue-800 dark:text-blue-200">
+          No audits in the selected period — pick a wider range above.
+        </div>
+      )}
+
       {/* Tabs */}
       <Card>
         {!hideTabNavigation && (
@@ -4554,6 +4578,10 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
         )}
 
         <CardContent className="p-6">
+          {showTabSkeleton ? (
+            <TabContentSkeleton />
+          ) : (
+          <>
           {activeTab === 'overview' && (
             <div className="space-y-6 pt-4">
               <div className="grid grid-cols-2 md:grid-cols-4 gap-4 md:gap-6">
@@ -8802,6 +8830,8 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                 onUpdate={fetchProjectData}
               />
             </div>
+          )}
+          </>
           )}
         </CardContent>
       </Card>
