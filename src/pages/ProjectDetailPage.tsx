@@ -141,6 +141,22 @@ interface ProjectDetailPageProps {
   hideTabNavigation?: boolean;
 }
 
+// In-memory cache of loaded data windows, keyed `${projectId}|${windowKey}`.
+// Makes period toggles and back-navigation instant. Entries are skipped
+// when they were captured while an audit was running, invalidated by
+// mutation flows (fetchProjectData(true)), and expire by TTL.
+const WINDOW_CACHE = new Map<string, {
+  ts: number;
+  allAudits: any[];
+  windowAudits: any[];
+  availableLlms: string[];
+  llmResponses: any[];
+  citations: any[];
+  dataTruncated: { audits: number } | null;
+}>();
+const WINDOW_CACHE_TTL = 180_000;
+const WINDOW_CACHE_MAX = 4;
+
 export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
   activeTabOverride,
   hideTabNavigation = false
@@ -1800,8 +1816,17 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     }
   };
 
-  const fetchProjectData = async () => {
+  const fetchProjectData = async (force = false) => {
     if (!id) return;
+
+    const cacheKey = `${id}|${windowKey}`;
+    if (force) {
+      // A mutation just changed this project's data — every cached
+      // window of it is stale.
+      Array.from(WINDOW_CACHE.keys())
+        .filter(k => k.startsWith(`${id}|`))
+        .forEach(k => WINDOW_CACHE.delete(k));
+    }
 
     // Full-page loader only on the first load of a project; a period
     // change keeps the previous window on screen behind a small
@@ -1876,6 +1901,23 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
             p.prompt_group === 'General' ? p.prompt_text : `${p.prompt_group};${p.prompt_text}`
           ).join('\n') || '',
         });
+      }
+
+      // Serve the window from the in-memory cache when fresh. Entries
+      // captured while an audit was running are never reused.
+      if (!force) {
+        const hit = WINDOW_CACHE.get(cacheKey);
+        if (hit && Date.now() - hit.ts < WINDOW_CACHE_TTL &&
+            !hit.allAudits.some((a: any) => a.status === 'running')) {
+          setAllAuditsMeta(hit.allAudits);
+          setAuditsData(hit.windowAudits);
+          setRunningAuditInfo(null);
+          setAvailableLlms(hit.availableLlms);
+          setLlmResponses(hit.llmResponses);
+          setCitations(hit.citations);
+          setDataTruncated(hit.dataTruncated);
+          return;
+        }
       }
 
       // Unified template: load EVERY audit inside the selected period,
@@ -1968,20 +2010,21 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
         const RESPONSES_CAP = 10000;
         const CITATIONS_CAP = 60000;
         const PAGE = 1000;
-        // Chunk size: never more than 60 ids per in.() (URL length), but
-        // also split small windows into >=3 chunks so all workers get
-        // something to do (a single-chunk window would serialize every
-        // page request).
-        const chunkSize = Math.min(60, Math.max(1, Math.ceil(recentAuditIds.length / 3)));
-        const idChunks: string[][] = [];
-        for (let i = 0; i < recentAuditIds.length; i += chunkSize) {
-          idChunks.push(recentAuditIds.slice(i, i + chunkSize));
-        }
 
         const fetchAllRows = async (
           buildQuery: (chunk: string[]) => any,
           cap: number,
+          conc: number,
         ): Promise<{ rows: any[]; truncated: boolean }> => {
+          // Chunk size: never more than 60 ids per in.() (URL length),
+          // but split small windows into `conc` chunks so every worker
+          // gets something to do (a single-chunk window would serialize
+          // all page requests).
+          const chunkSize = Math.min(60, Math.max(1, Math.ceil(recentAuditIds.length / conc)));
+          const idChunks: string[][] = [];
+          for (let i = 0; i < recentAuditIds.length; i += chunkSize) {
+            idChunks.push(recentAuditIds.slice(i, i + chunkSize));
+          }
           const rows: any[] = [];
           let truncated = false;
           let nextChunk = 0;
@@ -2002,11 +2045,19 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
             }
           };
           await Promise.all(
-            Array.from({ length: Math.min(3, idChunks.length) }, () => worker()),
+            Array.from({ length: Math.min(conc, idChunks.length) }, () => worker()),
           );
           return { rows, truncated };
         };
 
+        // Payload diet, no semantic change:
+        //   - `citations:citations_slim` — server-computed projection
+        //     (url/cited/title only; description kept solely when there
+        //     is no title). Same null/array semantics as the raw column;
+        //     was 65% of the responses payload.
+        //   - no `prompts`/`audits` embeds — the same two-field objects
+        //     are re-attached client-side below from data already in
+        //     memory (verified exact: zero orphaned prompt_ids in prod).
         const [respResult, citResult] = await Promise.allSettled([
           fetchAllRows(chunk => supabase
             .from('llm_responses')
@@ -2016,7 +2067,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
               prompt_id,
               llm,
               answer_text,
-              citations,
+              citations:citations_slim,
               all_sources,
               links_attached,
               web_search_query,
@@ -2026,11 +2077,9 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
               shopping_visible,
               is_map,
               ad_name:ads->>name,
-              created_at,
-              prompts (prompt_text, prompt_group),
-              audits (created_at, llms)
+              created_at
             `)
-            .in('audit_id', chunk), RESPONSES_CAP),
+            .in('audit_id', chunk), RESPONSES_CAP, 3),
           fetchAllRows(chunk => supabase
             .from('citations')
             .select(`
@@ -2045,34 +2094,74 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
               cited,
               sentiment_score,
               sentiment_label,
-              checked_at,
-              prompts (prompt_text, prompt_group),
-              audits (created_at, llms)
+              checked_at
             `)
-            .in('audit_id', chunk), CITATIONS_CAP),
+            .in('audit_id', chunk), CITATIONS_CAP, 6),
         ]);
 
+        // Re-attach the embed-shaped objects consumers expect
+        // ({prompt_text, prompt_group} / {created_at, llms}) from data
+        // already in memory instead of shipping them per row.
+        const promptById = new Map<string, any>(
+          ((projectData?.prompts || prompts || []) as any[]).map((p: any) =>
+            [p.id, { prompt_text: p.prompt_text, prompt_group: p.prompt_group }]));
+        const auditById = new Map<string, any>(
+          (allAudits || []).map((a: any) =>
+            [a.id, { created_at: a.created_at, llms: a.llms }]));
+        const decorate = (rows: any[]) => {
+          rows.forEach((row: any) => {
+            row.prompts = promptById.get(row.prompt_id) || null;
+            row.audits = auditById.get(row.audit_id) || null;
+          });
+          return rows;
+        };
+
         let anyTruncated = false;
+        let respRows: any[] = [];
+        let citRows: any[] = [];
         if (respResult.status === 'fulfilled') {
           // Restore the pre-pagination contract: newest first.
-          respResult.value.rows.sort((a, b) =>
+          respRows = decorate(respResult.value.rows).sort((a, b) =>
             String(b.created_at || '').localeCompare(String(a.created_at || '')));
-          setLlmResponses(respResult.value.rows);
+          setLlmResponses(respRows);
           anyTruncated = anyTruncated || respResult.value.truncated;
         } else {
           console.error('Error fetching LLM responses:', respResult.reason);
           setLlmResponses([]);
         }
         if (citResult.status === 'fulfilled') {
-          citResult.value.rows.sort((a, b) =>
+          citRows = decorate(citResult.value.rows).sort((a, b) =>
             String(b.checked_at || '').localeCompare(String(a.checked_at || '')));
-          setCitations(citResult.value.rows);
+          setCitations(citRows);
           anyTruncated = anyTruncated || citResult.value.truncated;
         } else {
           console.error('Error fetching citations:', citResult.reason);
           setCitations([]);
         }
-        setDataTruncated(anyTruncated ? { audits: windowAudits.length } : null);
+        const truncatedInfo = anyTruncated ? { audits: windowAudits.length } : null;
+        setDataTruncated(truncatedInfo);
+
+        // Cache the completed window (only when BOTH fetches succeeded,
+        // so a transient failure is retried on the next visit).
+        if (respResult.status === 'fulfilled' && citResult.status === 'fulfilled') {
+          WINDOW_CACHE.set(cacheKey, {
+            ts: Date.now(),
+            allAudits: allAudits || [],
+            windowAudits,
+            availableLlms: llmsList,
+            llmResponses: respRows,
+            citations: citRows,
+            dataTruncated: truncatedInfo,
+          });
+          while (WINDOW_CACHE.size > WINDOW_CACHE_MAX) {
+            let oldestKey = '';
+            let oldestTs = Infinity;
+            WINDOW_CACHE.forEach((v, k) => {
+              if (v.ts < oldestTs) { oldestTs = v.ts; oldestKey = k; }
+            });
+            WINDOW_CACHE.delete(oldestKey);
+          }
+        }
       }
       
       // Calculate citation consistency
@@ -2206,7 +2295,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     // Refresh project data to show updated results
     queryCache.invalidatePattern(`project:${id}`);
     queryCache.invalidate('projects:list');
-    fetchProjectData();
+    fetchProjectData(true);
   };
 
   // Insights functions
@@ -2352,7 +2441,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
 
       // Reload all project data to reflect the updated metrics
       queryCache.invalidatePattern(`project:${id}`);
-      await fetchProjectData();
+      await fetchProjectData(true);
 
       alert('Metrics recalculated successfully! All charts have been updated.');
     } catch (error) {
@@ -2572,7 +2661,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
         // Refresh project data only if we didn't recalculate (since recalculate already does it)
         queryCache.invalidatePattern(`project:${id}`);
         queryCache.invalidate('projects:list');
-        await fetchProjectData();
+        await fetchProjectData(true);
       }
     } catch (error) {
       console.error('Error updating project:', error);
