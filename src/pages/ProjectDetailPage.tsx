@@ -60,6 +60,7 @@ import { useProject } from '../contexts/ProjectContext';
 import { useDashboardFilters } from '../contexts/DashboardFiltersContext';
 import { resolveDateWindow } from '../lib/dashboard-filter-utils';
 import { DashboardFilterBar } from '../components/filters/DashboardFilterBar';
+import { fetchPackedWindow, unpackCitations, unpackResponses } from '../lib/windowPacked';
 
 // Explicit filter type. Catches keyboard slips like `promptGroup` vs
 // `promptGroups` — the latter is the real state key (a string[] of
@@ -2050,55 +2051,6 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
           return { rows, truncated };
         };
 
-        // Payload diet, no semantic change:
-        //   - `citations:citations_slim` — server-computed projection
-        //     (url/cited/title only; description kept solely when there
-        //     is no title). Same null/array semantics as the raw column;
-        //     was 65% of the responses payload.
-        //   - no `prompts`/`audits` embeds — the same two-field objects
-        //     are re-attached client-side below from data already in
-        //     memory (verified exact: zero orphaned prompt_ids in prod).
-        const [respResult, citResult] = await Promise.allSettled([
-          fetchAllRows(chunk => supabase
-            .from('llm_responses')
-            .select(`
-              id,
-              audit_id,
-              prompt_id,
-              llm,
-              answer_text,
-              citations:citations_slim,
-              all_sources,
-              links_attached,
-              web_search_query,
-              sentiment_score,
-              sentiment_label,
-              answer_competitors,
-              shopping_visible,
-              is_map,
-              ad_name:ads->>name,
-              created_at
-            `)
-            .in('audit_id', chunk), RESPONSES_CAP, 3),
-          fetchAllRows(chunk => supabase
-            .from('citations')
-            .select(`
-              id,
-              audit_id,
-              prompt_id,
-              llm,
-              page_url,
-              domain,
-              citation_text,
-              position,
-              cited,
-              sentiment_score,
-              sentiment_label,
-              checked_at
-            `)
-            .in('audit_id', chunk), CITATIONS_CAP, 6),
-        ]);
-
         // Re-attach the embed-shaped objects consumers expect
         // ({prompt_text, prompt_group} / {created_at, llms}) from data
         // already in memory instead of shipping them per row.
@@ -2117,25 +2069,104 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
         };
 
         let anyTruncated = false;
-        let respRows: any[] = [];
-        let citRows: any[] = [];
-        if (respResult.status === 'fulfilled') {
-          // Restore the pre-pagination contract: newest first.
-          respRows = decorate(respResult.value.rows).sort((a, b) =>
+        let respRows: any[] | null = null;
+        let citRows: any[] | null = null;
+
+        // Primary path: packed columnar RPCs — the whole window in 2
+        // requests (dictionary-encoded tuples, unpacked into the exact
+        // REST row shapes; equivalence verified field-by-field on prod).
+        // A statement-timeout on a very dense slice makes
+        // fetchPackedWindow split the audit set in half and recurse.
+        try {
+          const fromIso = (win ? win.start : new Date(0)).toISOString();
+          const toIso = (win ? win.end : new Date()).toISOString();
+          const [respParts, citParts] = await Promise.all([
+            fetchPackedWindow('project_responses_window_packed', id, fromIso, toIso,
+              recentAuditIds, abortController.signal),
+            fetchPackedWindow('project_citations_window_packed', id, fromIso, toIso,
+              recentAuditIds, abortController.signal),
+          ]);
+          respRows = respParts.flatMap(part => unpackResponses(part));
+          citRows = citParts.flatMap((part, pi) => unpackCitations(part, `${pi}-`));
+        } catch (packedErr) {
+          console.warn('Packed window fetch failed — falling back to paged REST:', packedErr);
+          respRows = null;
+          citRows = null;
+        }
+
+        // Fallback: the chunked/paged REST path (also the safety net
+        // right after a deploy while PostgREST's schema cache warms).
+        if (!respRows || !citRows) {
+          const [respResult, citResult] = await Promise.allSettled([
+            fetchAllRows(chunk => supabase
+              .from('llm_responses')
+              .select(`
+                id,
+                audit_id,
+                prompt_id,
+                llm,
+                answer_text,
+                citations:citations_slim,
+                all_sources,
+                links_attached,
+                web_search_query,
+                sentiment_score,
+                sentiment_label,
+                answer_competitors,
+                shopping_visible,
+                is_map,
+                ad_name:ads->>name,
+                created_at
+              `)
+              .in('audit_id', chunk), RESPONSES_CAP, 3),
+            fetchAllRows(chunk => supabase
+              .from('citations')
+              .select(`
+                id,
+                audit_id,
+                prompt_id,
+                llm,
+                page_url,
+                domain,
+                citation_text,
+                position,
+                cited,
+                sentiment_score,
+                sentiment_label,
+                checked_at
+              `)
+              .in('audit_id', chunk), CITATIONS_CAP, 6),
+          ]);
+          if (respResult.status === 'fulfilled') {
+            respRows = respResult.value.rows;
+            anyTruncated = anyTruncated || respResult.value.truncated;
+          } else {
+            console.error('Error fetching LLM responses:', respResult.reason);
+            respRows = null;
+          }
+          if (citResult.status === 'fulfilled') {
+            citRows = citResult.value.rows;
+            anyTruncated = anyTruncated || citResult.value.truncated;
+          } else {
+            console.error('Error fetching citations:', citResult.reason);
+            citRows = null;
+          }
+        }
+
+        // Common post-processing for both paths: decorate, restore the
+        // pre-pagination contract (newest first), publish.
+        if (respRows) {
+          respRows = decorate(respRows).sort((a, b) =>
             String(b.created_at || '').localeCompare(String(a.created_at || '')));
           setLlmResponses(respRows);
-          anyTruncated = anyTruncated || respResult.value.truncated;
         } else {
-          console.error('Error fetching LLM responses:', respResult.reason);
           setLlmResponses([]);
         }
-        if (citResult.status === 'fulfilled') {
-          citRows = decorate(citResult.value.rows).sort((a, b) =>
+        if (citRows) {
+          citRows = decorate(citRows).sort((a, b) =>
             String(b.checked_at || '').localeCompare(String(a.checked_at || '')));
           setCitations(citRows);
-          anyTruncated = anyTruncated || citResult.value.truncated;
         } else {
-          console.error('Error fetching citations:', citResult.reason);
           setCitations([]);
         }
         const truncatedInfo = anyTruncated ? { audits: windowAudits.length } : null;
@@ -2143,7 +2174,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
 
         // Cache the completed window (only when BOTH fetches succeeded,
         // so a transient failure is retried on the next visit).
-        if (respResult.status === 'fulfilled' && citResult.status === 'fulfilled') {
+        if (respRows && citRows) {
           WINDOW_CACHE.set(cacheKey, {
             ts: Date.now(),
             allAudits: allAudits || [],
