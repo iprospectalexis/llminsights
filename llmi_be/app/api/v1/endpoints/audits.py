@@ -85,6 +85,9 @@ class AuditStatusResponse(BaseModel):
 
 # ── Helpers ───────────────────────────────────────────────────────────
 
+from app.services.json_converter import domain_from_source, is_google_goto
+
+
 def extract_domain(url: str) -> str:
     try:
         return urlparse(url).hostname.replace("www.", "")
@@ -118,11 +121,17 @@ def collect_citations(result: dict, response: dict) -> list[dict]:
         "checked_at": datetime.now(timezone.utc),
     }
 
-    def _add(url, text, position, cited=None):
+    def _add(url, text, position, cited=None, domain=None):
+        # Google now encrypts AIO/AI-Mode outbound links as /goto tokens: the
+        # URL's own host is google.com, so the converter recovers the real
+        # domain from the reference's source/title and passes it here. Never
+        # store "google.com" as the domain of a goto citation.
+        if domain is None:
+            domain = None if is_google_goto(url) else extract_domain(url)
         citations.append({
             **base,
             "page_url": url,
-            "domain": extract_domain(url),
+            "domain": domain,
             "citation_text": text or "No description available",
             "position": position,
             **({"cited": cited} if cited is not None else {}),
@@ -165,11 +174,20 @@ def collect_citations(result: dict, response: dict) -> list[dict]:
         pos = 0
         for cit in result.get("citations") or []:
             url = cit.get("url") or cit.get("link") or ""
-            if not url.startswith("http") or _is_google_internal(url) or url in seen:
+            if url.startswith("/goto?"):
+                url = "https://www.google.com" + url
+            if not url.startswith("http") or url in seen:
+                continue
+            # goto redirects ARE the citations since 2026-08-28; only
+            # non-goto Google self-links stay junk.
+            if _is_google_internal(url) and not is_google_goto(url):
                 continue
             seen.add(url)
             pos += 1
-            _add(url, cit.get("title") or cit.get("text") or cit.get("snippet"), pos)
+            dom = cit.get("domain")
+            if is_google_goto(url) and (not dom or "google" in str(dom)):
+                dom = domain_from_source(cit.get("source") or "", cit.get("title") or cit.get("text") or "")
+            _add(url, cit.get("title") or cit.get("text") or cit.get("snippet"), pos, domain=dom)
         pos = 0
         for item in result.get("organic") or []:
             url = item.get("link") or item.get("url") or ""

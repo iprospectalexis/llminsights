@@ -589,6 +589,38 @@ def extract_aio_ndngvf_citations(page_html: str) -> list:
     return results
 
 
+# ── Google /goto redirect handling (since 2026-08-28) ────────────────────────
+# Google started encrypting outbound links on AI Overview / AI Mode surfaces:
+# both BrightData and DataForSEO now deliver "https://google.com/goto?url=<
+# opaque token>" instead of the real URL. The token payload is encrypted (no
+# URL inside), but the reference still carries a readable source name and
+# title — enough to recover the DOMAIN for citation analytics.
+_GOTO_DOMAIN_LIKE = re.compile(r"^[a-z0-9][a-z0-9.-]*\.[a-z]{2,12}$")
+_GOTO_DOMAIN_IN_TEXT = re.compile(
+    r"\b([a-z0-9][a-z0-9-]{0,62}(?:\.[a-z0-9-]{1,63})*"
+    r"\.(?:fr|com|net|org|io|co|eu|de|es|it|uk|be|ch|ca|us|info|biz|edu|gov))\b",
+    re.I,
+)
+
+
+def is_google_goto(url: str) -> bool:
+    u = url or ""
+    return u.startswith("/goto?") or ("google." in u and "/goto?" in u)
+
+
+def domain_from_source(source: str, title: str = "") -> str | None:
+    """Recover a citation domain from the reference's source/title text."""
+    s = (source or "").strip().lower()
+    if s and _GOTO_DOMAIN_LIKE.match(s):
+        return s[4:] if s.startswith("www.") else s
+    for txt in (source, title):
+        m = _GOTO_DOMAIN_IN_TEXT.search(txt or "")
+        if m:
+            d = m.group(1).lower()
+            return d[4:] if d.startswith("www.") else d
+    return None
+
+
 def normalize_native_aio_citations(raw) -> list:
     """Normalize BrightData's native aio_citations field.
 
@@ -600,27 +632,39 @@ def normalize_native_aio_citations(raw) -> list:
     out = []
     seen = set()
     for entry in raw or []:
+        source = ""
         if isinstance(entry, str):
             url, title = entry, ""
         elif isinstance(entry, dict):
             url = (entry.get("url") or entry.get("link")
-                   or entry.get("source_url") or entry.get("source") or "")
+                   or entry.get("source_url") or "")
+            source = entry.get("source") or ""
             title = (entry.get("title") or entry.get("name")
                      or entry.get("text") or "")
         else:
             continue
-        if not isinstance(url, str) or not url.startswith("http") or "google.com" in url:
+        if not isinstance(url, str):
+            continue
+        if url.startswith("/goto?"):
+            url = "https://www.google.com" + url
+        if not url.startswith("http"):
+            continue
+        goto = is_google_goto(url)
+        # Non-goto google.com links stay junk (SERP self-links); goto links
+        # ARE the citations now — keep them with a recovered domain.
+        if "google.com" in url and not goto:
             continue
         base_url = re.sub(r"#:~:text=.*$", "", url)
         if base_url in seen:
             continue
         seen.add(base_url)
+        domain = domain_from_source(source, title) if goto else extract_domain(base_url)
         out.append({
             "url": base_url,
             "icon": None,
             "cited": True,
             "title": title if isinstance(title, str) else "",
-            "domain": extract_domain(base_url),
+            "domain": domain,
             "description": None,
         })
     return out

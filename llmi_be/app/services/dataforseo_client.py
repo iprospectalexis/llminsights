@@ -37,6 +37,8 @@ import httpx
 
 from app.config import get_settings
 
+from app.services.json_converter import domain_from_source, is_google_goto
+
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
@@ -163,12 +165,17 @@ class DataForSeoClient:
                 url = ref.get("url")
                 if not url:
                     continue
+                # Google now encrypts AIO outbound links (/goto tokens with
+                # domain=google.com); recover the real domain from the
+                # reference's readable source/title.
+                dom = (domain_from_source(ref.get("source") or "", ref.get("title") or "")
+                       if is_google_goto(url) else _clean_domain(ref.get("domain"), url))
                 src = {
                     "url": url,
                     "title": ref.get("title"),
                     "source": ref.get("source"),
                     "text": ref.get("text"),
-                    "domain": _clean_domain(ref.get("domain"), url),
+                    "domain": dom,
                 }
                 all_sources.append(src)
                 citations.append({"url": url, "title": ref.get("title"), "domain": src["domain"]})
@@ -189,7 +196,8 @@ class DataForSeoClient:
                     if not url:
                         continue
                     if not any(s["url"] == url for s in all_sources):
-                        dom = _clean_domain(ref.get("domain"), url)
+                        dom = (domain_from_source(ref.get("source") or "", ref.get("title") or "")
+                               if is_google_goto(url) else _clean_domain(ref.get("domain"), url))
                         all_sources.append({
                             "url": url, "title": ref.get("title"),
                             "source": ref.get("source"), "text": ref.get("text"),
