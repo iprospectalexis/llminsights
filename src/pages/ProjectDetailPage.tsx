@@ -1968,9 +1968,14 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
         const RESPONSES_CAP = 10000;
         const CITATIONS_CAP = 60000;
         const PAGE = 1000;
+        // Chunk size: never more than 60 ids per in.() (URL length), but
+        // also split small windows into >=3 chunks so all workers get
+        // something to do (a single-chunk window would serialize every
+        // page request).
+        const chunkSize = Math.min(60, Math.max(1, Math.ceil(recentAuditIds.length / 3)));
         const idChunks: string[][] = [];
-        for (let i = 0; i < recentAuditIds.length; i += 60) {
-          idChunks.push(recentAuditIds.slice(i, i + 60));
+        for (let i = 0; i < recentAuditIds.length; i += chunkSize) {
+          idChunks.push(recentAuditIds.slice(i, i + chunkSize));
         }
 
         const fetchAllRows = async (
