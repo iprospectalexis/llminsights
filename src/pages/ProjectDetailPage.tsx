@@ -62,6 +62,7 @@ import { resolveDateWindow } from '../lib/dashboard-filter-utils';
 import { DashboardFilterBar } from '../components/filters/DashboardFilterBar';
 import { fetchPackedWindow, unpackCitations, unpackResponses } from '../lib/windowPacked';
 import { TabContentSkeleton } from '../components/ui/TabContentSkeleton';
+import { TabErrorBoundary } from '../components/ui/TabErrorBoundary';
 
 // Explicit filter type. Catches keyboard slips like `promptGroup` vs
 // `promptGroups` — the latter is the real state key (a string[] of
@@ -4497,7 +4498,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
           {showTabSkeleton ? (
             <TabContentSkeleton />
           ) : (
-          <>
+          <TabErrorBoundary key={activeTab}>
           {activeTab === 'overview' && (
             <div className="space-y-6 pt-4">
               <div className="grid grid-cols-2 md:grid-cols-4 gap-4 md:gap-6">
@@ -8660,7 +8661,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
               />
             </div>
           )}
-          </>
+          </TabErrorBoundary>
           )}
         </CardContent>
       </Card>
