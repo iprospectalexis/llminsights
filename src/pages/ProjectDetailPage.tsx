@@ -31,7 +31,7 @@ const CATEGORY_CHART_COLORS: Record<string, string> = {
   Unknown: '#d1d5db',
 };
 import { normalizeBrandKey, buildBrandDomainMapFromCitations } from '../lib/brandDomains';
-import { buildPageBrandIndex, findBrandsInText } from '../lib/pageBrands';
+import { buildMatchers, buildPageBrandIndex, findBrandsInText } from '../lib/pageBrands';
 import { TrendChip, Sparkline, trendDelta, TrendData, TrendPoint } from '../components/ui/TrendChip';
 import { LLM_ICONS as MATRIX_LLM_ICONS } from '../lib/llm-display';
 import { CitationSankey } from '../components/CitationSankey';
@@ -159,6 +159,52 @@ const WINDOW_CACHE = new Map<string, {
 const WINDOW_CACHE_TTL = 180_000;
 const WINDOW_CACHE_MAX = 4;
 
+// Normalize URLs before dedup-comparing citations from two sources
+// (the `citations` table and the `llm_responses.citations` JSONB).
+// Without this, "https://Example.com/foo/" and "http://www.example.com/foo"
+// were treated as different and the same URL got counted twice in the
+// Citations tab vs Overview widget. Trailing slash, www., scheme, host
+// case, and hash are all stripped; query string is preserved because
+// it can legitimately differentiate articles (e.g. ?id=123).
+//
+// Module-level with a memo cache: the same ~50k URLs of a window are
+// normalized by several passes (merge, trend index, page stats,
+// domain insights) — `new URL()` is far too expensive to repeat.
+const extractDomainFromUrl = (url: string): string => {
+  try {
+    const urlObj = new URL(url);
+    return urlObj.hostname.replace(/^www\./, '');
+  } catch {
+    return url;
+  }
+};
+
+// Session-wide domain→category results from the domain_categories table
+// ('' = queried, not present). Refetching the same ~4k domains on every
+// filter change was ~27 serialized round-trips.
+const DOMAIN_CATEGORY_FETCHED = new Map<string, string>();
+
+const EMPTY_ROWS: any[] = [];
+
+const URL_NORM_CACHE = new Map<string, string>();
+const normalizeUrl = (url: string): string => {
+  if (!url) return '';
+  const hit = URL_NORM_CACHE.get(url);
+  if (hit !== undefined) return hit;
+  let out: string;
+  try {
+    const u = new URL(url);
+    const host = u.hostname.toLowerCase().replace(/^www\./, '');
+    const path = u.pathname.replace(/\/+$/, '') || '/';
+    out = `${host}${path}${u.search}`;
+  } catch {
+    out = url.toLowerCase().replace(/\/+$/, '');
+  }
+  if (URL_NORM_CACHE.size > 200_000) URL_NORM_CACHE.clear();
+  URL_NORM_CACHE.set(url, out);
+  return out;
+};
+
 export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
   activeTabOverride,
   hideTabNavigation = false
@@ -186,8 +232,6 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
   const tabFromUrl = activeTabOverride || searchParams.get('tab') || 'overview';
   const [activeTab, setActiveTab] = useState(tabFromUrl);
   const [citations, setCitations] = useState<any[]>([]);
-  const [filteredCitations, setFilteredCitations] = useState<any[]>([]);
-  const [filteredMentions, setFilteredMentions] = useState<any[]>([]);
   const [prompts, setPrompts] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [selectedLlm, setSelectedLlm] = useState('all');
@@ -222,7 +266,6 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
   const [showEditModal, setShowEditModal] = useState(false);
   const [runningAudits, setRunningAudits] = useState<string[]>([]);
   const [runningAuditInfo, setRunningAuditInfo] = useState<{status: string, currentStep: string} | null>(null);
-  const [filteredLlmResponses, setFilteredLlmResponses] = useState<any[]>([]);
   // Backwards-compat view of the global multi-select `llms` filter
   // as a single-string value. Used by the many in-page comparison
   // sites written for the old shape. The actual data filtering uses
@@ -284,6 +327,13 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [globalFilters.dateRange, globalFilters.customDateRange.startDate, globalFilters.customDateRange.endDate]);
   const [availableDates, setAvailableDates] = useState<string[]>([]);
+  // Identity-stable setter for string-array state: skip the update when
+  // the value is unchanged, so downstream deps don't see a fresh array
+  // on every recomputation (each one used to cost a full page render).
+  const setIfChangedArray = (setter: React.Dispatch<React.SetStateAction<string[]>>, next: string[]) => {
+    setter(prev => (prev.length === next.length && prev.every((v, i) => v === next[i]) ? prev : next));
+  };
+
   const [editFormData, setEditFormData] = useState({
     name: '',
     domain: '',
@@ -300,7 +350,6 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
   const [competitors, setCompetitors] = useState<any[]>([]);
   const [brandsList, setBrandsList] = useState<string[]>([]);
   const [competitorsList, setCompetitorsList] = useState<string[]>([]);
-  const [citationConsistency, setCitationConsistency] = useState<number>(0);
   const [brandLeadershipData, setBrandLeadershipData] = useState<any[]>([]);
   const [splitBrandLeadershipByLlm, setSplitBrandLeadershipByLlm] = useState(false);
 
@@ -308,7 +357,6 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
   const [auditDates, setAuditDates] = useState<string[]>([]);
   const [citationsByAudit, setCitationsByAudit] = useState<{[key: string]: any[]}>({});
   const [llmResponses, setLlmResponses] = useState<any[]>([]);
-  const [processedCitations, setProcessedCitations] = useState<any[]>([]);
   const [lastAuditDate, setLastAuditDate] = useState<string>('');
   const [auditsData, setAuditsData] = useState<any[]>([]);
   // Lightweight meta for EVERY audit of the project (id/date/status) —
@@ -321,6 +369,177 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
   const [windowLoading, setWindowLoading] = useState(false);
   // Set when a safety cap cut the fetch short (extremely dense window).
   const [dataTruncated, setDataTruncated] = useState<{ audits: number } | null>(null);
+
+  // processedCitations = table rows + JSON-extracted rows missing from the
+  // table. Was an effect + state (extra render hop); now a memo.
+  const processedCitations = useMemo(() => {
+    const extractedCitations: any[] = [];
+
+    // First, add citations from the database (these come from the citations table)
+    citations.forEach(citation => {
+      // Extract domain from URL if not present
+      const domain = citation.domain || (citation.page_url ? extractDomainFromUrl(citation.page_url) : '');
+
+      extractedCitations.push({
+        id: citation.id,
+        audit_id: citation.audit_id,
+        prompt_id: citation.prompt_id,
+        llm: citation.llm,
+        page_url: citation.page_url,
+        domain: domain,
+        citation_text: citation.citation_text,
+        position: citation.position,
+        cited: citation.cited,
+        sentiment_score: citation.sentiment_score,
+        sentiment_label: citation.sentiment_label,
+        checked_at: citation.checked_at,
+        prompts: citation.prompts,
+        audits: citation.audits
+      });
+    });
+
+    // Then, extract citations from llm_responses.citations field (preferred
+    // for SearchGPT), skipping entries already present in the table.
+    //
+    // O(1) presence index. The old per-entry `citations.some(...)` scan was
+    // O(rows × entries) — 11-14s of main-thread block on the 90-day windows
+    // of dense projects (measured on real prod payloads; the indexed version
+    // produces the identical result in ~0.2s).
+    const inDb = new Set<string>();
+    citations.forEach(c => {
+      inDb.add(`${c.audit_id}|${c.prompt_id}|${c.llm}|${normalizeUrl(c.page_url)}`);
+    });
+
+    llmResponses.forEach(response => {
+      if (!response.citations || !Array.isArray(response.citations)) return;
+      const keyBase = `${response.audit_id}|${response.prompt_id}|${response.llm}|`;
+      response.citations.forEach((citation: any, index: number) => {
+        if (!citation.url) return;
+        if (inDb.has(keyBase + normalizeUrl(citation.url))) return;
+        const domain = extractDomainFromUrl(citation.url);
+        extractedCitations.push({
+          id: `${response.id}-${index}`,
+          audit_id: response.audit_id,
+          prompt_id: response.prompt_id,
+          llm: response.llm,
+          page_url: citation.url,
+          domain: domain,
+          citation_text: citation.title || citation.description || '',
+          position: index + 1,
+          cited: citation.cited !== undefined ? citation.cited : null, // Convert undefined to null for Perplexity
+          sentiment_score: null,
+          sentiment_label: null,
+          checked_at: response.created_at,
+          prompts: response.prompts,
+          audits: response.audits
+        });
+      });
+    });
+
+    return extractedCitations;
+  }, [llmResponses, citations]);
+
+  // Filtered views of the window. Was an effect writing two states (each
+  // run produced fresh identities and another render); now one memo.
+  const { filteredCitations, filteredLlmResponses } = useMemo(() => {
+    let filtered = [...processedCitations];
+    let filteredResponses = [...llmResponses];
+
+    // Apply date range filter
+    if (filters.dateRange !== 'all') {
+
+      if (filters.dateRange === 'lastAudit') {
+        if (lastAuditDate) {
+          // Filter to show only citations from the last audit date
+          filtered = filtered.filter(citation =>
+            citation.audits?.created_at && citation.audits.created_at.split('T')[0] === lastAuditDate
+          );
+          // Also filter LLM responses by audit date (not response creation date)
+          filteredResponses = filteredResponses.filter(response =>
+            response.audits?.created_at && response.audits.created_at.split('T')[0] === lastAuditDate
+          );
+        }
+        // If lastAuditDate is not set yet, don't filter (show all data)
+      } else if (filters.dateRange === 'custom') {
+        if (customDateRange.startDate && customDateRange.endDate) {
+          const startDate = new Date(customDateRange.startDate);
+          const endDate = new Date(customDateRange.endDate);
+          endDate.setHours(23, 59, 59, 999); // Include the entire end date
+
+          filtered = filtered.filter(citation => {
+            const citationDate = citation.audits?.created_at ? new Date(citation.audits.created_at) : new Date(citation.checked_at);
+            return citationDate >= startDate && citationDate <= endDate;
+          });
+
+          filteredResponses = filteredResponses.filter(response => {
+            const responseDate = response.audits?.created_at ? new Date(response.audits.created_at) : new Date(response.created_at);
+            return responseDate >= startDate && responseDate <= endDate;
+          });
+        }
+      } else {
+        // Apply predefined date ranges
+        const now = new Date();
+        now.setHours(23, 59, 59, 999); // Include today's data
+        const cutoffDate = new Date();
+
+        switch (filters.dateRange) {
+          case 'last7days':
+            cutoffDate.setDate(now.getDate() - 6); // Include today + 6 previous days = 7 days total
+            break;
+          case 'last14days':
+            cutoffDate.setDate(now.getDate() - 13); // Include today + 13 previous days = 14 days total
+            break;
+          case 'last30days':
+            cutoffDate.setDate(now.getDate() - 29); // Include today + 29 previous days = 30 days total
+            break;
+          case 'last90days':
+            cutoffDate.setDate(now.getDate() - 89); // Include today + 89 previous days = 90 days total
+            break;
+        }
+
+        cutoffDate.setHours(0, 0, 0, 0); // Start from beginning of the cutoff day
+
+        filtered = filtered.filter(citation => {
+          const citationDate = citation.audits?.created_at ? new Date(citation.audits.created_at) : new Date(citation.checked_at);
+          return citationDate >= cutoffDate && citationDate <= now;
+        });
+
+        filteredResponses = filteredResponses.filter(response => {
+          const responseDate = response.audits?.created_at ? new Date(response.audits.created_at) : new Date(response.created_at);
+          return responseDate >= cutoffDate && responseDate <= now;
+        });
+      }
+    }
+
+    // Apply LLM filter
+    if (filters.llms !== 'all') {
+      filtered = filtered.filter(citation => citation.llm === filters.llms);
+      filteredResponses = filteredResponses.filter(response => response.llm === filters.llms);
+    }
+
+    // Apply prompt group filter
+    if (filters.promptGroups.length > 0) {
+      filtered = filtered.filter(citation =>
+        citation.prompts?.prompt_group && filters.promptGroups.includes(citation.prompts.prompt_group)
+      );
+      filteredResponses = filteredResponses.filter(response =>
+        response.prompts?.prompt_group && filters.promptGroups.includes(response.prompts.prompt_group)
+      );
+    }
+
+    // Apply sentiment filter
+    if (filters.sentiment !== 'all') {
+      filtered = filtered.filter(citation => 
+        citation.sentiment_label === filters.sentiment
+      );
+      filteredResponses = filteredResponses.filter(response => 
+        response.sentiment_label === filters.sentiment
+      );
+    }
+
+    return { filteredCitations: filtered, filteredLlmResponses: filteredResponses };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [processedCitations, llmResponses, filters, customDateRange, lastAuditDate]);
   const [showCompetitorsInTrend, setShowCompetitorsInTrend] = useState(false);
   const [selectedTrendCompetitors, setSelectedTrendCompetitors] = useState<string[]>([]);
   const [showCompetitorsInCitationsTrend, setShowCompetitorsInCitationsTrend] = useState(false);
@@ -661,21 +880,43 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     }
     let cancelled = false;
     (async () => {
-      const map: Record<string, string> = {};
-      // Small chunks keep the PostgREST in.() URL well under gateway
-      // limits; one failed chunk must not abort the rest.
-      for (let i = 0; i < domains.length; i += 150) {
-        const { data, error } = await supabase
-          .from('domain_categories')
-          .select('domain, category')
-          .in('domain', domains.slice(i, i + 150));
-        if (error) {
-          console.error('Error fetching domain categories:', error);
-          continue;
+      // Only query domains this session hasn't looked up yet; the rest
+      // come from DOMAIN_CATEGORY_FETCHED. Chunks run in parallel (was a
+      // ~27-round-trip serialized loop on dense windows).
+      const missing = domains.filter(d => !DOMAIN_CATEGORY_FETCHED.has(d));
+      if (missing.length > 0) {
+        const chunks: string[][] = [];
+        for (let i = 0; i < missing.length; i += 150) {
+          chunks.push(missing.slice(i, i + 150));
         }
-        (data || []).forEach((r: any) => { map[r.domain] = r.category; });
+        const CONC = 6;
+        let next = 0;
+        const worker = async () => {
+          while (next < chunks.length) {
+            const chunk = chunks[next++];
+            const { data, error } = await supabase
+              .from('domain_categories')
+              .select('domain, category')
+              .in('domain', chunk);
+            if (error) {
+              console.error('Error fetching domain categories:', error);
+              continue;
+            }
+            const found = new Map((data || []).map((r: any) => [r.domain, r.category]));
+            chunk.forEach(d => {
+              DOMAIN_CATEGORY_FETCHED.set(d, found.get(d) || '');
+            });
+          }
+        };
+        await Promise.all(Array.from({ length: Math.min(CONC, chunks.length) }, () => worker()));
       }
-      if (!cancelled) setDomainCategoryMap(map);
+      if (cancelled) return;
+      const map: Record<string, string> = {};
+      domains.forEach(d => {
+        const cat = DOMAIN_CATEGORY_FETCHED.get(d);
+        if (cat) map[d] = cat;
+      });
+      setDomainCategoryMap(map);
     })();
     return () => { cancelled = true; };
   }, [processedCitations]);
@@ -734,18 +975,8 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     };
   }, [id, runningAuditInfo]);
 
-  useEffect(() => {
-    processLlmResponsesIntoCitations();
-  }, [llmResponses, citations]);
-
-  useEffect(() => {
-    // `customDateRange` and `lastAuditDate` are read inside applyFilters
-    // but were missing from the deps array — that caused a race on cold
-    // load (applyFilters runs before lastAuditDate is set) and made the
-    // Custom Date Range picker not re-filter when the user changed
-    // start/end dates without also touching another filter.
-    applyFilters();
-  }, [processedCitations, llmResponses, filters, customDateRange, lastAuditDate]);
+  // processedCitations and the filtered views are useMemo now (see below) —
+  // the old effect->state hops each cost a full extra render of the page.
 
   useEffect(() => {
     calculateBrandLeadership();
@@ -800,7 +1031,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     allAuditsMeta.forEach(a => {
       if (a.created_at) allAvailable.add(a.created_at.split('T')[0]);
     });
-    setAvailableDates(Array.from(allAvailable).sort());
+    setIfChangedArray(setAvailableDates, Array.from(allAvailable).sort());
 
     if (processedCitations.length > 0) {
 
@@ -826,7 +1057,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
       });
 
       const sortedAuditDates = Array.from(auditDatesSet).sort();
-      setAuditDates(sortedAuditDates);
+      setIfChangedArray(setAuditDates, sortedAuditDates);
       setCitationsByAudit(citationsByAuditDate);
 
       // Set last audit date — prefer the most recent date that actually
@@ -849,7 +1080,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     } else if (auditDatesFromAudits.size > 0) {
       // Even if no citations, show audit dates
       const sortedAuditDates = Array.from(auditDatesFromAudits).sort();
-      setAuditDates(sortedAuditDates);
+      setIfChangedArray(setAuditDates, sortedAuditDates);
       setCitationsByAudit({});
 
       // Same preference as above — a date with llm_response answers beats
@@ -1350,300 +1581,65 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     }
   };
 
-  const applyFilters = () => {
-    let filtered = [...processedCitations];
-    let filteredResponses = [...llmResponses];
-
-    // Apply date range filter
-    if (filters.dateRange !== 'all') {
-
-      if (filters.dateRange === 'lastAudit') {
-        if (lastAuditDate) {
-          // Filter to show only citations from the last audit date
-          filtered = filtered.filter(citation =>
-            citation.audits?.created_at && citation.audits.created_at.split('T')[0] === lastAuditDate
-          );
-          // Also filter LLM responses by audit date (not response creation date)
-          filteredResponses = filteredResponses.filter(response =>
-            response.audits?.created_at && response.audits.created_at.split('T')[0] === lastAuditDate
-          );
-        }
-        // If lastAuditDate is not set yet, don't filter (show all data)
-      } else if (filters.dateRange === 'custom') {
-        if (customDateRange.startDate && customDateRange.endDate) {
-          const startDate = new Date(customDateRange.startDate);
-          const endDate = new Date(customDateRange.endDate);
-          endDate.setHours(23, 59, 59, 999); // Include the entire end date
-
-          filtered = filtered.filter(citation => {
-            const citationDate = citation.audits?.created_at ? new Date(citation.audits.created_at) : new Date(citation.checked_at);
-            return citationDate >= startDate && citationDate <= endDate;
-          });
-
-          filteredResponses = filteredResponses.filter(response => {
-            const responseDate = response.audits?.created_at ? new Date(response.audits.created_at) : new Date(response.created_at);
-            return responseDate >= startDate && responseDate <= endDate;
-          });
-        }
-      } else {
-        // Apply predefined date ranges
-        const now = new Date();
-        now.setHours(23, 59, 59, 999); // Include today's data
-        const cutoffDate = new Date();
-
-        switch (filters.dateRange) {
-          case 'last7days':
-            cutoffDate.setDate(now.getDate() - 6); // Include today + 6 previous days = 7 days total
-            break;
-          case 'last14days':
-            cutoffDate.setDate(now.getDate() - 13); // Include today + 13 previous days = 14 days total
-            break;
-          case 'last30days':
-            cutoffDate.setDate(now.getDate() - 29); // Include today + 29 previous days = 30 days total
-            break;
-          case 'last90days':
-            cutoffDate.setDate(now.getDate() - 89); // Include today + 89 previous days = 90 days total
-            break;
-        }
-
-        cutoffDate.setHours(0, 0, 0, 0); // Start from beginning of the cutoff day
-
-        filtered = filtered.filter(citation => {
-          const citationDate = citation.audits?.created_at ? new Date(citation.audits.created_at) : new Date(citation.checked_at);
-          return citationDate >= cutoffDate && citationDate <= now;
-        });
-
-        filteredResponses = filteredResponses.filter(response => {
-          const responseDate = response.audits?.created_at ? new Date(response.audits.created_at) : new Date(response.created_at);
-          return responseDate >= cutoffDate && responseDate <= now;
-        });
-      }
-    }
-
-    // Apply LLM filter
-    if (filters.llms !== 'all') {
-      filtered = filtered.filter(citation => citation.llm === filters.llms);
-      filteredResponses = filteredResponses.filter(response => response.llm === filters.llms);
-    }
-
-    // Apply prompt group filter
-    if (filters.promptGroups.length > 0) {
-      filtered = filtered.filter(citation =>
-        citation.prompts?.prompt_group && filters.promptGroups.includes(citation.prompts.prompt_group)
-      );
-      filteredResponses = filteredResponses.filter(response =>
-        response.prompts?.prompt_group && filters.promptGroups.includes(response.prompts.prompt_group)
-      );
-    }
-
-    // Apply sentiment filter
-    if (filters.sentiment !== 'all') {
-      filtered = filtered.filter(citation => 
-        citation.sentiment_label === filters.sentiment
-      );
-      filteredResponses = filteredResponses.filter(response => 
-        response.sentiment_label === filters.sentiment
-      );
-    }
-
-    setFilteredCitations(filtered);
-    setFilteredLlmResponses(filteredResponses);
-
-  };
-
-  const processLlmResponsesIntoCitations = () => {
-    const extractedCitations: any[] = [];
-
-    // First, add citations from the database (these come from the citations table)
-    citations.forEach(citation => {
-      // Extract domain from URL if not present
-      const domain = citation.domain || (citation.page_url ? extractDomainFromUrl(citation.page_url) : '');
-
-      extractedCitations.push({
-        id: citation.id,
-        audit_id: citation.audit_id,
-        prompt_id: citation.prompt_id,
-        llm: citation.llm,
-        page_url: citation.page_url,
-        domain: domain,
-        citation_text: citation.citation_text,
-        position: citation.position,
-        cited: citation.cited,
-        sentiment_score: citation.sentiment_score,
-        sentiment_label: citation.sentiment_label,
-        checked_at: citation.checked_at,
-        prompts: citation.prompts,
-        audits: citation.audits
-      });
-    });
-
-    // Then, extract citations from llm_responses.citations field (preferred for SearchGPT)
-    llmResponses.forEach(response => {
-      // First, try to use the citations field from llm_responses (this has cited info)
-      if (response.citations && Array.isArray(response.citations)) {
-        response.citations.forEach((citation: any, index: number) => {
-          // Check if this citation already exists in the database citations.
-          // Compare on normalized URL — see normalizeUrl above for why.
-          const candidateKey = normalizeUrl(citation.url);
-          const existsInDb = citations.some(c =>
-            c.audit_id === response.audit_id &&
-            c.prompt_id === response.prompt_id &&
-            c.llm === response.llm &&
-            normalizeUrl(c.page_url) === candidateKey
-          );
-
-          if (!existsInDb && citation.url) {
-            const domain = extractDomainFromUrl(citation.url);
-            extractedCitations.push({
-              id: `${response.id}-${index}`,
-              audit_id: response.audit_id,
-              prompt_id: response.prompt_id,
-              llm: response.llm,
-              page_url: citation.url,
-              domain: domain,
-              citation_text: citation.title || citation.description || '',
-              position: index + 1,
-              cited: citation.cited !== undefined ? citation.cited : null, // Convert undefined to null for Perplexity
-              sentiment_score: null,
-              sentiment_label: null,
-              checked_at: response.created_at,
-              prompts: response.prompts,
-              audits: response.audits
-            });
-          }
-        });
-        return; // Skip raw_response_data processing if we have citations field
-      }
-
-      // Fallback: extract citations from raw_response_data for backward compatibility
-      if (!response.raw_response_data) return;
-
-      let urls: any[] = [];
-
-      // Extract URLs based on LLM type
-      if (response.llm === 'perplexity' && (response.raw_response_data.sources || response.raw_response_data.citations)) {
-        const sources = response.raw_response_data.sources || response.raw_response_data.citations || [];
-        urls = sources.map((source: any, index: number) => ({
-          url: source.url,
-          text: source.title || source.description || 'No description',
-          position: source.position || index + 1
-        }));
-      } else if (response.llm === 'searchgpt') {
-        // Handle SearchGPT - use links_attached field
-        const linksAttached = response.raw_response_data.links_attached || [];
-
-        linksAttached.forEach((link: any, index: number) => {
-          if (link.url) {
-            urls.push({
-              url: link.url,
-              text: link.text || link.title || link.description,
-              position: link.position || index + 1,
-            });
-          }
-        });
-      } else if (response.llm === 'gemini') {
-        // Handle Gemini citations
-        const linksAttached = response.raw_response_data.links_attached || [];
-
-        linksAttached.forEach((link: any, index: number) => {
-          if (link.url) {
-            urls.push({
-              url: link.url,
-              text: link.text || link.title || link.description,
-              position: link.position || index + 1,
-            });
-          }
-        });
-      } else if (response.llm === 'grok' && response.raw_response_data.citations) {
-        // Handle Grok citations
-        response.raw_response_data.citations.forEach((cit: any, index: number) => {
-          if (cit.url) {
-            urls.push({
-              url: cit.url,
-              text: cit.title || cit.description || 'No description',
-              position: index + 1,
-            });
-          }
-        });
-      }
-
-      // Convert URLs to citation format (only if not already in citations table)
-      urls.forEach(urlData => {
-        // Check if this citation already exists in the database citations.
-        // Compare on normalized URL — see normalizeUrl above.
-        const candidateKey = normalizeUrl(urlData.url);
-        const existsInDb = citations.some(c =>
-          c.audit_id === response.audit_id &&
-          c.prompt_id === response.prompt_id &&
-          c.llm === response.llm &&
-          normalizeUrl(c.page_url) === candidateKey
-        );
-
-        if (!existsInDb) {
-          const domain = extractDomainFromUrl(urlData.url);
-          extractedCitations.push({
-            id: `${response.id}-${urlData.position}`,
-            audit_id: response.audit_id,
-            prompt_id: response.prompt_id,
-            llm: response.llm,
-            page_url: urlData.url,
-            domain: domain,
-            citation_text: urlData.text,
-            position: urlData.position,
-            sentiment_score: null,
-            sentiment_label: null,
-            checked_at: response.created_at,
-            prompts: response.prompts,
-            audits: response.audits
-          });
-        }
-      });
-    });
-
-    setProcessedCitations(extractedCitations);
-  };
-
-  const extractDomainFromUrl = (url: string): string => {
-    try {
-      const urlObj = new URL(url);
-      return urlObj.hostname.replace(/^www\./, '');
-    } catch {
-      return url;
-    }
-  };
-
-  // Normalize URLs before dedup-comparing citations from two sources
-  // (the `citations` table and the `llm_responses.citations` JSONB).
-  // Without this, "https://Example.com/foo/" and "http://www.example.com/foo"
-  // were treated as different and the same URL got counted twice in the
-  // Citations tab vs Overview widget. Trailing slash, www., scheme, host
-  // case, and hash are all stripped; query string is preserved because
-  // it can legitimately differentiate articles (e.g. ?id=123).
-  const normalizeUrl = (url: string): string => {
-    if (!url) return '';
-    try {
-      const u = new URL(url);
-      const host = u.hostname.toLowerCase().replace(/^www\./, '');
-      const path = u.pathname.replace(/\/+$/, '') || '/';
-      return `${host}${path}${u.search}`;
-    } catch {
-      return url.toLowerCase().replace(/\/+$/, '');
-    }
-  };
 
   // Page ↔ brand attribution index (Pages tab "Brands" column): exact
   // evidence only — brand in the answer chunk citing the page ([N] markers,
   // searchgpt/chatgpt) or in the citation's own title (all LLMs); response
   // co-mentions go to tooltips. See src/lib/pageBrands.ts.
+  // Tab gating for the heavy derived indexes: when the consuming tab is
+  // closed, the memos run over stable EMPTY inputs (near-zero cost, same
+  // result shape). Opening the tab swaps the real arrays in and the memo
+  // recomputes once.
+  const pagesDataActive = activeTab === 'pages';
+  const pagesOrDomainsActive = activeTab === 'pages' || activeTab === 'domains';
+  const pageBrandResponses = pagesDataActive ? filteredLlmResponses : EMPTY_ROWS;
+  const pageBrandCitations = pagesDataActive ? filteredCitations : EMPTY_ROWS;
+  const trendResponses = pagesOrDomainsActive ? filteredLlmResponses : EMPTY_ROWS;
+  const trendCitations = pagesOrDomainsActive ? filteredCitations : EMPTY_ROWS;
+  const matrixResponses = activeTab === 'mentions' ? filteredLlmResponses : EMPTY_ROWS;
+
+  // Grid indexes for the Prompts / Visibility tabs — replace the per-cell
+  // full-window filters (222 rows × 7 LLMs × 6.6k responses each).
+  const gridIndexes = useMemo(() => {
+    const byPromptLlmAll = new Map<string, any[]>();
+    const byPromptFiltered = new Map<string, any[]>();
+    const active = activeTab === 'prompts' || activeTab === 'visibility';
+    if (active) {
+      llmResponses.forEach((r: any) => {
+        const k = `${r.prompt_id}|${r.llm}`;
+        let arr = byPromptLlmAll.get(k);
+        if (!arr) byPromptLlmAll.set(k, arr = []);
+        arr.push(r);
+      });
+      filteredLlmResponses.forEach((r: any) => {
+        let arr = byPromptFiltered.get(r.prompt_id);
+        if (!arr) byPromptFiltered.set(r.prompt_id, arr = []);
+        arr.push(r);
+      });
+    }
+    const uniqueLlms = active
+      ? Array.from(new Set(llmResponses.map((r: any) => r.llm))).sort()
+      : [];
+    return { byPromptLlmAll, byPromptFiltered, uniqueLlms };
+  }, [activeTab, llmResponses, filteredLlmResponses]);
+
+  // Render caps for the two unbounded tables (Pages can reach ~18k rows).
+  const [pagesRowLimit, setPagesRowLimit] = useState(50);
+  const [domainsRowLimit, setDomainsRowLimit] = useState(50);
+  useEffect(() => {
+    setPagesRowLimit(50);
+    setDomainsRowLimit(50);
+  }, [windowKey, activeTab]);
+
   const pageBrandIndex = useMemo(
     () => buildPageBrandIndex({
-      responses: filteredLlmResponses,
-      citations: filteredCitations,
+      responses: pageBrandResponses,
+      citations: pageBrandCitations,
       projectBrands: [...brands, ...competitors],
       normalizeUrl,
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [filteredLlmResponses, filteredCitations, brands, competitors]
+    [pageBrandResponses, pageBrandCitations, brands, competitors]
   );
 
   // Trend vs the previous audit (Domains / Pages tabs). Compares the last
@@ -1663,7 +1659,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     if (!auditsData || auditsData.length < 2) return empty;
 
     const answeredByAudit = new Map<string, number>();
-    filteredLlmResponses.forEach(r => {
+    trendResponses.forEach(r => {
       if (!r.audit_id || !r.answer_text) return;
       answeredByAudit.set(r.audit_id, (answeredByAudit.get(r.audit_id) || 0) + 1);
     });
@@ -1699,7 +1695,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
       if (!set) { set = new Set(); e.set(auditId, set); }
       set.add(rk);
     };
-    filteredCitations.forEach(c => {
+    trendCitations.forEach(c => {
       if (!c.audit_id || !windowIds.has(c.audit_id) || !isCited(c)) return;
       const rk = c.audit_id + '-' + c.prompt_id + '-' + c.llm;
       if (c.domain) bump(domainSets, c.domain, c.audit_id, rk);
@@ -1735,7 +1731,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
       })),
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filteredCitations, filteredLlmResponses, auditsData, filters.llms]);
+  }, [trendCitations, trendResponses, auditsData, filters.llms]);
 
   const extractDomain = (url: string): string => {
     try {
@@ -2202,9 +2198,6 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
         }
       }
       
-      // Calculate citation consistency
-      const consistency = calculateCitationConsistency(projectData.prompts || [], []);
-      setCitationConsistency(consistency);
     } catch (error: any) {
       if (error?.name === 'AbortError') {
         console.warn('Data fetch timed out — database may be under heavy load');
@@ -2218,97 +2211,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     }
   };
 
-  const calculateCitationConsistency = (prompts: any[], citations: any[]): number => {
-    if (prompts.length === 0) return 0;
-    
-    const promptConsistencies: number[] = [];
-    
-    prompts.forEach(prompt => {
-      // Get all citations for this prompt across all LLMs
-      const promptCitations = citations.filter(citation => citation.prompt_id === prompt.id);
-      
-      if (promptCitations.length === 0) {
-        promptConsistencies.push(0);
-        return;
-      }
-      
-      // Group citations by LLM
-      const citationsByLlm: { [key: string]: any[] } = {};
-      promptCitations.forEach(citation => {
-        if (!citationsByLlm[citation.llm]) {
-          citationsByLlm[citation.llm] = [];
-        }
-        citationsByLlm[citation.llm].push(citation);
-      });
-      
-      const llms = Object.keys(citationsByLlm);
-      if (llms.length < 2) {
-        // Need at least 2 LLMs to calculate consistency
-        promptConsistencies.push(0);
-        return;
-      }
-      
-      // Get all unique domains for this prompt
-      const allDomains = new Set<string>();
-      promptCitations.forEach(citation => {
-        if (citation.domain) {
-          allDomains.add(citation.domain);
-        }
-      });
-      
-      if (allDomains.size === 0) {
-        promptConsistencies.push(0);
-        return;
-      }
-      
-      // Calculate common domains percentage
-      let commonDomainsCount = 0;
-      
-      allDomains.forEach(domain => {
-        // Count how many LLMs mentioned this domain
-        const llmsWithDomain = llms.filter(llm => 
-          citationsByLlm[llm].some(citation => citation.domain === domain)
-        );
-        
-        // If domain appears in multiple LLMs, it's a common domain
-        if (llmsWithDomain.length > 1) {
-          commonDomainsCount++;
-        }
-      });
-      
-      // Calculate percentage of common domains
-      const consistencyPercentage = (commonDomainsCount / allDomains.size) * 100;
-      promptConsistencies.push(consistencyPercentage);
-    });
-    
-    // Return average consistency across all prompts
-    if (promptConsistencies.length === 0) return 0;
-    return Math.round(promptConsistencies.reduce((sum, consistency) => sum + consistency, 0) / promptConsistencies.length);
-  };
 
-  const getBrandMentions = (brandName: string) => {
-    const brandLower = brandName.toLowerCase();
-    const promptsWithMentions = new Set<string>();
-    let totalMentions = 0;
-
-    // Check filtered LLM responses for mentions of this brand
-    filteredLlmResponses.forEach(response => {
-      if (response.answer_text) {
-        const answerLower = response.answer_text.toLowerCase();
-        if (answerLower.includes(brandLower)) {
-          promptsWithMentions.add(response.prompt_id);
-          // Count occurrences in this response
-          const matches = answerLower.split(brandLower).length - 1;
-          totalMentions += matches;
-        }
-      }
-    });
-
-    return {
-      promptsWithMentions: promptsWithMentions.size,
-      totalMentions,
-    };
-  };
 
   const handleRunAudit = (_projectId: string) => {
     // Local LLM dropdown was removed when the filter UI moved into
@@ -2762,19 +2665,6 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     }
   };
 
-  const getSentimentData = () => {
-    const sentimentCounts = filteredCitations.reduce((acc, citation) => {
-      const label = citation.sentiment_label || 'neutral';
-      acc[label] = (acc[label] || 0) + 1;
-      return acc;
-    }, {});
-
-    return Object.entries(sentimentCounts).map(([name, value]) => ({
-      name: name.charAt(0).toUpperCase() + name.slice(1),
-      value,
-      color: SENTIMENT_COLORS[name as keyof typeof SENTIMENT_COLORS],
-    }));
-  };
 
   const getTopCompetitorDomains = () => {
     if (!filteredCitations.length) return [];
@@ -2978,30 +2868,6 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
 
       return result;
     }).filter(item => item.totalCitations > 0); // Only show groups with responses
-  };
-  const getFilteredPromptStats = () => {
-    const promptStats = prompts.map(prompt => {
-      const promptCitations = filteredCitations.filter(c => c.prompt_id === prompt.id);
-      const sentimentCounts = promptCitations.reduce((acc, citation) => {
-        const label = citation.sentiment_label || 'neutral';
-        acc[label] = (acc[label] || 0) + 1;
-        return acc;
-      }, { positive: 0, neutral: 0, negative: 0 });
-
-      const total = promptCitations.length;
-      return {
-        id: prompt.id,
-        prompt: prompt.prompt_text,
-        group: prompt.prompt_group,
-        total,
-        positive: total > 0 ? Math.round((sentimentCounts.positive / total) * 100) : 0,
-        neutral: total > 0 ? Math.round((sentimentCounts.neutral / total) * 100) : 0,
-        negative: total > 0 ? Math.round((sentimentCounts.negative / total) * 100) : 0,
-        date: new Date(prompt.created_at).toLocaleDateString(),
-      };
-    });
-
-    return promptStats;
   };
 
   const exportPromptsToExcel = () => {
@@ -3550,32 +3416,59 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     });
   };
 
+  // Sorted page rows for the Pages performance table — computed once per
+  // data/sort change (was recomputed inside JSX on every render) and only
+  // while the Pages tab is open.
+  const pageStatsRows = useMemo(
+    () => (activeTab === 'pages' ? getFilteredPageStats() : EMPTY_ROWS),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [activeTab, filteredCitations, filteredLlmResponses, pageSortConfig, domainCategoryMap, pageBrandIndex, project?.domain],
+  );
+
   // Project-relative overlay on top of the global category: the project's own
   // domain (and domains matching own-brand names) show as "Own Brand", domains
   // matching competitor brand names as "Competitor". Falls back to the stored
   // global category, then "Unknown".
+  // Result cache for getDomainDisplayCategory — the same few thousand
+  // domains are classified by several widgets (sources pie walks all
+  // ~50k citations), and every classification does NFD normalization
+  // against the brand lists. Invalidated when any input changes.
+  const domainCategoryCache = useMemo(
+    () => new Map<string, string>(),
+    [project?.domain, brands, competitors, domainCategoryMap],
+  );
+
   const getDomainDisplayCategory = (rawDomain: string): string => {
-    const domain = (rawDomain || '').toLowerCase().replace(/^www\./, '');
-    if (!domain) return 'Unknown';
+    const cached = domainCategoryCache.get(rawDomain);
+    if (cached !== undefined) return cached;
 
-    if (project?.domain) {
-      const projectDomain = project.domain.toLowerCase().replace(/^www\./, '');
-      if (domain === projectDomain || domain.endsWith(`.${projectDomain}`)) {
-        return 'Own Brand';
+    const compute = (): string => {
+      const domain = (rawDomain || '').toLowerCase().replace(/^www\./, '');
+      if (!domain) return 'Unknown';
+
+      if (project?.domain) {
+        const projectDomain = project.domain.toLowerCase().replace(/^www\./, '');
+        if (domain === projectDomain || domain.endsWith(`.${projectDomain}`)) {
+          return 'Own Brand';
+        }
       }
-    }
 
-    // Match the registrable label ("credit-agricole" in credit-agricole.fr)
-    // against normalized brand names ("Crédit Agricole" → "creditagricole").
-    const normalize = normalizeBrandKey;
-    const labels = domain.split('.');
-    const secondLevel = normalize(labels.length >= 2 ? labels[labels.length - 2] : labels[0]);
-    if (secondLevel.length >= 3) {
-      if (brands.some(b => normalize(b.brand_name || '') === secondLevel)) return 'Own Brand';
-      if (competitors.some(b => normalize(b.brand_name || '') === secondLevel)) return 'Competitor';
-    }
+      // Match the registrable label ("credit-agricole" in credit-agricole.fr)
+      // against normalized brand names ("Crédit Agricole" → "creditagricole").
+      const normalize = normalizeBrandKey;
+      const labels = domain.split('.');
+      const secondLevel = normalize(labels.length >= 2 ? labels[labels.length - 2] : labels[0]);
+      if (secondLevel.length >= 3) {
+        if (brands.some(b => normalize(b.brand_name || '') === secondLevel)) return 'Own Brand';
+        if (competitors.some(b => normalize(b.brand_name || '') === secondLevel)) return 'Competitor';
+      }
 
-    return domainCategoryMap[rawDomain] || domainCategoryMap[domain] || 'Unknown';
+      return domainCategoryMap[rawDomain] || domainCategoryMap[domain] || 'Unknown';
+    };
+
+    const out = compute();
+    domainCategoryCache.set(rawDomain, out);
+    return out;
   };
 
   // Data for the Domains Insights view — one memoized pass over
@@ -3600,7 +3493,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     const catCounts = new Map<string, number>();
     const catResp = new Map<string, Map<string, Set<string>>>();
 
-    filteredCitations.forEach((c: any) => {
+    trendCitations.forEach((c: any) => {
       if (!c.domain || !isCited(c)) return;
       let cat = catOf.get(c.domain);
       if (!cat) { cat = getDomainDisplayCategory(c.domain); catOf.set(c.domain, cat); }
@@ -3692,7 +3585,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
 
     return { movers, shakers, pageMovers, pageShakers, pie, totalCited, topCats, dynamics };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filteredCitations, auditTrendIndex, domainCategoryMap, brands, competitors, project?.domain, filters.llms]);
+  }, [trendCitations, auditTrendIndex, domainCategoryMap, brands, competitors, project?.domain, filters.llms]);
 
   // Movers/Shakers horizon. 'last' compares against the previous audit from
   // client-side data; the day modes need a baseline far outside the loaded
@@ -3989,6 +3882,13 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     });
   };
 
+  // Same treatment for the Domains performance table.
+  const domainStatsRows = useMemo(
+    () => (activeTab === 'domains' ? getFilteredDomainStats() : EMPTY_ROWS),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [activeTab, filteredCitations, filteredLlmResponses, domainSortConfig, domainCategoryMap, project?.domain],
+  );
+
   const getFilteredAuditDates = () => {
     // Filter audit dates based on current date range filter
     if (filters.dateRange === 'all') return auditDates;
@@ -4033,7 +3933,17 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     return auditDates.filter(date => date >= cutoffDateStr);
   };
 
-  const getCitationRate = () => {
+  // Memoized: the Prompts grid used to call getFilteredAuditDates() once
+  // per row (222 rows x a sort each).
+  const filteredAuditDates = useMemo(
+    () => getFilteredAuditDates(),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [auditDates, filters.dateRange, customDateRange, lastAuditDate],
+  );
+
+  // Memoized: this used to be a plain function invoked 3x per render
+  // from the Overview cards, re-walking the full window each time.
+  const citationRateStats = useMemo(() => {
     if (!project?.domain) return { rate: 0, cited: 0, total: 0 };
 
     // Normalize project domain (remove www and lowercase) to match
@@ -4092,9 +4002,13 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
 
     const rate = Math.round((citedAnswers / totalLlmResponses) * 100);
     return { rate, cited: citedAnswers, total: totalLlmResponses };
-  };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filteredCitations, filteredLlmResponses, project?.domain, project?.domain_mode]);
 
-  const getMentionRate = () => {
+  // Memoized for the same reason; brand matchers are compiled ONCE per
+  // brand-list change instead of once per response (findBrandsInText
+  // without the matchers arg rebuilds the regex set on every call).
+  const mentionRateStats = useMemo(() => {
     const ownBrands = brands.filter(brand => !brand.is_competitor).map(brand => brand.brand_name);
 
     if (ownBrands.length === 0) return { rate: 0, mentioned: 0, total: 0 };
@@ -4120,13 +4034,15 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     // French words (venir, devenir, obtenir…) and inflated one project's
     // mention rate from 21% to 35%.
     const ownBrandRows = brands.filter(b => !b.is_competitor);
+    const matchers = buildMatchers(ownBrandRows);
     const mentioned = relevantResponses.filter(
-      response => findBrandsInText(response.answer_text, ownBrandRows).length > 0
+      response => findBrandsInText(response.answer_text, ownBrandRows, matchers).length > 0
     ).length;
 
     const rate = Math.round((mentioned / total) * 100);
     return { rate, mentioned, total };
-  };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filteredLlmResponses, brands]);
 
   // Calculate brand mentions data based on filtered responses
   // Citation Funnel stages for the project's own domain, per prompt of one
@@ -4205,7 +4121,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
   // under the active filters. One pass over responses.
   const MATRIX_LLM_ORDER = ['searchgpt', 'google-ai-mode', 'google-ai-overview', 'gemini', 'grok', 'bing-copilot', 'perplexity'];
   const mentionsMatrix = useMemo(() => {
-    const answered = filteredLlmResponses.filter(r => r.answer_text && r.answer_text !== '');
+    const answered = matrixResponses.filter(r => r.answer_text && r.answer_text !== '');
     const llms = MATRIX_LLM_ORDER.filter(l => answered.some(r => r.llm === l));
     const denom: Record<string, number> = {};
     llms.forEach(l => { denom[l] = answered.filter(r => r.llm === l).length; });
@@ -4264,7 +4180,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
 
     return { llms, denom, rows, maxCount, maxRate };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filteredLlmResponses, brands, competitors]);
+  }, [matrixResponses, brands, competitors]);
 
   const exportMentionsMatrix = () => {
     const { llms, rows } = mentionsMatrix;
@@ -4286,91 +4202,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     xlsxWriteFile(wb, `${project?.name || 'project'}_mentions_matrix_${new Date().toISOString().split('T')[0]}.xlsx`);
   };
 
-  const getBrandMentionsData = () => {
-    const allBrands = [...brands, ...competitors];
 
-    return allBrands.map(brand => {
-      const brandLower = brand.brand_name.toLowerCase();
-
-      // Count unique prompts where brand is mentioned
-      const promptsWithMentions = new Set<string>();
-      let searchgptResponsesWithMentions = 0;
-      let perplexityResponsesWithMentions = 0;
-      let geminiResponsesWithMentions = 0;
-      let sentimentScores: number[] = [];
-
-      filteredLlmResponses.forEach(response => {
-        if (response.answer_text) {
-          const answerLower = response.answer_text.toLowerCase();
-          if (answerLower.includes(brandLower)) {
-            // Track unique prompts (audit_id + prompt_id)
-            if (response.audit_id && response.prompt_id) {
-              promptsWithMentions.add(`${response.audit_id}-${response.prompt_id}`);
-            }
-
-            // Count by LLM (number of responses)
-            if (response.llm === 'searchgpt') searchgptResponsesWithMentions++;
-            else if (response.llm === 'perplexity') perplexityResponsesWithMentions++;
-            else if (response.llm === 'gemini') geminiResponsesWithMentions++;
-
-            // Collect sentiment scores
-            if (response.sentiment_score !== null) {
-              sentimentScores.push(response.sentiment_score);
-            }
-          }
-        }
-      });
-
-      // Calculate mention rate as % of total unique prompts that mention this brand
-      const totalUniquePrompts = new Set(
-        filteredLlmResponses
-          .filter(r => r.audit_id && r.prompt_id)
-          .map(r => `${r.audit_id}-${r.prompt_id}`)
-      );
-
-      const mentionRate = totalUniquePrompts.size > 0 ?
-        Math.round((promptsWithMentions.size / totalUniquePrompts.size) * 100) : 0;
-
-      const avgSentiment = sentimentScores.length > 0 ?
-        sentimentScores.reduce((sum, score) => sum + score, 0) / sentimentScores.length : null;
-
-      return {
-        brand_name: brand.brand_name,
-        is_competitor: brand.is_competitor,
-        total_mentions: promptsWithMentions.size,
-        searchgpt_mentions: searchgptResponsesWithMentions,
-        perplexity_mentions: perplexityResponsesWithMentions,
-        gemini_mentions: geminiResponsesWithMentions,
-        mention_rate: mentionRate,
-        avg_sentiment: avgSentiment,
-      };
-    });
-  };
-
-  const getCitationConsistency = () => {
-    if (!project?.domain || auditDates.length === 0) return 0;
-
-    const projectDomain = project.domain.toLowerCase().replace(/^www\./, '');
-    const domainMode = project.domain_mode || 'exact';
-    let consistentAudits = 0;
-
-    auditDates.forEach(date => {
-      const auditCitations = citationsByAudit[date] || [];
-      const hasDomainCitation = auditCitations.some(citation => {
-        if (!citation.domain) return false;
-        const citationDomain = citation.domain.toLowerCase().replace(/^www\./, '');
-
-        if (domainMode === 'subdomains') {
-          return citationDomain === projectDomain || citationDomain.endsWith(`.${projectDomain}`);
-        } else {
-          return citationDomain === projectDomain;
-        }
-      });
-      if (hasDomainCitation) consistentAudits++;
-    });
-
-    return Math.round((consistentAudits / auditDates.length) * 100);
-  };
 
   const tabs = [
     { id: 'overview', label: 'Overview', icon: List },
@@ -4385,6 +4217,89 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     { id: 'sentiment', label: 'Sentiment', icon: Smile },
     { id: 'settings', label: 'Settings', icon: Settings },
   ];
+
+  // Per-prompt-group citation radar: memoized — this walked the whole
+  // window (~10^7 include-steps) on every Overview render.
+  const promptGroupRadarData = useMemo(
+    () => (activeTab === 'overview' ? getCitationRateByPromptGroup() : []),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [activeTab, filteredCitations, filteredLlmResponses, prompts, promptGroups],
+  );
+
+  // Overview visibility-heatmap metrics: one indexed pass instead of the
+  // old inline JSX computation, which walked filteredCitations once per
+  // response (~3×10^8 iterations) on EVERY render of the Overview tab.
+  const heatmapMetrics = useMemo(() => {
+    const empty = { uniqueLlms: [] as string[], metricsByLlm: {} as Record<string, any> };
+    if (activeTab !== 'overview') return empty;
+    const uniqueLlms = [...new Set(filteredLlmResponses.map(r => r.llm))].sort();
+    const metricsByLlm: Record<string, any> = {};
+    if (uniqueLlms.length === 0) return { uniqueLlms, metricsByLlm };
+
+    const projectDomain = project?.domain?.toLowerCase().replace(/^www\./, '');
+    const domainMode = project?.domain_mode || 'exact';
+    const ownBrands = brands
+      .filter(b => !b.is_competitor)
+      .map(b => String(b.brand_name || '').toLowerCase())
+      .filter(Boolean);
+
+    const matchesProject = (rawDomain: string | null | undefined): boolean => {
+      if (!rawDomain || !projectDomain) return false;
+      const d = String(rawDomain).toLowerCase().replace(/^www\./, '');
+      return domainMode === 'subdomains'
+        ? d === projectDomain || d.endsWith(`.${projectDomain}`)
+        : d === projectDomain;
+    };
+    const hostOf = (url: string): string => {
+      try { return new URL(url).hostname.toLowerCase().replace(/^www\./, ''); }
+      catch { return ''; }
+    };
+
+    // (audit, prompt, llm) triples that have a project-domain citation
+    // (cited !== false) in the citations table.
+    const citedByKey = new Set<string>();
+    filteredCitations.forEach((c: any) => {
+      if (c.cited === false) return;
+      if (!matchesProject(c.domain)) return;
+      citedByKey.add(`${c.audit_id}|${c.prompt_id}|${c.llm}`);
+    });
+
+    filteredLlmResponses.forEach((response: any) => {
+      const llm = response.llm;
+      let m = metricsByLlm[llm];
+      if (!m) m = metricsByLlm[llm] = { totalResponses: 0, citedCount: 0, mentionedCount: 0 };
+      m.totalResponses++;
+
+      let cited = citedByKey.has(`${response.audit_id}|${response.prompt_id}|${llm}`);
+      if (!cited && llm === 'searchgpt' && Array.isArray(response.links_attached)) {
+        cited = response.links_attached.some((link: any) =>
+          link?.url && matchesProject(hostOf(link.url)));
+      }
+      if (!cited && response.all_sources) {
+        try {
+          const sources = Array.isArray(response.all_sources)
+            ? response.all_sources : JSON.parse(response.all_sources);
+          cited = sources.some((source: any) => {
+            if (source?.domain) return matchesProject(source.domain);
+            if (source?.url) return matchesProject(hostOf(source.url));
+            return false;
+          });
+        } catch { /* malformed all_sources — treated as not cited, as before */ }
+      }
+      if (cited) m.citedCount++;
+
+      const answerText = response.answer_text ? String(response.answer_text).toLowerCase() : '';
+      if (answerText && ownBrands.some(b => answerText.includes(b))) m.mentionedCount++;
+    });
+
+    uniqueLlms.forEach(llm => {
+      const m = metricsByLlm[llm];
+      m.citationRate = m.totalResponses > 0 ? Math.round((m.citedCount / m.totalResponses) * 100) : 0;
+      m.mentionRate = m.totalResponses > 0 ? Math.round((m.mentionedCount / m.totalResponses) * 100) : 0;
+    });
+    return { uniqueLlms, metricsByLlm };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, filteredLlmResponses, filteredCitations, project?.domain, project?.domain_mode, brands]);
 
   // Widget skeletons instead of "no data" empty states while the
   // window is (re)loading and nothing is on screen yet. Settings and
@@ -4615,13 +4530,13 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                     </div>
                   </div>
                   <div className="text-3xl font-bold text-white mb-2">
-                    {getCitationRate().rate}%
+                    {citationRateStats.rate}%
                   </div>
                   <div className="text-sm text-white/90 font-medium">
                     Citation Rate
                   </div>
                   <div className="text-xs text-white/70 mt-1">
-                    {getCitationRate().cited} of {getCitationRate().total} responses cite your domain
+                    {citationRateStats.cited} of {citationRateStats.total} responses cite your domain
                   </div>
                 </div>
 
@@ -4635,13 +4550,13 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                     </div>
                   </div>
                   <div className="text-3xl font-bold text-white mb-2">
-                    {getMentionRate().rate}%
+                    {mentionRateStats.rate}%
                   </div>
                   <div className="text-sm text-white/90 font-medium">
                     Mention Rate
                   </div>
                   <div className="text-xs text-white/70 mt-1">
-                    {getMentionRate().mentioned} of {getMentionRate().total} responses mention your brand
+                    {mentionRateStats.mentioned} of {mentionRateStats.total} responses mention your brand
                   </div>
                 </div>
 
@@ -4710,11 +4625,9 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                 </div>
 
                 {(() => {
-                  // Calculate metrics by LLM
-                  const metricsByLlm: Record<string, { citationRate: number; mentionRate: number; totalResponses: number }> = {};
-
-                  // Get unique LLMs from filtered responses
-                  const uniqueLlms = [...new Set(filteredLlmResponses.map(r => r.llm))].sort();
+                  // Metrics come precomputed from the heatmapMetrics memo
+                  // (indexed single pass over the window).
+                  const { uniqueLlms, metricsByLlm } = heatmapMetrics;
 
                   if (uniqueLlms.length === 0) {
                     return (
@@ -4727,115 +4640,6 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                       </div>
                     );
                   }
-
-                  const projectDomain = project?.domain?.toLowerCase().replace(/^www\./, '');
-                  const domainMode = project?.domain_mode || 'exact';
-                  const ownBrands = brands.filter(b => !b.is_competitor).map(b => b.brand_name);
-
-                  uniqueLlms.forEach(llm => {
-                    const llmResponses = filteredLlmResponses.filter(r => r.llm === llm);
-                    const totalResponses = llmResponses.length;
-
-                    // Calculate Citation Rate for this LLM
-                    const responsesWithCitation = llmResponses.filter(response => {
-                      // Check citations table (excluding cited=false) - use filteredCitations to respect filters
-                      const responseCitations = filteredCitations.filter(c =>
-                        c.prompt_id === response.prompt_id &&
-                        c.audit_id === response.audit_id &&
-                        c.llm === llm &&
-                        c.cited !== false
-                      );
-
-                      const hasCitationInTable = responseCitations.some(c => {
-                        if (!c.domain) return false;
-                        const citationDomain = c.domain.toLowerCase().replace(/^www\./, '');
-
-                        if (domainMode === 'subdomains') {
-                          return citationDomain === projectDomain || citationDomain.endsWith(`.${projectDomain}`);
-                        } else {
-                          return citationDomain === projectDomain;
-                        }
-                      });
-
-                      if (hasCitationInTable) return true;
-
-                      // Check links_attached field for SearchGPT
-                      if (llm === 'searchgpt' && response.links_attached && Array.isArray(response.links_attached)) {
-                        const hasLinkInAttached = response.links_attached.some((link: any) => {
-                          if (!link.url) return false;
-
-                          try {
-                            const urlObj = new URL(link.url);
-                            const linkDomain = urlObj.hostname.toLowerCase().replace(/^www\./, '');
-
-                            if (domainMode === 'subdomains') {
-                              return linkDomain === projectDomain || linkDomain.endsWith(`.${projectDomain}`);
-                            } else {
-                              return linkDomain === projectDomain;
-                            }
-                          } catch {
-                            return false;
-                          }
-                        });
-
-                        if (hasLinkInAttached) return true;
-                      }
-
-                      // Check all_sources field for LLMs that store sources there
-                      if (response.all_sources) {
-                        try {
-                          const sources = Array.isArray(response.all_sources) ? response.all_sources : JSON.parse(response.all_sources);
-
-                          return sources.some((source: any) => {
-                            if (!source.domain && !source.url) return false;
-
-                            let sourceDomain = '';
-                            if (source.domain) {
-                              sourceDomain = source.domain.toLowerCase().replace(/^www\./, '');
-                            } else if (source.url) {
-                              try {
-                                const urlObj = new URL(source.url);
-                                sourceDomain = urlObj.hostname.toLowerCase().replace(/^www\./, '');
-                              } catch {
-                                return false;
-                              }
-                            }
-
-                            if (domainMode === 'subdomains') {
-                              return sourceDomain === projectDomain || sourceDomain.endsWith(`.${projectDomain}`);
-                            } else {
-                              return sourceDomain === projectDomain;
-                            }
-                          });
-                        } catch (error) {
-                          console.error('Error parsing all_sources:', error);
-                          return false;
-                        }
-                      }
-
-                      return false;
-                    });
-
-                    const citedCount = responsesWithCitation.length;
-                    const citationRate = totalResponses > 0 ? Math.round((citedCount / totalResponses) * 100) : 0;
-
-                    // Calculate Mention Rate for this LLM
-                    const responsesWithMention = llmResponses.filter(response => {
-                      const answerText = response.answer_text?.toLowerCase() || '';
-                      return ownBrands.some(brandName => answerText.includes(brandName.toLowerCase()));
-                    });
-
-                    const mentionedCount = responsesWithMention.length;
-                    const mentionRate = totalResponses > 0 ? Math.round((mentionedCount / totalResponses) * 100) : 0;
-
-                    metricsByLlm[llm] = {
-                      citationRate,
-                      mentionRate,
-                      totalResponses,
-                      citedCount,
-                      mentionedCount
-                    };
-                  });
 
                   // Helper function to get color based on rate
                   const getHeatmapColor = (rate: number, isDark: boolean) => {
@@ -4987,7 +4791,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                   </div>
 
                   {(() => {
-                    const radarData = getCitationRateByPromptGroup();
+                    const radarData = promptGroupRadarData;
                     const topCompetitorDomains = getTopCompetitorDomains();
                     const projectDomainName = project?.domain || "Your Domain";
 
@@ -6539,8 +6343,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                   </thead>
                   <tbody>
                     {prompts.map((prompt) => {
-                      // Get unique LLMs
-                      const uniqueLlms = Array.from(new Set(llmResponses.map(r => r.llm))).sort();
+                      const uniqueLlms = gridIndexes.uniqueLlms;
 
                       return (
                         <tr key={prompt.id} className="border-b border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700/50">
@@ -6551,9 +6354,8 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                           </td>
                           {uniqueLlms.map(llm => {
                             // Get responses for this prompt and LLM
-                            const responsesForPromptLlm = llmResponses.filter(
-                              r => r.prompt_id === prompt.id && r.llm === llm
-                            );
+                            const responsesForPromptLlm =
+                              gridIndexes.byPromptLlmAll.get(`${prompt.id}|${llm}`) || EMPTY_ROWS;
 
                             // Check if brand is mentioned (brand_mentioned field)
                             const isMentioned = responsesForPromptLlm.some(r => r.brand_mentioned === true);
@@ -6661,7 +6463,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                         <th className="text-left py-3 px-2 text-gray-900 dark:text-gray-100">Prompt</th>
                         <th className="text-left py-3 px-2 text-gray-900 dark:text-gray-100">Group</th>
                         <th className="text-center py-3 px-2 text-gray-900 dark:text-gray-100">Mentioned</th>
-                        {getFilteredAuditDates().map(date => (
+                        {filteredAuditDates.map(date => (
                           <th key={date} className="text-center py-3 px-2 text-gray-900 dark:text-gray-100 min-w-[120px]">
                             <div className="text-xs">{new Date(date).toLocaleDateString()}</div>
                             <div className="flex justify-center space-x-1 mt-1">
@@ -6689,8 +6491,8 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                                   {prompt.prompt_text}
                                 </button>
                                 {(() => {
-                                  const webSearchQueries = filteredLlmResponses
-                                    .filter(response => response.prompt_id === prompt.id && response.web_search_query)
+                                  const webSearchQueries = (gridIndexes.byPromptFiltered.get(prompt.id) || EMPTY_ROWS)
+                                    .filter((response: any) => response.web_search_query)
                                     .flatMap(response => {
                                       let queries = response.web_search_query;
 
@@ -6785,7 +6587,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                                 })()}
                               </div>
                             </td>
-                            {getFilteredAuditDates().map(date => {
+                            {filteredAuditDates.map(date => {
                               const auditCitations = getFilteredPromptCitationsByAudit(prompt.id, date);
                               return (
                                 <td key={date} className="py-3 px-2 text-center">
@@ -6946,13 +6748,14 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                     </tr>
                   </thead>
                   <tbody>
-                    {getFilteredPageStats().map((page, index) => (
+                    {pageStatsRows.slice(0, pagesRowLimit).map((page, index) => (
                       <tr key={index} className="border-b border-gray-100 dark:border-gray-800">
                         <td className="py-3 px-2 max-w-md">
                           <div className="flex items-start">
                             <img
                               src={`https://www.google.com/s2/favicons?domain=${extractDomain(page.page_url)}&sz=32`}
                               alt={`${extractDomain(page.page_url)} favicon`}
+                              loading="lazy"
                               className="w-4 h-4 mr-2 mt-0.5 flex-shrink-0"
                               onError={(e) => {
                                 const target = e.target as HTMLImageElement;
@@ -7036,6 +6839,18 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                         <td className="py-3 px-2 text-center text-gray-900 dark:text-gray-100">{page.all_sources_count || 0}</td>
                       </tr>
                     ))}
+                  {pageStatsRows.length > pagesRowLimit && (
+                    <tr>
+                      <td colSpan={99} className="py-3 text-center">
+                        <button
+                          onClick={() => setPagesRowLimit(l => l + 200)}
+                          className="px-4 py-1.5 rounded-lg text-sm font-medium text-brand-primary border border-gray-300 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors"
+                        >
+                          Show more ({pagesRowLimit} of {pageStatsRows.length})
+                        </button>
+                      </td>
+                    </tr>
+                  )}
                   </tbody>
                 </table>
               </div>
@@ -7276,13 +7091,14 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                     </tr>
                   </thead>
                   <tbody>
-                    {getFilteredDomainStats().map((domain: any, index) => (
+                    {domainStatsRows.slice(0, domainsRowLimit).map((domain: any, index) => (
                       <tr key={index} className="border-b border-gray-100 dark:border-gray-800">
                         <td className="py-3 px-2 font-medium text-gray-900 dark:text-gray-100">
                           <div className="flex items-center">
                             <img
                               src={`https://www.google.com/s2/favicons?domain=${domain.domain}&sz=32`}
                               alt={`${domain.domain} favicon`}
+                              loading="lazy"
                               className="w-4 h-4 mr-2"
                               onError={(e) => {
                                 const target = e.target as HTMLImageElement;
@@ -7341,6 +7157,18 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                         </td>
                       </tr>
                     ))}
+                  {domainStatsRows.length > domainsRowLimit && (
+                    <tr>
+                      <td colSpan={99} className="py-3 text-center">
+                        <button
+                          onClick={() => setDomainsRowLimit(l => l + 200)}
+                          className="px-4 py-1.5 rounded-lg text-sm font-medium text-brand-primary border border-gray-300 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors"
+                        >
+                          Show more ({domainsRowLimit} of {domainStatsRows.length})
+                        </button>
+                      </td>
+                    </tr>
+                  )}
                   </tbody>
                 </table>
               </div>

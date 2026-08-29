@@ -32,7 +32,7 @@ interface BrandMatcher {
   patterns: RegExp[];
 }
 
-function buildMatchers(projectBrands: PageBrandRow[]): BrandMatcher[] {
+export function buildMatchers(projectBrands: PageBrandRow[]): BrandMatcher[] {
   const matchers: BrandMatcher[] = [];
   for (const row of projectBrands) {
     const names = [row.brand_name, ...(row.aliases || [])]
