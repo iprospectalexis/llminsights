@@ -1651,15 +1651,75 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     setDomainsRowLimit(50);
   }, [windowKey, activeTab]);
 
+  // Pages route: lazily restore searchgpt answer texts (dropped from the
+  // bulk v2 transport) so buildPageBrandIndex keeps its exact chunk-level
+  // (level-1) brand attribution. Fetched once per window, only while the
+  // Pages dashboard is open; positions are sequential 1..n in the data
+  // (verified on 18k rows), so the parser's index fallback is exact.
+  const [pagesSgTexts, setPagesSgTexts] = useState<Map<string, string> | null>(null);
+  useEffect(() => { setPagesSgTexts(null); }, [windowKey, id]);
+  useEffect(() => {
+    if (activeTab !== 'pages' || pagesSgTexts !== null) return;
+    const auditIds = auditsData.map((a: any) => a.id);
+    if (auditIds.length === 0 || llmResponses.length === 0) return;
+    // REST-fallback rows already carry texts — nothing to fetch.
+    if (llmResponses.some((r: any) => r.llm === 'searchgpt' && r.answer_text)) {
+      setPagesSgTexts(new Map());
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const out = new Map<string, string>();
+        const chunks: string[][] = [];
+        for (let i = 0; i < auditIds.length; i += 60) chunks.push(auditIds.slice(i, i + 60));
+        let next = 0;
+        const worker = async () => {
+          while (next < chunks.length && !cancelled) {
+            const chunk = chunks[next++];
+            for (let from = 0; ; from += 1000) {
+              const { data: page, error } = await supabase
+                .from('llm_responses')
+                .select('id, answer_text')
+                .in('audit_id', chunk)
+                .eq('llm', 'searchgpt')
+                .not('answer_text', 'is', null)
+                .order('id', { ascending: true })
+                .range(from, from + 999);
+              if (error) throw error;
+              (page || []).forEach((r: any) => { if (r.answer_text) out.set(r.id, r.answer_text); });
+              if (!page || page.length < 1000) break;
+            }
+          }
+        };
+        await Promise.all(Array.from({ length: Math.min(3, chunks.length) }, () => worker()));
+        if (!cancelled) setPagesSgTexts(out);
+      } catch (e) {
+        console.error('Pages: searchgpt texts fetch failed', e);
+        if (!cancelled) setPagesSgTexts(new Map());
+      }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, pagesSgTexts, auditsData, llmResponses]);
+
+  const pageBrandResponsesWithText = useMemo(() => {
+    if (!pagesSgTexts || pagesSgTexts.size === 0) return pageBrandResponses;
+    return pageBrandResponses.map((r: any) =>
+      r.answer_text == null && pagesSgTexts.has(r.id)
+        ? { ...r, answer_text: pagesSgTexts.get(r.id) }
+        : r);
+  }, [pageBrandResponses, pagesSgTexts]);
+
   const pageBrandIndex = useMemo(
     () => buildPageBrandIndex({
-      responses: pageBrandResponses,
+      responses: pageBrandResponsesWithText,
       citations: pageBrandCitations,
       projectBrands: [...brands, ...competitors],
       normalizeUrl,
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [pageBrandResponses, pageBrandCitations, brands, competitors]
+    [pageBrandResponsesWithText, pageBrandCitations, brands, competitors]
   );
 
   // Trend vs the previous audit (Domains / Pages tabs). Compares the last
