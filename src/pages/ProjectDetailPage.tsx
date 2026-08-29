@@ -3416,14 +3416,6 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     });
   };
 
-  // Sorted page rows for the Pages performance table — computed once per
-  // data/sort change (was recomputed inside JSX on every render) and only
-  // while the Pages tab is open.
-  const pageStatsRows = useMemo(
-    () => (activeTab === 'pages' ? getFilteredPageStats() : EMPTY_ROWS),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [activeTab, filteredCitations, filteredLlmResponses, pageSortConfig, domainCategoryMap, pageBrandIndex, project?.domain],
-  );
 
   // Project-relative overlay on top of the global category: the project's own
   // domain (and domains matching own-brand names) show as "Own Brand", domains
@@ -3881,6 +3873,15 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
       return 0;
     });
   };
+
+  // Sorted page rows for the Pages performance table — computed once per
+  // data/sort change (was recomputed inside JSX on every render) and only
+  // while the Pages tab is open.
+  const pageStatsRows = useMemo(
+    () => (activeTab === 'pages' ? getFilteredPageStats() : EMPTY_ROWS),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [activeTab, filteredCitations, filteredLlmResponses, pageSortConfig, domainCategoryMap, pageBrandIndex, project?.domain],
+  );
 
   // Same treatment for the Domains performance table.
   const domainStatsRows = useMemo(
