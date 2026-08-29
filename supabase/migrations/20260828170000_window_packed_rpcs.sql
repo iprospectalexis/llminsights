@@ -113,15 +113,20 @@ BEGIN
 END;
 $$;
 
--- Responses tuple:
---   [id, aud_i, prm_i, llm_i, answer_text, created_epoch,
+-- Responses tuple (v2 — answer_text never ships in bulk):
+--   [id, aud_i, prm_i, llm_i, answered(0/1), created_epoch,
 --    sentiment_score, sentiment_label, shopping(0/1/null),
 --    is_map(0/1/null), ad_name, web_search_query,
 --    cit_p (null | [[url_i, cited, ttl_i], ...]),
 --    links_p (null | [url_i, ...]),
 --    srcs_p (null | [[url_i, sdom_i], ...]),
 --    comp_kind (0 null / 1 brands / 2 other-truthy),
---    comp_p (null | [brand_i, ...])]
+--    comp_p (null | [brand_i, ...]),
+--    ment_p (null | [pbrand_i, ...] — project brands matched in the
+--            answer via brand_boundary_pattern: word-boundary,
+--            unaccented, alias-aware — same rules as project metrics)]
+-- Payload also carries 'v': 2 and the 'pbrands' dictionary (project
+-- brand names in index order).
 CREATE OR REPLACE FUNCTION public.project_responses_window_packed(
   p_project uuid,
   p_from timestamptz,
@@ -153,7 +158,8 @@ BEGIN
   -- straight from the table (one detoast pass, no temp-file rewrite
   -- of 30+MB of jsonb).
   WITH rows AS MATERIALIZED (
-    SELECT r.id, r.audit_id, r.prompt_id, r.llm, r.answer_text,
+    SELECT r.id, r.audit_id, r.prompt_id, r.llm,
+           (r.answer_text IS NOT NULL AND r.answer_text != '') AS answered,
            r.web_search_query, r.sentiment_score, r.sentiment_label,
            r.shopping_visible, r.is_map,
            r.ads->>'name' AS ad_name, r.created_at,
@@ -169,6 +175,32 @@ BEGIN
     WHERE a.project_id = p_project
       AND a.created_at >= p_from AND a.created_at <= p_to
       AND (p_audit_ids IS NULL OR a.id = ANY(p_audit_ids))
+  ),
+  -- Project brand dictionary + per-response mention flags. Matching
+  -- reuses brand_boundary_pattern (word-boundary, unaccent, aliases,
+  -- names >= 3 chars) so the dashboards agree with project metrics.
+  pb AS MATERIALIZED (
+    SELECT b.brand_name AS v,
+           row_number() OVER (ORDER BY b.brand_name) - 1 AS i,
+           public.brand_boundary_pattern(
+             array_prepend(b.brand_name, coalesce(b.aliases, '{}'))) AS pat
+    FROM brands b
+    WHERE b.project_id = p_project AND b.brand_name IS NOT NULL
+  ),
+  rtxt AS MATERIALIZED (
+    SELECT r.id, extensions.unaccent(lower(r.answer_text)) AS t
+    FROM llm_responses r
+    JOIN audits a ON a.id = r.audit_id
+    WHERE a.project_id = p_project
+      AND a.created_at >= p_from AND a.created_at <= p_to
+      AND (p_audit_ids IS NULL OR a.id = ANY(p_audit_ids))
+      AND r.answer_text IS NOT NULL AND r.answer_text != ''
+  ),
+  ment AS MATERIALIZED (
+    SELECT rt.id, jsonb_agg(pb.i ORDER BY pb.i) AS v
+    FROM rtxt rt
+    JOIN pb ON pb.pat IS NOT NULL AND rt.t ~ pb.pat
+    GROUP BY rt.id
   ),
   -- citations_slim inlined at entry level: title = title|name (120),
   -- else description (160) — exactly what the consumers display.
@@ -285,7 +317,9 @@ BEGIN
     GROUP BY be.id
   )
   SELECT jsonb_build_object(
+    'v',        2,
     'n',        (SELECT count(*) FROM rows),
+    'pbrands',  coalesce((SELECT jsonb_agg(v ORDER BY i) FROM pb), '[]'::jsonb),
     'urls',     coalesce((SELECT jsonb_agg(v ORDER BY i) FROM d_url), '[]'::jsonb),
     'titles',   coalesce((SELECT jsonb_agg(v ORDER BY i) FROM d_ttl), '[]'::jsonb),
     'sdomains', coalesce((SELECT jsonb_agg(v ORDER BY i) FROM d_sdom), '[]'::jsonb),
@@ -295,7 +329,8 @@ BEGIN
     'prompts',  coalesce((SELECT jsonb_agg(v ORDER BY i) FROM d_prm), '[]'::jsonb),
     'rows',     coalesce((
       SELECT jsonb_agg(jsonb_build_array(
-               r.id, da.i, dp.i, dl.i, r.answer_text,
+               r.id, da.i, dp.i, dl.i,
+               CASE WHEN r.answered THEN 1 ELSE 0 END,
                floor(extract(epoch FROM r.created_at))::bigint,
                r.sentiment_score, r.sentiment_label,
                CASE WHEN r.shopping_visible IS NULL THEN NULL
@@ -311,7 +346,8 @@ BEGIN
                     ELSE coalesce(sp.v, '[]'::jsonb) END,
                r.comp_kind,
                CASE WHEN r.comp_kind = 1
-                    THEN coalesce(kp.v, '[]'::jsonb) END
+                    THEN coalesce(kp.v, '[]'::jsonb) END,
+               CASE WHEN r.answered THEN coalesce(mp.v, '[]'::jsonb) END
              ) ORDER BY r.id)
       FROM rows r
       LEFT JOIN d_llm dl ON dl.v = r.llm
@@ -321,6 +357,7 @@ BEGIN
       LEFT JOIN link_pack lp ON lp.id = r.id
       LEFT JOIN src_pack sp ON sp.id = r.id
       LEFT JOIN comp_pack kp ON kp.id = r.id
+      LEFT JOIN ment mp ON mp.id = r.id
     ), '[]'::jsonb)
   ) INTO result;
 

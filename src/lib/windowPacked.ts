@@ -15,6 +15,7 @@
  * on live projects (6k responses / 40k citations, zero diffs).
  */
 import { supabase } from './supabase';
+import { normalizeBrandKey } from './brandDomains';
 
 const iso = (epoch: number | null): string | null =>
   epoch === null || epoch === undefined ? null : new Date(epoch * 1000).toISOString();
@@ -45,10 +46,19 @@ export function unpackCitations(p: any, idPrefix = ''): any[] {
 
 export function unpackResponses(p: any): any[] {
   const { urls, titles, sdomains, brands, llms, audits, prompts, rows } = p;
+  // v2 payloads replace the bulk answer_text with an answered flag and
+  // per-response project-brand mention indexes (SQL word-boundary
+  // matching — same rules as project metrics). pbrands maps index ->
+  // brand name; rows expose mentionedKeys as canonical brand keys.
+  const isV2 = p.v === 2;
+  const pbrandKeys: string[] = isV2
+    ? (p.pbrands || []).map((n: string) => normalizeBrandKey(n || ''))
+    : [];
   const out: any[] = new Array(rows.length);
   for (let i = 0; i < rows.length; i++) {
-    const [rid, a, pr, l, text, cr, ss, sl, shop, ismap, ad, wsq,
-           citp, lnp, srp, ck, cp] = rows[i];
+    const [rid, a, pr, l, textOrAnswered, cr, ss, sl, shop, ismap, ad, wsq,
+           citp, lnp, srp, ck, cp, mentp] = rows[i];
+    const text = isV2 ? null : textOrAnswered;
     let citations: any = null;
     if (citp !== null) {
       citations = citp.map(([u, c, x]: any[]) => ({
@@ -63,6 +73,10 @@ export function unpackResponses(p: any): any[] {
       prompt_id: pr === null ? null : prompts[pr],
       llm: l === null ? null : llms[l],
       answer_text: text,
+      answered: isV2 ? textOrAnswered === 1 : undefined,
+      mentionedKeys: isV2
+        ? new Set((mentp || []).map((bi: number) => pbrandKeys[bi]).filter(Boolean))
+        : undefined,
       created_at: iso(cr),
       sentiment_score: ss,
       sentiment_label: sl,
@@ -92,6 +106,13 @@ export function unpackResponses(p: any): any[] {
  * (parallel) when the server hits its statement timeout on a very
  * dense slice. Returns the packed payloads of every part.
  */
+// Never ask the server for more than this many audits per call: dense
+// projects made full-window calls flirt with the 8s statement_timeout
+// (pg_stat_statements: max 7.65s), and every cancel triggered the
+// split-retry cascade. Fixed-size chunks are predictably 0.3-2.5s.
+const MAX_AUDITS_PER_CALL = 10;
+const PACKED_CONCURRENCY = 4;
+
 export async function fetchPackedWindow(
   fn: 'project_responses_window_packed' | 'project_citations_window_packed',
   projectId: string,
@@ -124,5 +145,23 @@ export async function fetchPackedWindow(
     }
     return [data];
   };
-  return call(auditIds);
+
+  const chunks: string[][] = [];
+  for (let i = 0; i < auditIds.length; i += MAX_AUDITS_PER_CALL) {
+    chunks.push(auditIds.slice(i, i + MAX_AUDITS_PER_CALL));
+  }
+  if (chunks.length <= 1) return call(auditIds);
+
+  const results: any[][] = new Array(chunks.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < chunks.length) {
+      const idx = next++;
+      results[idx] = await call(chunks[idx]);
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(PACKED_CONCURRENCY, chunks.length) }, () => worker()),
+  );
+  return results.flat();
 }

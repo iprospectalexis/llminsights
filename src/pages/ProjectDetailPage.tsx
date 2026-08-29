@@ -63,6 +63,7 @@ import { DashboardFilterBar } from '../components/filters/DashboardFilterBar';
 import { fetchPackedWindow, unpackCitations, unpackResponses } from '../lib/windowPacked';
 import { TabContentSkeleton } from '../components/ui/TabContentSkeleton';
 import { TabErrorBoundary } from '../components/ui/TabErrorBoundary';
+import { perfEnd, perfReport, perfStart } from '../lib/perfMarks';
 
 // Explicit filter type. Catches keyboard slips like `promptGroup` vs
 // `promptGroups` — the latter is the real state key (a string[] of
@@ -186,6 +187,24 @@ const extractDomainFromUrl = (url: string): string => {
 const DOMAIN_CATEGORY_FETCHED = new Map<string, string>();
 
 const EMPTY_ROWS: any[] = [];
+
+// v2 packed windows ship `answered` + `mentionedKeys` instead of the
+// bulk answer_text (15MB on dense projects). These helpers read the
+// flags and fall back to the raw text for legacy/REST rows.
+const isAnswered = (r: any): boolean =>
+  r?.answered !== undefined ? !!r.answered : !!(r?.answer_text && r.answer_text !== '');
+
+const rowMentionsAnyName = (r: any, names: Array<string | null | undefined>): boolean => {
+  if (r?.mentionedKeys) {
+    for (const n of names) {
+      if (n && r.mentionedKeys.has(normalizeBrandKey(n))) return true;
+    }
+    return false;
+  }
+  const t = r?.answer_text ? String(r.answer_text).toLowerCase() : '';
+  if (!t) return false;
+  return names.some(n => n && t.includes(String(n).toLowerCase()));
+};
 
 const URL_NORM_CACHE = new Map<string, string>();
 const normalizeUrl = (url: string): string => {
@@ -1010,7 +1029,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
       if (d) datesWithData.add(d);
     });
     llmResponses.forEach(response => {
-      if (response.answer_text && response.audits?.created_at) {
+      if (isAnswered(response) && response.audits?.created_at) {
         datesWithData.add(response.audits.created_at.split('T')[0]);
       }
     });
@@ -1661,7 +1680,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
 
     const answeredByAudit = new Map<string, number>();
     trendResponses.forEach(r => {
-      if (!r.audit_id || !r.answer_text) return;
+      if (!r.audit_id || !isAnswered(r)) return;
       answeredByAudit.set(r.audit_id, (answeredByAudit.get(r.audit_id) || 0) + 1);
     });
 
@@ -1839,6 +1858,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     // Wide windows on dense projects legitimately take a while — the
     // old 15s guard aborted mid-pagination.
     const timeoutId = setTimeout(() => abortController.abort(), 60_000);
+    perfStart('total');
     try {
       // Fetch project details (with cache for navigation back/forth)
       const cacheKey = `project:${id}:detail`;
@@ -1919,6 +1939,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
         }
       }
 
+      perfStart('audits-meta');
       // Unified template: load EVERY audit inside the selected period,
       // not a fixed "last N". Audit meta for the whole project is cheap
       // (light columns) and also feeds the custom-range picker with all
@@ -1938,6 +1959,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
         return;
       }
 
+      perfEnd('audits-meta');
       setAllAuditsMeta(allAudits || []);
 
       // Keep only the audits inside the active period.
@@ -2071,6 +2093,25 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
           });
           return rows;
         };
+        // REST-fallback (or legacy v1 packed) response rows carry raw
+        // answer_text but no flags — compute them once here so every
+        // consumer downstream reads answered/mentionedKeys uniformly.
+        const allBrandRows: any[] = (projectData?.brands as any[]) || [...brands, ...competitors];
+        const brandMatchers = buildMatchers(allBrandRows);
+        const enrichResponses = (rows: any[]) => {
+          rows.forEach((row: any) => {
+            if (row.answered === undefined) {
+              row.answered = !!(row.answer_text && row.answer_text !== '');
+            }
+            if (!row.mentionedKeys) {
+              row.mentionedKeys = row.answered && row.answer_text
+                ? new Set(findBrandsInText(row.answer_text, allBrandRows, brandMatchers)
+                    .map((b: any) => normalizeBrandKey(b.brand_name || '')))
+                : new Set();
+            }
+          });
+          return rows;
+        };
 
         let anyTruncated = false;
         let respRows: any[] | null = null;
@@ -2081,6 +2122,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
         // REST row shapes; equivalence verified field-by-field on prod).
         // A statement-timeout on a very dense slice makes
         // fetchPackedWindow split the audit set in half and recurse.
+        perfStart('window-fetch');
         try {
           const fromIso = (win ? win.start : new Date(0)).toISOString();
           const toIso = (win ? win.end : new Date()).toISOString();
@@ -2090,8 +2132,11 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
             fetchPackedWindow('project_citations_window_packed', id, fromIso, toIso,
               recentAuditIds, abortController.signal),
           ]);
+          perfEnd('window-fetch');
+          perfStart('unpack');
           respRows = respParts.flatMap(part => unpackResponses(part));
           citRows = citParts.flatMap((part, pi) => unpackCitations(part, `${pi}-`));
+          perfEnd('unpack');
         } catch (packedErr) {
           console.warn('Packed window fetch failed — falling back to paged REST:', packedErr);
           respRows = null;
@@ -2160,7 +2205,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
         // Common post-processing for both paths: decorate, restore the
         // pre-pagination contract (newest first), publish.
         if (respRows) {
-          respRows = decorate(respRows).sort((a, b) =>
+          respRows = enrichResponses(decorate(respRows)).sort((a, b) =>
             String(b.created_at || '').localeCompare(String(a.created_at || '')));
           setLlmResponses(respRows);
         } else {
@@ -2207,6 +2252,8 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
       }
     } finally {
       clearTimeout(timeoutId);
+      perfEnd('total');
+      perfReport(`project window loaded (${id})`);
       setLoading(false);
       setWindowLoading(false);
     }
@@ -2886,12 +2933,8 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
         );
 
         // Check if project brand is mentioned
-        const isProjectBrandMentioned = llmResponsesForPrompt.some(response => {
-          const answerText = response.answer_text?.toLowerCase() || '';
-          return projectBrands.some(brandName =>
-            answerText.includes(brandName.toLowerCase())
-          );
-        });
+        const isProjectBrandMentioned = llmResponsesForPrompt.some(response =>
+            rowMentionsAnyName(response, projectBrands));
 
         // Get citations data by LLM
         const citationsByLlm: Record<string, number> = {};
@@ -3992,7 +4035,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     // "an AI answer that ignored us". Same definition as the card metrics
     // (recalculate_project_metrics SQL function), so both surfaces agree.
     const answered = filteredLlmResponses.filter(
-      r => r.audit_id && r.prompt_id && r.answer_text && r.answer_text !== ''
+      r => r.audit_id && r.prompt_id && isAnswered(r)
     );
     const totalLlmResponses = answered.length;
 
@@ -4025,7 +4068,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     // ANSWERED responses only (see getCitationRate) — same denominator as
     // the card metrics.
     const relevantResponses = filteredLlmResponses.filter(
-      r => r.audit_id && r.prompt_id && r.answer_text && r.answer_text !== ''
+      r => r.audit_id && r.prompt_id && isAnswered(r)
     );
 
     const total = relevantResponses.length;
@@ -4037,8 +4080,11 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     // mention rate from 21% to 35%.
     const ownBrandRows = brands.filter(b => !b.is_competitor);
     const matchers = buildMatchers(ownBrandRows);
-    const mentioned = relevantResponses.filter(
-      response => findBrandsInText(response.answer_text, ownBrandRows, matchers).length > 0
+    const ownKeys = ownBrandRows.map(b => normalizeBrandKey(b.brand_name || '')).filter(Boolean);
+    const mentioned = relevantResponses.filter(response =>
+      response.mentionedKeys
+        ? ownKeys.some(k => response.mentionedKeys.has(k))
+        : findBrandsInText(response.answer_text, ownBrandRows, matchers).length > 0
     ).length;
 
     const rate = Math.round((mentioned / total) * 100);
@@ -4123,7 +4169,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
   // under the active filters. One pass over responses.
   const MATRIX_LLM_ORDER = ['searchgpt', 'google-ai-mode', 'google-ai-overview', 'gemini', 'grok', 'bing-copilot', 'perplexity'];
   const mentionsMatrix = useMemo(() => {
-    const answered = matrixResponses.filter(r => r.answer_text && r.answer_text !== '');
+    const answered = matrixResponses.filter(r => isAnswered(r));
     const llms = MATRIX_LLM_ORDER.filter(l => answered.some(r => r.llm === l));
     const denom: Record<string, number> = {};
     llms.forEach(l => { denom[l] = answered.filter(r => r.llm === l).length; });
@@ -4290,8 +4336,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
       }
       if (cited) m.citedCount++;
 
-      const answerText = response.answer_text ? String(response.answer_text).toLowerCase() : '';
-      if (answerText && ownBrands.some(b => answerText.includes(b))) m.mentionedCount++;
+      if (rowMentionsAnyName(response, ownBrands)) m.mentionedCount++;
     });
 
     uniqueLlms.forEach(llm => {
@@ -6137,7 +6182,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                     {
                       key: 'Text answer',
                       icon: <FileText className="w-4 h-4 text-gray-500 flex-shrink-0" />,
-                      count: filteredLlmResponses.filter(r => r.answer_text && r.answer_text !== '').length,
+                      count: filteredLlmResponses.filter(r => isAnswered(r)).length,
                       bar: 'bg-gradient-to-r from-brand-primary to-brand-secondary',
                     },
                     {
@@ -6576,12 +6621,8 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                                     response.prompt_id === prompt.id
                                   );
 
-                                  const isProjectBrandMentioned = llmResponsesForPrompt.some(response => {
-                                    const answerText = response.answer_text?.toLowerCase() || '';
-                                    return projectBrands.some(brandName =>
-                                      answerText.includes(brandName.toLowerCase())
-                                    );
-                                  });
+                                  const isProjectBrandMentioned = llmResponsesForPrompt.some(response =>
+            rowMentionsAnyName(response, projectBrands));
 
                                   return isProjectBrandMentioned ? (
                                     <BadgeCheck className="w-5 h-5 text-green-500" />
@@ -7989,10 +8030,9 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
 
                             llmResponsesForPrompt.forEach(response => {
                               const llm = response.llm;
-                              const answerText = response.answer_text?.toLowerCase() || '';
 
                               allBrands.forEach(brand => {
-                                if (answerText.includes(brand.brand_name.toLowerCase())) {
+                                if (rowMentionsAnyName(response, [brand.brand_name])) {
                                   if (!brandMentionsByLlm[llm]) {
                                     brandMentionsByLlm[llm] = [];
                                   }
@@ -8012,9 +8052,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                             let isProjectBrandMentioned = false;
 
                             llmResponsesForPrompt.forEach(response => {
-                              const hasBrandMention = projectBrands.some(brandName =>
-                                response.answer_text?.toLowerCase().includes(brandName.toLowerCase())
-                              );
+                              const hasBrandMention = rowMentionsAnyName(response, projectBrands);
 
                               if (hasBrandMention) {
                                 isProjectBrandMentioned = true;
