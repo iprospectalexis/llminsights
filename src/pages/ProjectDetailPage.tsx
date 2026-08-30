@@ -4312,19 +4312,6 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
 
 
 
-  const tabs = [
-    { id: 'overview', label: 'Overview', icon: List },
-    { id: 'visibility', label: 'Visibility Overview', icon: BarChart3 },
-    { id: 'prompts', label: 'Prompts', icon: MessageCircle },
-    { id: 'pages', label: 'Pages', icon: FileText },
-    { id: 'domains', label: 'Domains', icon: Globe },
-    { id: 'ads', label: 'Ads', icon: Megaphone },
-    { id: 'citation-funnel', label: 'Citation Funnel', icon: Workflow },
-    { id: 'mentions', label: 'Mentions', icon: BadgeCheck },
-    { id: 'insights', label: 'Insights', icon: Lightbulb },
-    { id: 'sentiment', label: 'Sentiment', icon: Smile },
-    { id: 'settings', label: 'Settings', icon: Settings },
-  ];
 
   // Per-prompt-group citation radar: memoized — this walked the whole
   // window (~10^7 include-steps) on every Overview render.
@@ -4572,33 +4559,9 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
         </div>
       )}
 
-      {/* Tabs */}
+      {/* Dashboard navigation lives in the sidebar (one route per
+          dashboard); the in-page tab bar duplicated it and is gone. */}
       <Card>
-        {!hideTabNavigation && (
-          <CardHeader className="pb-0">
-            <div className="border-b border-gray-200 dark:border-gray-700">
-              <nav className="flex space-x-4 sm:space-x-8 overflow-x-auto">
-                {tabs.map(tab => (
-                  <button
-                    key={tab.id}
-                    onClick={() => setActiveTab(tab.id)}
-                    className={`
-                      flex items-center py-2 px-1 border-b-2 font-medium text-sm transition-colors
-                      ${activeTab === tab.id
-                        ? 'border-brand-primary text-brand-primary'
-                        : 'border-transparent text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-300'
-                      }
-                    `}
-                  >
-                    <tab.icon className="w-4 h-4 mr-2" />
-                    {tab.label}
-                  </button>
-                ))}
-              </nav>
-            </div>
-          </CardHeader>
-        )}
-
         <CardContent className="p-6">
           {showTabSkeleton ? (
             <TabContentSkeleton />

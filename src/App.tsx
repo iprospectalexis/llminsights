@@ -1,5 +1,5 @@
 import React from 'react';
-import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
+import { BrowserRouter as Router, Routes, Route, Navigate, useParams, useSearchParams } from 'react-router-dom';
 import { ThemeProvider } from './contexts/ThemeContext';
 import { ProjectProvider } from './contexts/ProjectContext';
 import { DashboardFiltersProvider } from './contexts/DashboardFiltersContext';
@@ -8,6 +8,7 @@ import { SignInForm } from './components/auth/SignInForm';
 import { SignUpForm } from './components/auth/SignUpForm';
 import { ProjectsPage } from './pages/ProjectsPage';
 import { ProjectDetailPage } from './pages/ProjectDetailPage';
+import { ProjectVisibilityPage } from './pages/ProjectVisibilityPage';
 import { ProjectOverviewPage } from './pages/ProjectOverviewPage';
 import { ProjectPromptsPage } from './pages/ProjectPromptsPage';
 import { ProjectCompetitorsPage } from './pages/ProjectCompetitorsPage';
@@ -37,6 +38,25 @@ import ReportDetailPage from './pages/ReportDetailPage';
 import { AIOverviewPublicPage } from './pages/AIOverviewPublicPage';
 import './i18n';
 
+// The in-page tab bar is gone — every dashboard is its own route from
+// the sidebar. The bare project URL (and legacy ?tab= links/bookmarks)
+// land on the matching dashboard route, keeping the filter params.
+const PROJECT_DASHBOARD_SLUGS = new Set([
+  'overview', 'visibility', 'prompts', 'pages', 'domains', 'ads',
+  'citation-funnel', 'mentions', 'insights', 'sentiment', 'settings',
+]);
+
+const ProjectIndexRedirect = () => {
+  const { id } = useParams();
+  const [searchParams] = useSearchParams();
+  const params = new URLSearchParams(searchParams);
+  const tab = params.get('tab') || 'overview';
+  params.delete('tab');
+  const slug = PROJECT_DASHBOARD_SLUGS.has(tab) ? tab : 'overview';
+  const qs = params.toString();
+  return <Navigate to={`/projects/${id}/${slug}${qs ? `?${qs}` : ''}`} replace />;
+};
+
 function App() {
   return (
     <ThemeProvider>
@@ -59,8 +79,9 @@ function App() {
             <Route path="prompt-finder" element={<PromptFinderPage />} />
             <Route path="ai-overview" element={<AIOverviewPreviewPage />} />
             <Route path="projects" element={<ProjectsPage />} />
-            <Route path="projects/:id" element={<ProjectDetailPage />} />
+            <Route path="projects/:id" element={<ProjectIndexRedirect />} />
             <Route path="projects/:id/overview" element={<ProjectOverviewPage />} />
+            <Route path="projects/:id/visibility" element={<ProjectVisibilityPage />} />
             <Route path="projects/:id/prompts" element={<ProjectPromptsPage />} />
             <Route path="projects/:id/competitors" element={<ProjectCompetitorsPage />} />
             <Route path="projects/:id/pages" element={<ProjectPagesPage />} />
