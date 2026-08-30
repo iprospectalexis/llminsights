@@ -9,15 +9,7 @@ import { useDashboardFilters } from '../contexts/DashboardFiltersContext';
 import { DashboardFilterBar } from '../components/filters/DashboardFilterBar';
 import * as XLSX from 'xlsx';
 
-const LLM_ICONS = {
-  searchgpt: 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/SearchGPT.PNG',
-  perplexity: 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/Perplexity.png',
-  gemini: 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/Gemini.png',
-  'google-ai-overview': 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/Google.png',
-  'google-ai-mode': 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/Google.png',
-  'bing-copilot': 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/bing_copilot.png',
-  'grok': 'https://raw.githubusercontent.com/Fruall/ip_llminsights/refs/heads/main/Grok-icon.png',
-};
+import { LLM_ICONS } from '../lib/llm-display';
 
 interface VisibilityData {
   prompt_id: string;
@@ -61,7 +53,12 @@ interface AllAuditsData {
 export const ProjectPromptsPage: React.FC = () => {
   const { id } = useParams();
   const navigate = useNavigate();
-  const [activeTab, setActiveTab] = useState<'evolution' | 'visibility' | 'all-audits' | 'google-ai'>('visibility');
+  const [activeTab, setActiveTab] = useState<'evolution' | 'visibility' | 'all-audits' | 'google-ai' | 'fan-out'>('visibility');
+  // Fan-out tab: prompt -> unique web-search queries the LLMs ran for it.
+  const [fanOutData, setFanOutData] = useState<Array<{
+    prompt_id: string; prompt_text: string; prompt_group: string;
+    queries: Array<{ q: string; llms: string[] }>;
+  }>>([]);
   const [loading, setLoading] = useState(true);
   const [project, setProject] = useState<any>(null);
   const [visibilityData, setVisibilityData] = useState<VisibilityData[]>([]);
@@ -138,9 +135,116 @@ export const ProjectPromptsPage: React.FC = () => {
       loadGoogleAIData();
     } else if (id && activeTab === 'all-audits') {
       loadAllAuditsData();
+    } else if (id && activeTab === 'fan-out') {
+      loadFanOutData();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id, activeTab, globalStartDate]);
+
+  // Parse web_search_query, which is stored inconsistently: a JSON-ish
+  // string '["q1","q2"]', a plain string, or a real array.
+  const parseFanOutQueries = (raw: any): string[] => {
+    const out = new Set<string>();
+    const push = (v: any) => {
+      const t = String(v ?? '').trim().replace(/^\[?['\"]?|['\"]?\]?$/g, '').trim();
+      if (t) out.add(t);
+    };
+    if (Array.isArray(raw)) raw.forEach(push);
+    else if (typeof raw === 'string' && raw.trim()) {
+      const t = raw.trim();
+      if (t.startsWith('[')) {
+        try { JSON.parse(t).forEach(push); } catch { push(t); }
+      } else push(t);
+    }
+    return Array.from(out);
+  };
+
+  const loadFanOutData = async () => {
+    if (!id) return;
+    setLoading(true);
+    try {
+      const [{ data: promptRows }, auditsQ] = await Promise.all([
+        supabase.from('prompts').select('id, prompt_text, prompt_group').eq('project_id', id),
+        (() => {
+          let q = supabase.from('audits').select('id')
+            .eq('project_id', id).eq('status', 'completed')
+            .order('created_at', { ascending: false });
+          if (globalStartDate) q = q.gte('created_at', globalStartDate);
+          return q;
+        })(),
+      ]);
+      const auditIds = (auditsQ.data || []).map((a: any) => a.id);
+      const promptById = new Map((promptRows || []).map((pr: any) => [pr.id, pr]));
+
+      // query -> per-prompt map of query -> llm set
+      const perPrompt = new Map<string, Map<string, Set<string>>>();
+      for (let i = 0; i < auditIds.length; i += 60) {
+        const chunk = auditIds.slice(i, i + 60);
+        for (let from = 0; ; from += 1000) {
+          const { data: page, error } = await supabase
+            .from('llm_responses')
+            .select('prompt_id, llm, web_search_query')
+            .in('audit_id', chunk)
+            .not('web_search_query', 'is', null)
+            .order('id', { ascending: true })
+            .range(from, from + 999);
+          if (error) throw error;
+          (page || []).forEach((r: any) => {
+            const queries = parseFanOutQueries(r.web_search_query);
+            if (queries.length === 0 || !r.prompt_id) return;
+            let m = perPrompt.get(r.prompt_id);
+            if (!m) perPrompt.set(r.prompt_id, m = new Map());
+            queries.forEach(q2 => {
+              let set = m!.get(q2);
+              if (!set) m!.set(q2, set = new Set());
+              if (r.llm) set.add(r.llm);
+            });
+          });
+          if (!page || page.length < 1000) break;
+        }
+      }
+
+      const rows: Array<{ prompt_id: string; prompt_text: string; prompt_group: string;
+        queries: Array<{ q: string; llms: string[] }> }> = [];
+      perPrompt.forEach((qmap, promptId) => {
+        const pr = promptById.get(promptId);
+        if (!pr) return;
+        rows.push({
+          prompt_id: promptId,
+          prompt_text: pr.prompt_text,
+          prompt_group: pr.prompt_group || 'General',
+          queries: Array.from(qmap.entries())
+            .map(([q2, llms]) => ({ q: q2, llms: Array.from(llms).sort() }))
+            .sort((x, y) => x.q.localeCompare(y.q)),
+        });
+      });
+      rows.sort((x, y) => x.prompt_text.localeCompare(y.prompt_text));
+      setFanOutData(rows);
+    } catch (e) {
+      console.error('Fan-out load failed:', e);
+      setFanOutData([]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const exportFanOut = () => {
+    const flat: any[] = [];
+    fanOutData
+      .filter(r => matchesPromptGroup(r.prompt_group))
+      .forEach(r => r.queries
+        .filter(qq => qq.llms.some(isLlmVisible))
+        .forEach(qq => flat.push({
+          Prompt: r.prompt_text,
+          Group: r.prompt_group,
+          'Fan-out query': qq.q,
+          LLMs: qq.llms.filter(isLlmVisible).join(', '),
+        })));
+    const ws = XLSX.utils.json_to_sheet(flat);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Fan-out');
+    XLSX.writeFile(wb, `${project?.name || 'project'}_fanout_${new Date().toISOString().split('T')[0]}.xlsx`);
+  };
 
   const loadVisibilityData = async () => {
     try {
@@ -906,6 +1010,18 @@ export const ProjectPromptsPage: React.FC = () => {
               >
                 Evolution
               </button>
+              <button
+                onClick={() => setActiveTab('fan-out')}
+                className={`
+                  py-4 px-1 border-b-2 font-medium text-sm transition-colors
+                  ${activeTab === 'fan-out'
+                    ? 'border-[rgb(126,34,206)] text-[rgb(126,34,206)] dark:border-purple-400 dark:text-purple-400'
+                    : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300 dark:text-gray-400 dark:hover:text-gray-300'
+                  }
+                `}
+              >
+                Fan-out
+              </button>
             </nav>
           </div>
         </div>
@@ -1167,8 +1283,81 @@ export const ProjectPromptsPage: React.FC = () => {
         )}
 
         {/* Evolution Tab Content */}
+        {/* Fan-out Tab Content */}
+        {activeTab === 'fan-out' && (
+          loading ? (
+            <div className="flex items-center justify-center py-16">
+              <LoadingSpinner size="lg" />
+            </div>
+          ) : (
+            <div className="bg-white dark:bg-gray-800 rounded-2xl border border-gray-200 dark:border-gray-700 overflow-hidden">
+              <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200 dark:border-gray-700">
+                <div>
+                  <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-100">Fan-out queries</h2>
+                  <p className="text-sm text-gray-500 dark:text-gray-400 mt-0.5">
+                    Web searches the AI engines ran to answer each prompt (unique across the selected period)
+                  </p>
+                </div>
+                <Button variant="secondary" onClick={exportFanOut}>
+                  <Download className="w-4 h-4 mr-2" />
+                  Export to Excel
+                </Button>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="border-b border-gray-200 dark:border-gray-700 text-left">
+                      <th className="py-3 px-6 text-gray-900 dark:text-gray-100 w-[34%]">Prompt</th>
+                      <th className="py-3 px-3 text-gray-900 dark:text-gray-100">Group</th>
+                      <th className="py-3 px-3 text-gray-900 dark:text-gray-100">Fan-out queries</th>
+                      <th className="py-3 px-3 text-center text-gray-900 dark:text-gray-100">#</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {fanOutData
+                      .filter(r => matchesPromptGroup(r.prompt_group))
+                      .map(r => {
+                        const visible = r.queries.filter(qq => qq.llms.some(isLlmVisible));
+                        if (visible.length === 0) return null;
+                        return (
+                          <tr key={r.prompt_id} className="border-b border-gray-100 dark:border-gray-800 align-top">
+                            <td className="py-3 px-6 text-gray-900 dark:text-gray-100">{r.prompt_text}</td>
+                            <td className="py-3 px-3 text-gray-600 dark:text-gray-400 whitespace-nowrap">{r.prompt_group}</td>
+                            <td className="py-3 px-3">
+                              <div className="flex flex-wrap gap-1.5">
+                                {visible.map(qq => (
+                                  <span
+                                    key={qq.q}
+                                    className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-gray-200 text-xs"
+                                  >
+                                    {qq.q}
+                                    {qq.llms.filter(isLlmVisible).map(l => (
+                                      LLM_ICONS[l as keyof typeof LLM_ICONS]
+                                        ? <img key={l} src={LLM_ICONS[l as keyof typeof LLM_ICONS]} alt={l} title={l} className="w-3.5 h-3.5 object-contain" />
+                                        : null
+                                    ))}
+                                  </span>
+                                ))}
+                              </div>
+                            </td>
+                            <td className="py-3 px-3 text-center text-gray-700 dark:text-gray-300">{visible.length}</td>
+                          </tr>
+                        );
+                      })}
+                  </tbody>
+                </table>
+                {fanOutData.filter(r => matchesPromptGroup(r.prompt_group)).length === 0 && (
+                  <p className="text-sm text-gray-400 dark:text-gray-500 py-10 text-center">
+                    No fan-out queries recorded for the selected period
+                  </p>
+                )}
+              </div>
+            </div>
+          )
+        )}
+
         {activeTab === 'evolution' && (
-          <ProjectDetailPage activeTabOverride="prompts" hideTabNavigation />
+          <ProjectDetailPage activeTabOverride="prompts" hideTabNavigation embedded />
         )}
 
         {/* All Audits Tab Content */}

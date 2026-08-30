@@ -143,6 +143,10 @@ const getBrandColor = (brandName: string, allBrands: string[]): string => {
 interface ProjectDetailPageProps {
   activeTabOverride?: string;
   hideTabNavigation?: boolean;
+  /** Rendered inside another page (e.g. the Prompts page's Evolution
+      tab): skip the project header and the filter bar — the host page
+      owns them, and both instances share the same filter context. */
+  embedded?: boolean;
 }
 
 // In-memory cache of loaded data windows, keyed `${projectId}|${windowKey}`.
@@ -227,7 +231,8 @@ const normalizeUrl = (url: string): string => {
 
 export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
   activeTabOverride,
-  hideTabNavigation = false
+  hideTabNavigation = false,
+  embedded = false
 }) => {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -4427,6 +4432,8 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
 
   return (
     <div className="space-y-6">
+      {!embedded && (
+      <>
       <motion.div
         initial={{ opacity: 0, y: 20 }}
         animate={{ opacity: 1, y: 0 }}
@@ -4557,6 +4564,8 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
         <div className="rounded-xl border border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-900/20 px-4 py-2.5 text-sm text-blue-800 dark:text-blue-200">
           No audits in the selected period — pick a wider range above.
         </div>
+      )}
+      </>
       )}
 
       {/* Dashboard navigation lives in the sidebar (one route per
