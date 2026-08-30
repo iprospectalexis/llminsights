@@ -41,7 +41,7 @@ PROVIDER_CAPABILITIES: dict[str, set] = {
         "searchgpt", "perplexity", "gemini", "bing-copilot", "grok",
         "google-ai-mode", "google-ai-overview",
     },
-    "dataforseo": {"google-ai-overview", "gemini"},
+    "dataforseo": {"google-ai-overview", "gemini", "perplexity"},
     "serp": {"searchgpt", "perplexity", "gemini", "google-ai-mode", "google-ai-overview"},
 }
 
@@ -50,7 +50,10 @@ PROVIDER_CAPABILITIES: dict[str, set] = {
 # observed reliability/cost for this project.
 DEFAULT_CHAINS: dict[str, list] = {
     "searchgpt": ["serp", "brightdata"],
-    "perplexity": ["brightdata", "serp"],
+    # BrightData's perplexity dataset went dark on 2026-08-26 (empty
+    # hash-keyed records, no answers); DataForSEO ai_optimization is the
+    # working source now.
+    "perplexity": ["dataforseo", "brightdata"],
     "gemini": ["brightdata", "dataforseo", "serp"],
     "google-ai-overview": ["dataforseo", "brightdata"],
     "google-ai-mode": ["brightdata", "serp"],

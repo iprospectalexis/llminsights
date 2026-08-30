@@ -119,6 +119,10 @@ class DataForSeoClient:
             settings, "dataforseo_gemini_system_message",
             "You are a helpful assistant that provides accurate information.",
         )
+        # Perplexity (ai_optimization) params. Only probe-verified fields
+        # are sent: model_name / user_prompt / web_search.
+        self.perplexity_model = getattr(settings, "dataforseo_perplexity_model", "sonar")
+        self.perplexity_web_search = getattr(settings, "dataforseo_perplexity_web_search", True)
         token = base64.b64encode(f"{self.login}:{self.password}".encode()).decode()
         self.headers = {
             "Authorization": f"Basic {token}",
@@ -462,6 +466,159 @@ class DataForSeoClient:
         )
         return results, failed
 
+    async def _post_perplexity_one(
+        self, client: httpx.AsyncClient, prompt: str, max_retries: int,
+    ) -> dict:
+        """POST one prompt to the Perplexity llm_responses live endpoint."""
+        payload = [{
+            "model_name": self.perplexity_model,
+            "user_prompt": prompt,
+            "web_search": self.perplexity_web_search,
+        }]
+        url = f"{self.base_url}/v3/ai_optimization/perplexity/llm_responses/live"
+        last_err = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                resp = await client.post(url, json=payload, headers=self.headers)
+                resp.raise_for_status()
+                return resp.json()
+            except Exception as e:
+                last_err = e
+                if attempt < max_retries:
+                    await asyncio.sleep(3 ** (attempt - 1))
+                else:
+                    raise last_err
+
+    def _convert_perplexity(self, task: dict, prompt: str) -> Optional[dict]:
+        """Map a Perplexity llm_responses task -> the canonical converted
+        record. Same items/sections/annotations walk as Gemini, but the
+        annotation URLs are direct (no grounding redirects), so no URL
+        resolution pass is needed."""
+        results = task.get("result") or []
+        if task.get("status_code") != 20000 or not results:
+            return None
+        res0 = results[0] or {}
+
+        text_parts: list[str] = []
+        annotations: list[dict] = []
+        for item in (res0.get("items") or []):
+            if item.get("type") != "message":
+                continue
+            for sec in (item.get("sections") or []):
+                if sec.get("type") != "text":
+                    continue
+                if sec.get("text"):
+                    text_parts.append(sec["text"])
+                for ann in (sec.get("annotations") or []):
+                    if ann.get("url"):
+                        annotations.append(ann)
+
+        answer_text = "\n\n".join(text_parts).strip()
+        fan_out = [str(q) for q in (res0.get("fan_out_queries") or []) if q]
+
+        citations: list[dict] = []
+        all_sources: list[dict] = []
+        seen: set[str] = set()
+        for a in annotations:
+            u = a["url"]
+            if u in seen:
+                continue
+            seen.add(u)
+            dom = _clean_domain(None, u)
+            title = a.get("title")
+            citations.append({"url": u, "page_url": u, "title": title, "domain": dom, "cited": True})
+            all_sources.append({"url": u, "title": title, "domain": dom})
+
+        timestamp = res0.get("datetime") or (datetime.utcnow().isoformat(timespec="milliseconds") + "Z")
+        return {
+            "map": None,
+            "url": "",
+            "index": None,
+            "input": {"user_prompt": prompt},
+            "model": "perplexity",
+            "is_map": False,
+            "prompt": prompt,
+            "country": "",
+            "shopping": [],
+            "shopping_visible": False,
+            "citations": citations,
+            "timestamp": timestamp,
+            "references": [],
+            "answer_text": answer_text,
+            "links_attached": [],
+            "answer_section_html": "",
+            "answer_text_markdown": answer_text,
+            "web_search_triggered": bool(self.perplexity_web_search),
+            "web_search_query": fan_out,
+            "search_sources": [],
+            "recommendations": [],
+            "additional_prompt": "",
+            "additional_answer_text": None,
+            "all_sources": all_sources,
+            "organic": [],
+        }
+
+    async def _process_perplexity(
+        self,
+        prompts: list[str],
+        max_retries: int,
+        progress_callback: Optional[Callable],
+    ) -> tuple[list[dict], list[str]]:
+        """One Perplexity request per prompt, bounded concurrency
+        (~5-15s and ~$0.006 per prompt on sonar)."""
+        logger.info(
+            f"DataForSEO Perplexity: {len(prompts)} prompts, model={self.perplexity_model}, "
+            f"web_search={self.perplexity_web_search}, max_concurrent={self.max_concurrent}"
+        )
+        results: list[dict] = []
+        failed: list[str] = []
+        total = len(prompts)
+        processed = 0
+        sem = asyncio.Semaphore(self.max_concurrent)
+        lock = asyncio.Lock()
+        timeout = httpx.Timeout(120.0, connect=30.0)
+
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async def run_one(prompt: str) -> None:
+                nonlocal processed
+                rec = None
+                try:
+                    async with sem:
+                        data = await self._post_perplexity_one(client, prompt, max_retries)
+                    tasks = data.get("tasks") or ([data] if data.get("result") else [])
+                    task = tasks[0] if tasks else None
+                    if task:
+                        self.total_cost += float(task.get("cost") or 0)
+                        rec = self._convert_perplexity(task, prompt)
+                        if not rec:
+                            logger.warning(
+                                f"DataForSEO Perplexity task not usable for '{prompt[:60]}': "
+                                f"status={task.get('status_code')} msg={task.get('status_message')!r}"
+                            )
+                except Exception as e:
+                    logger.error(
+                        f"DataForSEO Perplexity failed for '{prompt[:60]}': {type(e).__name__}: {e}"
+                    )
+                async with lock:
+                    if rec and rec.get("answer_text"):
+                        results.append(rec)
+                    else:
+                        failed.append(prompt)
+                    processed += 1
+                    if progress_callback:
+                        try:
+                            await progress_callback(processed, total, results)
+                        except Exception:
+                            pass
+
+            await asyncio.gather(*[run_one(p) for p in prompts])
+
+        logger.info(
+            f"DataForSEO Perplexity: done - {len(results)} ok, {len(failed)} failed, "
+            f"cost=${self.total_cost:.4f}"
+        )
+        return results, failed
+
     async def _post_batch(
         self, client: httpx.AsyncClient, keywords: list[str],
         location_code: int, language_code: str, max_retries: int,
@@ -518,6 +675,8 @@ class DataForSeoClient:
         # (ai_optimization/gemini/llm_responses/live), so route it out.
         if (source or "").lower() == "gemini":
             return await self._process_gemini(prompts, max_retries, progress_callback)
+        if (source or "").lower() == "perplexity":
+            return await self._process_perplexity(prompts, max_retries, progress_callback)
 
         location_code, language_code = self._resolve_location(geo_targeting)
         country = (geo_targeting or "").strip().upper()[:2] or "US"
