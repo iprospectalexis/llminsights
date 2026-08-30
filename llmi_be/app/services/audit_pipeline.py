@@ -493,6 +493,17 @@ async def handle_polling(audit_id: str, worker_id: str) -> None:
             )
             if transitioned:
                 logger.info(f"[polling] {audit_id}: polling → extracting_competitors")
+                # A fresh extraction cycle starts here. Stale counters from a
+                # PREVIOUS cycle (retry-llm re-entered polling on a completed
+                # audit) made the NULL-only force-skip guard believe a full
+                # pass had already run and mass-skip brand-new rows without
+                # ever extracting them (111 perplexity rows, 2026-08-30).
+                await db.update_audit(audit_id, {
+                    "competitors_total": 0,
+                    "competitors_processed": 0,
+                    "sentiment_total": 0,
+                    "sentiment_processed": 0,
+                })
             else:
                 logger.warning(
                     f"[polling] {audit_id}: CAS transition polling→extracting_competitors "
