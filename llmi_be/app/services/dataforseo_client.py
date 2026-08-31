@@ -743,7 +743,15 @@ class DataForSeoClient:
                                 if provider_health.classify_error(status_msg) == "billing":
                                     provider_health.record_failure("dataforseo", status_msg)
                                 if kw:
-                                    batch_failed.append(kw)
+                                    # 40101 "Internal SE Server Error" comes in
+                                    # transient bursts on DataForSEO's side (70%
+                                    # of keywords failed on 2026-08-31) — give
+                                    # those one in-job retry before failing the
+                                    # keyword over to the provider chain.
+                                    if task.get("status_code") == 40101 and allow_async_retry:
+                                        batch_async.append(kw)
+                                    else:
+                                        batch_failed.append(kw)
                                     seen.add(kw)
                         for kw in batch:
                             if kw not in seen:

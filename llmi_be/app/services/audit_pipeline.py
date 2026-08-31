@@ -606,6 +606,7 @@ async def handle_polling(audit_id: str, worker_id: str) -> None:
         results: list[dict] = []
         error_terminal_ids: list[str] = []   # provider_error
         dropped_terminal_ids: list[str] = [] # provider_dropped
+        dropped_rows: list[dict] = []         # same rows, for chain failover
         failed_job_rows: list[dict] = []     # job hard-failed → provider switch
         job_provider_map: dict[str, str] = {}
         job_status_map: dict[str, str] = {}
@@ -771,8 +772,12 @@ async def handle_polling(audit_id: str, worker_id: str) -> None:
                                         f"Total unmatched provider results: {sum(len(v) for v in result_by_prompt.values())} | "
                                         f"Provider result fields sample: {list((onesearch_results[0] or {}).keys())[:10] if onesearch_results else 'empty'}"
                                     )
-                                # Provider returned the snapshot but dropped this prompt → terminal.
+                                # Provider returned the snapshot but dropped this
+                                # prompt. Queue for chain failover first (e.g.
+                                # DataForSEO 40101 bursts) — only rows that cannot
+                                # switch are terminal-marked after the failover pass.
                                 dropped_terminal_ids.append(str(resp["id"]))
+                                dropped_rows.append(resp)
                         if matched_count < len(responses):
                             logger.warning(
                                 f"[polling] {audit_id}: provider drop on job {job_id}: "
@@ -839,9 +844,8 @@ async def handle_polling(audit_id: str, worker_id: str) -> None:
             if all_citations:
                 await db.insert_citations_batch(all_citations)
 
-        phase = "mark_dropped"
-        if dropped_terminal_ids:
-            await db.mark_polling_terminal(dropped_terminal_ids, "provider_dropped")
+        # mark_dropped moved below the failover pass — dropped rows get one
+        # chance to switch providers first.
         phase = "mark_errors"
         if error_terminal_ids:
             await db.mark_polling_terminal(error_terminal_ids, "provider_error")
@@ -850,7 +854,7 @@ async def handle_polling(audit_id: str, worker_id: str) -> None:
         phase = "exhaustion_sweep"
         exhausted_ids: list[str] = []
         # `successful_ids` was captured above before `upsert_llm_responses`.
-        handled_terminal = set(dropped_terminal_ids) | set(error_terminal_ids)
+        handled_terminal = set(dropped_terminal_ids) | set(error_terminal_ids)  # dropped: handled by failover below
         for r in due:
             rid = str(r["id"])
             if rid in successful_ids or rid in handled_terminal:
@@ -877,6 +881,8 @@ async def handle_polling(audit_id: str, worker_id: str) -> None:
             if r:
                 switch_candidates[rid] = r
         for r in failed_job_rows:
+            switch_candidates.setdefault(str(r["id"]), r)
+        for r in dropped_rows:
             switch_candidates.setdefault(str(r["id"]), r)
 
         fellback_ids: set[str] = set()
@@ -951,6 +957,11 @@ async def handle_polling(audit_id: str, worker_id: str) -> None:
                 })
             except Exception:
                 pass
+
+        phase = "mark_dropped"
+        remaining_dropped = [rid for rid in dropped_terminal_ids if rid not in fellback_ids]
+        if remaining_dropped:
+            await db.mark_polling_terminal(remaining_dropped, "provider_dropped")
 
         exhausted_set = set(exhausted_ids)
         remaining_failed = [
