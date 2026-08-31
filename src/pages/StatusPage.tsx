@@ -20,7 +20,9 @@ import {
   Brain,
   Flag,
   ScrollText,
-  LifeBuoy
+  LifeBuoy,
+  CalendarClock,
+  MousePointerClick
 } from 'lucide-react';
 import { Button } from '../components/ui/Button';
 import { Modal } from '../components/ui/Modal';
@@ -54,6 +56,7 @@ interface Audit {
   finished_at: string | null;
   processing_started_at: string | null;
   created_at: string;
+  is_scheduled?: boolean;
   projects: {
     name: string;
     domain: string;
@@ -880,6 +883,25 @@ export function StatusPage() {
                                 </div>
                               );
                             })()}
+                          </div>
+                          <div className="mt-1 ml-6">
+                            {audit.is_scheduled ? (
+                              <span
+                                className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium bg-indigo-50 dark:bg-indigo-900/30 text-indigo-700 dark:text-indigo-300"
+                                title="Started automatically by the project's audit schedule"
+                              >
+                                <CalendarClock className="w-3 h-3" />
+                                Scheduled
+                              </span>
+                            ) : (
+                              <span
+                                className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-medium text-gray-400 dark:text-gray-500"
+                                title="Started manually by a user"
+                              >
+                                <MousePointerClick className="w-3 h-3" />
+                                Manual
+                              </span>
+                            )}
                           </div>
                         </td>
                         <td className="px-6 py-4">

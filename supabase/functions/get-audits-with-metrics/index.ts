@@ -103,6 +103,7 @@ Deno.serve(async (req: Request) => {
         processing_started_at,
         created_at,
         run_by,
+        is_scheduled,
         projects (
           id,
           name,
