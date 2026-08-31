@@ -4186,6 +4186,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
 
     let webSearch = 0, noSearch = 0, present = 0, absent = 0;
     let cited = 0, moreOnly = 0, mainCit = 0, supporting = 0;
+    let panelRows = 0;
 
     cfData.rows.forEach(r => {
       const la = urlsOf(r.links_attached);
@@ -4209,6 +4210,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
         ss.length > 0 || ssm.length > 0 || cit.length > 0 || !!r.web_search_query;
       if (!searched) { noSearch++; return; }
       webSearch++;
+      if (ss.length > 0 || ssmPanel.length > 0) panelRows++;
       const mainSet = la.length > 0 ? la : citUsed;  // in-text links (or their deduped panel)
       const usedSet = ss.length > 0 ? ss : mainSet;  // used-sources panel when captured
       const inMain = mainSet.some(isOwn);
@@ -4225,7 +4227,12 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     });
 
     const total = cfData.rows.length;
-    return { total, webSearch, noSearch, present, absent, cited, moreOnly, mainCit, supporting };
+    // Source panels stopped arriving from the provider on Aug 26, 2026. When
+    // most searched rows lack them, the Present/Absent-in-Sources tier is just
+    // an echo of the Citations tier — render the collapsed funnel instead of
+    // fabricating a retrieval stage.
+    const panelsAvailable = webSearch > 0 && panelRows / webSearch >= 0.5;
+    return { total, webSearch, noSearch, present, absent, cited, moreOnly, mainCit, supporting, panelsAvailable };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cfData, project?.domain, project?.domain_mode]);
 
@@ -7837,13 +7844,21 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                         </span>
                       </div>
                       <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">
-                        How your domain travels through ChatGPT's search pipeline: retrieved &rarr; sources panel &rarr; cited in the answer.
+                        {citationFunnel && citationFunnel.panelsAvailable === false
+                          ? <>Where your domain lands in ChatGPT's search answers: web search on/off &rarr; cited in the answer or not.</>
+                          : <>How your domain travels through ChatGPT's search pipeline: retrieved &rarr; sources panel &rarr; cited in the answer.</>}
                         {cfData && (
                           <span className="ml-1 text-gray-500 dark:text-gray-500">
                             Audit of {new Date(cfData.auditDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })} &middot; SearchGPT only.
                           </span>
                         )}
                       </p>
+                      {citationFunnel && citationFunnel.panelsAvailable === false && (
+                        <p className="text-xs text-amber-700 dark:text-amber-400 mt-1.5">
+                          Sources-panel data is unavailable for this audit (the data provider stopped exposing ChatGPT's sources panel on Aug 26, 2026),
+                          so the &laquo;Present / Absent in Sources&raquo; stage is hidden &mdash; the funnel shows citation outcome only.
+                        </p>
+                      )}
                     </div>
                   </div>
                 </CardHeader>
@@ -7868,12 +7883,22 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                 </CardHeader>
                 <CardContent>
                   <ul className="text-sm text-gray-600 dark:text-gray-400 space-y-1.5">
-                    <li><b>Web Search Enabled</b> &mdash; the answer carries search-attributed links (utm marker) or a sources panel. ChatGPT's own flag is unreliable and is not used.</li>
-                    <li><b>Present in Sources</b> &mdash; your domain appears anywhere in the retrieved set: answer links, the sources panel, or the &laquo;More&raquo; list.</li>
-                    <li><b>Citations</b> &mdash; your domain is in the used-sources panel or the answer itself; <b>More / Supplemental</b> &mdash; retrieved but only in the &laquo;More&raquo; list.</li>
-                    <li><b>Main Citations</b> &mdash; linked inside the answer text; <b>Supporting</b> &mdash; in the used-sources panel without an in-text link.</li>
-                    <li>Snapshot variants: when a capture lacks the expanded panels, the funnel falls back to the answer's Citations panel &mdash; entries flagged cited are the used tier, entries flagged not-cited feed &laquo;More&raquo;; Supporting is then indistinguishable and shows 0.</li>
-                    <li>Scope: the latest completed audit with SearchGPT answers, one row per prompt&nbsp;&times;&nbsp;run. Full source panels are collected since Aug&nbsp;19, 2026.</li>
+                    <li><b>Web Search Enabled</b> &mdash; the answer carries search-attributed links (utm marker), citations, or a sources panel; when web search is off, ChatGPT answers from its own knowledge with no links. ChatGPT's own flag is unreliable and is not used.</li>
+                    {citationFunnel && citationFunnel.panelsAvailable === false ? (
+                      <>
+                        <li><b>Cited in Answer</b> &mdash; your domain is linked in the answer text or its Citations panel; <b>In &laquo;More&raquo; list only</b> &mdash; listed as a supplemental source without being cited; <b>Not Cited</b> &mdash; neither.</li>
+                        <li><b>Main Citations</b> &mdash; linked inside the answer text; <b>Supporting</b> &mdash; in the used-sources panel without an in-text link (indistinguishable without panels, shows 0).</li>
+                        <li>The retrieval stage (&laquo;Present / Absent in Sources&raquo;) needs ChatGPT's sources panel, which the data provider stopped exposing on Aug&nbsp;26, 2026 &mdash; it is hidden for audits captured after that date rather than shown as a copy of the Citations stage.</li>
+                      </>
+                    ) : (
+                      <>
+                        <li><b>Present in Sources</b> &mdash; your domain appears anywhere in the retrieved set: answer links, the sources panel, or the &laquo;More&raquo; list.</li>
+                        <li><b>Citations</b> &mdash; your domain is in the used-sources panel or the answer itself; <b>More / Supplemental</b> &mdash; retrieved but only in the &laquo;More&raquo; list.</li>
+                        <li><b>Main Citations</b> &mdash; linked inside the answer text; <b>Supporting</b> &mdash; in the used-sources panel without an in-text link.</li>
+                        <li>Snapshot variants: when a capture lacks the expanded panels, the funnel falls back to the answer's Citations panel &mdash; entries flagged cited are the used tier, entries flagged not-cited feed &laquo;More&raquo;; Supporting is then indistinguishable and shows 0.</li>
+                      </>
+                    )}
+                    <li>Scope: the latest completed audit with SearchGPT answers, one row per prompt&nbsp;&times;&nbsp;run. Full source panels were collected Aug&nbsp;19&ndash;26, 2026.</li>
                   </ul>
                 </CardContent>
               </Card>

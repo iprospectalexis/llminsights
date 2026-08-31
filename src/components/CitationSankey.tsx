@@ -17,6 +17,10 @@ export interface FunnelCounts {
   moreOnly: number;
   mainCit: number;
   supporting: number;
+  /** False when the provider snapshots carry no source panels for this audit:
+   * the Present/Absent-in-Sources tier would only mirror Citations, so the
+   * funnel collapses to All → Search → Cited/Not cited → Main/Supporting. */
+  panelsAvailable?: boolean;
 }
 
 interface NodeDef { id: string; name: string; v: number; color: string; col: number }
@@ -29,9 +33,14 @@ export function CitationSankey({ f }: { f: FunnelCounts }) {
   const GAP = 34;
   const LABELW = 205;
 
+  const hasPanels = f.panelsAvailable !== false;
+
   // Column slots; vertical order within a column is chosen so ribbons never
   // cross: each parent's outgoing links go to targets in top-to-bottom order.
-  const defs: NodeDef[] = [
+  // Without source panels the retrieval tier (Present/Absent in Sources) would
+  // only mirror the Citations tier, so it is dropped and Absent is relabeled
+  // to what it actually measures then: the domain is not cited.
+  const defs: NodeDef[] = (hasPanels ? [
     { id: 'all',     name: `All Prompts (${f.total})`,               v: f.total,      color: '#ec4899', col: 0 },
     { id: 'ws',      name: `Web Search Enabled (${f.webSearch})`,    v: f.webSearch,  color: '#ec4899', col: 1 },
     { id: 'ns',      name: `Web Search Disabled (${f.noSearch})`,    v: f.noSearch,   color: '#6b7280', col: 1 },
@@ -41,24 +50,38 @@ export function CitationSankey({ f }: { f: FunnelCounts }) {
     { id: 'more',    name: `More / Supplemental (${f.moreOnly})`,    v: f.moreOnly,   color: '#fbbf24', col: 3 },
     { id: 'main',    name: `Main Citations (${f.mainCit})`,          v: f.mainCit,    color: '#38bdf8', col: 4 },
     { id: 'supp',    name: `Supporting Citations (${f.supporting})`, v: f.supporting, color: '#60a5fa', col: 4 },
-  ].filter(n => n.v > 0);
+  ] : [
+    { id: 'all',     name: `All Prompts (${f.total})`,               v: f.total,      color: '#ec4899', col: 0 },
+    { id: 'ws',      name: `Web Search Enabled (${f.webSearch})`,    v: f.webSearch,  color: '#ec4899', col: 1 },
+    { id: 'ns',      name: `Web Search Disabled (${f.noSearch})`,    v: f.noSearch,   color: '#6b7280', col: 1 },
+    { id: 'cit',     name: `Cited in Answer (${f.cited})`,           v: f.cited,      color: '#38bdf8', col: 2 },
+    { id: 'more',    name: `In "More" list only (${f.moreOnly})`,    v: f.moreOnly,   color: '#fbbf24', col: 2 },
+    { id: 'absent',  name: `Not Cited (${f.absent})`,                v: f.absent,     color: '#fbbf24', col: 2 },
+    { id: 'main',    name: `Main Citations (${f.mainCit})`,          v: f.mainCit,    color: '#38bdf8', col: 3 },
+    { id: 'supp',    name: `Supporting Citations (${f.supporting})`, v: f.supporting, color: '#60a5fa', col: 3 },
+  ]).filter(n => n.v > 0);
 
-  const linkDefs: Array<[string, string, number]> = ([
+  const linkDefs: Array<[string, string, number]> = ((hasPanels ? [
     ['all', 'ws', f.webSearch], ['all', 'ns', f.noSearch],
     ['ws', 'absent', f.absent], ['ws', 'present', f.present],
     ['present', 'cit', f.cited], ['present', 'more', f.moreOnly],
     ['cit', 'main', f.mainCit], ['cit', 'supp', f.supporting],
-  ] as Array<[string, string, number]>).filter(l => l[2] > 0);
+  ] : [
+    ['all', 'ws', f.webSearch], ['all', 'ns', f.noSearch],
+    ['ws', 'cit', f.cited], ['ws', 'more', f.moreOnly], ['ws', 'absent', f.absent],
+    ['cit', 'main', f.mainCit], ['cit', 'supp', f.supporting],
+  ]) as Array<[string, string, number]>).filter(l => l[2] > 0);
 
   if (f.total === 0) return null;
 
   const usable = H - 2 * PADY - GAP; // room for a 2-node column
   const scale = usable / f.total;
-  const colX = (c: number) => 8 + c * ((W - LABELW - 8 - NODEW) / 4);
+  const maxCol = defs.reduce((m, n) => Math.max(m, n.col), 1);
+  const colX = (c: number) => 8 + c * ((W - LABELW - 8 - NODEW) / maxCol);
 
   // Stack nodes per column, vertically centered.
   const nodes = new Map<string, NodeDef & { x: number; y: number; h: number; inOff: number; outOff: number }>();
-  for (let c = 0; c <= 4; c++) {
+  for (let c = 0; c <= maxCol; c++) {
     const colNodes = defs.filter(n => n.col === c);
     if (colNodes.length === 0) continue;
     const totalH = colNodes.reduce((a, n) => a + Math.max(n.v * scale, 4), 0) + GAP * (colNodes.length - 1);
