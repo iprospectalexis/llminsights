@@ -987,6 +987,53 @@ class SupabaseDB:
                 await s.execute(text(sql), params)
             await s.commit()
 
+    # SELECT half of reconcile_citations(): the citation rows implied by
+    # llm_responses.citations for responses that have no rows in the
+    # citations table. Mirrors collect_citations(): url → page_url (http only,
+    # Google's own search pages dropped), title/text/description →
+    # citation_text, the converter's domain preferred over the URL host (goto
+    # links), 1-based position, cited only when the entry carries it.
+    RECONCILE_CITATIONS_SELECT = """
+        SELECT lr.audit_id, lr.prompt_id, lr.llm, COALESCE(lr.run_index, 1) AS run_index,
+               COALESCE(c->>'url', c->>'page_url', c->>'link') AS page_url,
+               NULLIF(c->>'domain', '') AS domain,
+               COALESCE(NULLIF(c->>'title', ''), NULLIF(c->>'text', ''),
+                        NULLIF(c->>'description', ''), NULLIF(c->>'snippet', ''),
+                        'No description available') AS citation_text,
+               e.ord::int AS position,
+               now() AS checked_at,
+               CASE WHEN c ? 'cited' THEN (c->>'cited')::boolean END AS cited
+        FROM llm_responses lr
+        CROSS JOIN LATERAL jsonb_array_elements(lr.citations) WITH ORDINALITY AS e(c, ord)
+        WHERE lr.audit_id = :aid
+          AND jsonb_typeof(lr.citations) = 'array'
+          AND jsonb_array_length(lr.citations) > 0
+          AND COALESCE(c->>'url', c->>'page_url', c->>'link') ~* '^https?://'
+          AND COALESCE(c->>'url', c->>'page_url', c->>'link')
+              !~* '^https?://(www\\.)?google\\.[a-z.]+/(search|url)\\?'
+          AND NOT EXISTS (
+              SELECT 1 FROM citations ct
+              WHERE ct.audit_id = lr.audit_id AND ct.prompt_id = lr.prompt_id
+                AND ct.llm = lr.llm AND ct.run_index = COALESCE(lr.run_index, 1)
+          )
+    """
+
+    async def reconcile_citations(self, audit_id: str) -> int:
+        """Rebuild citation rows for responses whose citations exist only in
+        llm_responses.citations (a lost INSERT during polling). Idempotent:
+        touches only responses with zero rows. Returns rows inserted."""
+        async with AsyncSessionLocal() as s:
+            result = await s.execute(
+                text(
+                    "INSERT INTO citations (audit_id, prompt_id, llm, run_index, page_url, "
+                    "domain, citation_text, position, checked_at, cited)\n"
+                    + self.RECONCILE_CITATIONS_SELECT
+                ),
+                {"aid": audit_id},
+            )
+            await s.commit()
+            return result.rowcount or 0
+
     async def get_unclassified_citation_domains(
         self, limit: int = 300, audit_id: Optional[str] = None
     ) -> list[str]:

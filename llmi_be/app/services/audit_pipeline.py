@@ -840,9 +840,20 @@ async def handle_polling(audit_id: str, worker_id: str) -> None:
                     "run_index": resp.get("run_index") or 1,
                 })
                 all_citations.extend(collect_citations(r["result"], resp))
-            await db.delete_citations_batch(delete_keys)
-            if all_citations:
-                await db.insert_citations_batch(all_citations)
+            # Not fatal for the tick: the response rows are already saved and
+            # handle_finalize rebuilds any citations that are missing here
+            # from llm_responses.citations. Crashing the tick at this point
+            # used to skip mark_errors/the exhaustion sweep as well.
+            try:
+                await db.delete_citations_batch(delete_keys)
+                if all_citations:
+                    await db.insert_citations_batch(all_citations)
+            except Exception as e:
+                logger.error(
+                    f"[polling] {audit_id}: citations persist failed for "
+                    f"{len(successful)} response(s) — finalize will rebuild them: "
+                    f"{type(e).__name__}: {e}"
+                )
 
         # mark_dropped moved below the failover pass — dropped rows get one
         # chance to switch providers first.
@@ -2026,6 +2037,21 @@ async def handle_finalize(audit_id: str, worker_id: str) -> None:
             )
     except Exception as e:
         logger.warning(f"[pipeline] {audit_id}: coverage check failed: {e}")
+
+    # The citations table is derived from llm_responses.citations; a polling
+    # tick that saved the rows but lost the INSERT INTO citations (three
+    # retries all inside one DB-load window, 2026-09-01) leaves responses
+    # with citations in jsonb and no table rows. Rebuild those before the
+    # metrics are computed. Idempotent: only responses with zero rows.
+    try:
+        rebuilt = await db.reconcile_citations(audit_id)
+        if rebuilt:
+            logger.warning(
+                f"[pipeline] {audit_id}: rebuilt {rebuilt} citation row(s) from "
+                "llm_responses.citations for responses that had none"
+            )
+    except Exception as e:
+        logger.warning(f"[pipeline] {audit_id}: citation reconcile warning: {e}")
 
     try:
         await db.refresh_audit_metrics(audit_id)
