@@ -573,6 +573,10 @@ async def run_audit(req: RunAuditRequest, background_tasks: BackgroundTasks):
             await db.update_audit(audit_id, {
                 "progress": progress,
                 "pipeline_state": "polling",  # Hand off to scheduler
+                # Anchors the 90-min polling deadline. Left NULL, the
+                # deadline fell back to started_at and swept audits that
+                # were merely recovered late (2026-09-01).
+                "pipeline_state_entered_at": datetime.now(timezone.utc),
                 "responses_expected": total,
             })
             await db.update_audit_step(audit_id, "fetch", {

@@ -89,11 +89,18 @@ async def recover_stale_audits():
 
     try:
         async with AsyncSessionLocal() as s:
+            # pipeline_state_entered_at is re-stamped too: it anchors both the
+            # 45-min zombie sweep and the 90-min polling deadline. Without it
+            # the recovered audits were killed within a minute of the restart
+            # that was meant to save them (2026-09-01: 2 sentiment audits
+            # zombie-killed, 2 polling audits swept as polling_timeout with
+            # their job results already sitting in the jobs table).
             result = await s.execute(text("""
                 UPDATE audits
                 SET locked_by = NULL,
                     locked_at = NULL,
                     last_activity_at = now(),
+                    pipeline_state_entered_at = now(),
                     error_message = COALESCE(
                         NULLIF(error_message, ''),
                         'Recovered after scheduler restart'
