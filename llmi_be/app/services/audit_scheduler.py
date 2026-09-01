@@ -20,6 +20,7 @@ Only ONE executor processes each audit at a time.
 
 import asyncio
 import logging
+import os
 from datetime import datetime, timezone
 
 from app.services import audit_pipeline
@@ -32,6 +33,27 @@ _semaphore = asyncio.Semaphore(3)
 _in_flight: set[str] = set()  # audit IDs currently being processed (prevents overlapping tasks)
 _running = False
 _scheduled_tick_counter = 0  # only dispatch scheduled audits every Nth tick
+
+# ── Hang protection ──────────────────────────────────────────────────
+# 2026-09-01: a wedged asyncpg connection (client command timeout whose
+# CancelRequest the pooler never acknowledged) blocked the tick coroutine
+# in an await that could never complete. No exception, so the tick loop's
+# try/except never fired; /health stayed 200; five audits sat untouched
+# for 11 hours. Three independent guards now bound that failure:
+#   1. every tick runs under a timeout — a hung tick is abandoned and the
+#      loop goes on;
+#   2. every per-audit handler runs under a ceiling — a hung handler frees
+#      its semaphore slot (there are only 3) and its _in_flight entry;
+#   3. a watchdog restarts the process when ticks stop for good — Docker's
+#      restart policy brings it back and recover_stale_audits() resumes
+#      the work.
+TICK_TIMEOUT_S = 180
+# Handlers are bounded by MAX_BATCHES_PER_INVOCATION (≤ ~5 min); the SQL
+# zombie watchdog fails an audit stuck in one state after 45 min. This
+# ceiling only has to be lower than "forever".
+HANDLER_CEILING_S = 40 * 60
+WATCHDOG_STALE_S = 300
+WATCHDOG_INTERVAL_S = 30
 
 # ── Scheduler heartbeat ──────────────────────────────────────────────
 # Updated every tick so external callers (health endpoint) can detect a
@@ -112,7 +134,12 @@ async def start_scheduler():
 
     while _running:
         try:
-            await _scheduler_tick()
+            await asyncio.wait_for(_scheduler_tick(), timeout=TICK_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            logger.error(
+                f"Scheduler tick hung for >{TICK_TIMEOUT_S}s and was abandoned "
+                "(wedged DB connection?) — continuing with the next tick"
+            )
         except Exception as e:
             logger.error(f"Scheduler tick error: {e}")
         await asyncio.sleep(15)
@@ -123,6 +150,37 @@ def stop_scheduler():
     global _running
     _running = False
     logger.info("Audit scheduler stopped")
+
+
+async def scheduler_watchdog():
+    """Restart the process if the scheduler loop stops ticking.
+
+    The tick loop is the single owner of every audit; if it dies, nothing
+    else in the system notices (the API keeps serving, /health kept
+    answering 200 for 11 hours on 2026-09-01). Exiting the process is the
+    one recovery that needs no cooperation from the hung coroutine: the
+    container's restart policy brings a fresh process up and
+    recover_stale_audits() re-activates the stranded audits on the first
+    tick.
+    """
+    while True:
+        await asyncio.sleep(WATCHDOG_INTERVAL_S)
+        if not _running or _last_tick_at is None:
+            continue
+        stale = (datetime.now(timezone.utc) - _last_tick_at).total_seconds()
+        if stale > WATCHDOG_STALE_S:
+            logger.critical(
+                f"[watchdog] scheduler has not ticked for {stale:.0f}s "
+                f"(limit {WATCHDOG_STALE_S}s, in-flight={sorted(_in_flight)}) — "
+                "exiting so the container restarts and recovers the audits"
+            )
+            # Flush handlers before the hard exit so the line above survives.
+            for h in logging.getLogger().handlers:
+                try:
+                    h.flush()
+                except Exception:
+                    pass
+            os._exit(70)
 
 
 async def _dispatch_scheduled_audits():
@@ -391,11 +449,26 @@ async def _scheduler_tick():
                     return  # Another worker/tick owns it
 
                 try:
-                    await audit_pipeline.process_step(audit, WORKER_ID)
+                    await asyncio.wait_for(
+                        audit_pipeline.process_step(audit, WORKER_ID),
+                        timeout=HANDLER_CEILING_S,
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(
+                        f"Scheduler: handler for {audit_id} "
+                        f"(state={audit.get('pipeline_state')}) exceeded "
+                        f"{HANDLER_CEILING_S}s and was cancelled — the next tick retries"
+                    )
                 except Exception as e:
                     logger.error(f"Scheduler pipeline error for {audit_id}: {e}")
                 finally:
-                    await audit_pipeline.release(audit_id, WORKER_ID)
+                    try:
+                        await audit_pipeline.release(audit_id, WORKER_ID)
+                    except Exception as e:
+                        # release_stale_audit_locks() clears the lock on a
+                        # later tick; a failed release must not surface as an
+                        # unretrieved task exception.
+                        logger.warning(f"Scheduler: release failed for {audit_id}: {e}")
         finally:
             _in_flight.discard(audit_id)
 

@@ -16,7 +16,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database import AsyncSessionLocal
+from app.database import AsyncSessionLocal, MaintenanceSessionLocal
 
 logger = logging.getLogger(__name__)
 
@@ -1166,8 +1166,13 @@ class SupabaseDB:
 
     # ── Metrics ───────────────────────────────────────────────────────
 
-    async def refresh_audit_metrics(self, audit_id: str) -> None:
-        """Queue and trigger metrics refresh via RPC."""
+    async def enqueue_metrics_refresh(self, audit_id: str) -> None:
+        """Mark the audit for the next scheduled audit_metrics_mv refresh.
+
+        Cheap upsert only. The refresh itself (a full REFRESH MATERIALIZED
+        VIEW CONCURRENTLY) runs from the pg_cron job every 15 minutes, or
+        synchronously via refresh_audit_metrics() when an audit completes.
+        """
         try:
             async with AsyncSessionLocal() as s:
                 await s.execute(
@@ -1178,7 +1183,24 @@ class SupabaseDB:
                     """),
                     {"aid": audit_id, "now": datetime.now(timezone.utc)},
                 )
-                # Increase statement timeout for MV refresh (default is too low for large tables)
+                await s.commit()
+        except Exception as e:
+            logger.warning(f"Failed to enqueue metrics refresh for {audit_id}: {e}")
+
+    async def refresh_audit_metrics(self, audit_id: str) -> None:
+        """Queue and run the metrics refresh RPC (full MV refresh).
+
+        Runs on the maintenance engine: the server-side statement_timeout is
+        the only cap, so a slow refresh ends in a clean server-side cancel
+        instead of a client CancelRequest through the pooler. Do not call
+        this from the polling tick — the 2026-09-01 scheduler hang came from
+        exactly that (the refresh serialised across concurrent audits, hit
+        the 10s client cap ~240 times a day, and one of those cancels wedged
+        14 pooled connections for good).
+        """
+        await self.enqueue_metrics_refresh(audit_id)
+        try:
+            async with MaintenanceSessionLocal() as s:
                 await s.execute(text("SET LOCAL statement_timeout = '120s'"))
                 await s.execute(
                     text("SELECT refresh_audit_metrics(:aid)"),
@@ -1186,7 +1208,7 @@ class SupabaseDB:
                 )
                 await s.commit()
         except Exception as e:
-            logger.warning(f"Failed to refresh metrics for {audit_id}: {e}")
+            logger.warning(f"Failed to refresh metrics for {audit_id}: {type(e).__name__}: {e}")
 
     async def calculate_project_metrics(self, audit_id: str) -> None:
         """Recompute the project's card metrics via the single SQL definition.

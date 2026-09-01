@@ -1,9 +1,15 @@
+import asyncio
+import logging
+
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.pool import NullPool
 
 from app.config import get_settings
 
 settings = get_settings()
+logger = logging.getLogger(__name__)
 
 # Build engine with driver-appropriate options
 engine_kwargs = {
@@ -70,14 +76,15 @@ if settings.is_postgres:
         # Fail fast on the rare case a connection setup hangs. Healthy
         # Supavisor handshake is <500ms; anything beyond 10s is dead.
         "timeout": 10,
-        # Cap a single query at 10s (was 30s). A stalled Supavisor that
+        # Cap a single query at 20s (was 10s). A stalled Supavisor that
         # accepts the connection but never responds was holding sessions
         # in the pool for up to 30s × 3 retries = 90s per failed call.
         # Under sustained Supavisor flakiness this accumulated to pool
         # exhaustion within ~12 minutes despite an 80-session budget.
-        # 10s is plenty for any normal query (we have no analytical
-        # workload on the hot path).
-        "command_timeout": 10,
+        # The hot path has no analytical workload, so 20s is generous; a
+        # connection that does time out is hard-terminated by the
+        # handle_error hook below, so the cap no longer costs pool capacity.
+        "command_timeout": 20,
     }
 else:
     # SQLite with aiosqlite: allow multi-thread access
@@ -85,9 +92,72 @@ else:
 
 async_engine = create_async_engine(settings.database_url, **engine_kwargs)
 
+if settings.is_postgres:
+    # Long-running maintenance statements (REFRESH MATERIALIZED VIEW ...) get
+    # a pool-less engine of their own. The server-side statement_timeout set
+    # per call is the authority there; the client cap sits far above it so
+    # the client never cancels a statement that is merely slow.
+    _maintenance_kwargs = {
+        "echo": settings.debug,
+        "poolclass": NullPool,
+        "connect_args": {
+            **engine_kwargs["connect_args"],
+            "command_timeout": 180,
+        },
+    }
+    maintenance_engine = create_async_engine(settings.database_url, **_maintenance_kwargs)
+else:
+    maintenance_engine = async_engine
+
+
+def _terminate_on_timeout(context) -> None:
+    """Hard-terminate an asyncpg connection whose command timed out.
+
+    On a client-side timeout (and on task cancellation) asyncpg sends a
+    CancelRequest and then blocks every later statement on that connection
+    until the server acknowledges it. Through Supavisor in transaction mode
+    that acknowledgment can never come, and the next statement — including
+    the ROLLBACK the pool issues when the session is returned — blocks
+    forever. 2026-09-01: 14 sessions plus the scheduler tick hung that way
+    for 11 hours while /health kept answering 200. Terminating the socket
+    and discarding the connection is the only safe exit.
+    """
+    exc = context.original_exception
+    if not isinstance(exc, (asyncio.TimeoutError, TimeoutError, asyncio.CancelledError)):
+        return
+    context.is_disconnect = True
+    context.invalidate_pool_on_disconnect = False
+    try:
+        fairy = context.connection.connection if context.connection is not None else None
+        dbapi_conn = getattr(fairy, "dbapi_connection", None)
+        raw = getattr(dbapi_conn, "_connection", None)
+        if raw is not None and not raw.is_closed():
+            raw.terminate()
+            logger.warning(
+                f"[db] terminated connection after {type(exc).__name__} "
+                f"on: {str(context.statement)[:120]!r}"
+            )
+    except Exception as e:  # never let the guard itself break error handling
+        logger.warning(f"[db] terminate-on-timeout guard failed: {e}")
+
+
+if settings.is_postgres:
+    event.listen(async_engine.sync_engine, "handle_error", _terminate_on_timeout)
+    event.listen(maintenance_engine.sync_engine, "handle_error", _terminate_on_timeout)
+
 # Async session factory
 AsyncSessionLocal = async_sessionmaker(
     bind=async_engine,
+    class_=AsyncSession,
+    expire_on_commit=False,
+    autocommit=False,
+    autoflush=False,
+)
+
+# Sessions for statements that legitimately run for minutes (see
+# maintenance_engine). Not for the request/pipeline hot path.
+MaintenanceSessionLocal = async_sessionmaker(
+    bind=maintenance_engine,
     class_=AsyncSession,
     expire_on_commit=False,
     autocommit=False,

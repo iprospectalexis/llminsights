@@ -13,7 +13,13 @@ from app.database import init_db, async_engine
 from app.config import get_settings
 from app.schemas import HealthResponse
 from app.services.job_processor import job_processor
-from app.services.audit_scheduler import start_scheduler, stop_scheduler
+from app.services.audit_scheduler import (
+    start_scheduler,
+    stop_scheduler,
+    scheduler_watchdog,
+    get_scheduler_health,
+    WATCHDOG_STALE_S,
+)
 
 # Configure logging
 logging.basicConfig(
@@ -68,6 +74,7 @@ async def lifespan(app: FastAPI):
         scheduler_task = asyncio.create_task(start_scheduler())
         app.state.scheduler_running = True
         logger.info("Audit scheduler started (Supabase PostgreSQL detected)")
+        watchdog_task = asyncio.create_task(scheduler_watchdog())
 
         # Pool monitor — logs a one-line snapshot of pool state every 30s,
         # warns if util stays >75% for 2 minutes, and DUMPS ALL ACTIVE
@@ -92,7 +99,10 @@ async def lifespan(app: FastAPI):
                         f"[db-pool] size={size} checked_out={checked_out} "
                         f"overflow={overflow} util={util_pct:.0f}%"
                     )
-                    if util_pct > 75:
+                    # Absolute floor as well as the utilisation ratio: with
+                    # max_overflow=60 the ratio never crossed 75% while 14
+                    # sessions sat wedged for 11 hours (2026-09-01).
+                    if util_pct > 75 or checked_out >= 10:
                         high_water_streak += 1
                         logger.warning(
                             f"{msg} HIGH (streak={high_water_streak}, threshold=4)"
@@ -107,7 +117,7 @@ async def lifespan(app: FastAPI):
                         # reliable way to find what's holding the sessions —
                         # the leaker shows up here with a non-trivial frame
                         # count and we can see exactly where it's stuck.
-                        if util_pct >= 90 and not task_dump_done:
+                        if (util_pct >= 90 or high_water_streak >= 4) and not task_dump_done:
                             task_dump_done = True
                             try:
                                 tasks = asyncio.all_tasks()
@@ -175,10 +185,13 @@ async def lifespan(app: FastAPI):
         else:
             logger.info("Audit scheduler skipped (non-Postgres DB — no Supabase tables)")
         pool_monitor_task = None
+        watchdog_task = None
 
     yield
 
     # Stop scheduler
+    if watchdog_task:
+        watchdog_task.cancel()
     if scheduler_task:
         stop_scheduler()
         scheduler_task.cancel()
@@ -344,22 +357,36 @@ async def health_check():
     
     active_jobs = len(job_processor.get_active_job_ids())
     db_ok = db_status == "healthy"
-    overall = "healthy" if db_ok else "unhealthy"
     scheduler_running = bool(getattr(app.state, "scheduler_running", False))
 
+    # A scheduler that stopped ticking is an outage for every audit, even
+    # though the API keeps answering. The static `scheduler_running` flag
+    # hid exactly that on 2026-09-01; report real liveness instead.
+    scheduler_info = None
+    scheduler_ok = True
+    if scheduler_running:
+        scheduler_info = get_scheduler_health()
+        stale = scheduler_info.get("stale_seconds")
+        scheduler_ok = bool(scheduler_info.get("alive")) and (
+            stale is None or stale <= WATCHDOG_STALE_S
+        )
+
+    overall = "healthy" if (db_ok and scheduler_ok) else "unhealthy"
     body = HealthResponse(
         status=overall,
         version=settings.app_version,
         database=db_status,
         active_jobs=active_jobs,
         worker_enabled=settings.worker_enabled,
-        scheduler_running=scheduler_running,
+        scheduler_running=scheduler_running and scheduler_ok,
+        scheduler=scheduler_info,
     )
-    # Return 503 when the DB is unreachable so uptime monitors, load
-    # balancers and Docker healthchecks (which key on the status CODE,
-    # not the JSON body) actually see the instance as down.
+    # Return 503 when the DB is unreachable or the scheduler loop is stale,
+    # so uptime monitors, load balancers and Docker healthchecks (which key
+    # on the status CODE, not the JSON body) actually see the instance as
+    # down.
     return JSONResponse(
-        status_code=status.HTTP_200_OK if db_ok else status.HTTP_503_SERVICE_UNAVAILABLE,
+        status_code=status.HTTP_200_OK if overall == "healthy" else status.HTTP_503_SERVICE_UNAVAILABLE,
         content=body.model_dump(),
     )
 

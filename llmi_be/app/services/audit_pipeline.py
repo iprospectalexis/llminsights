@@ -1003,12 +1003,15 @@ async def handle_polling(audit_id: str, worker_id: str) -> None:
             f"orphans={len(orphans)}"
         )
 
-        # Try to refresh metrics (non-fatal)
+        # Flag the audit for the scheduled MV refresh (non-fatal). The full
+        # refresh is NOT run here: it is a whole-view REFRESH CONCURRENTLY
+        # that serialises across concurrent audits and blew the client
+        # command timeout on every tick of a busy hour.
         phase = "refresh_metrics"
         try:
-            await db.refresh_audit_metrics(audit_id)
+            await db.enqueue_metrics_refresh(audit_id)
         except Exception as e:
-            logger.warning(f"[pipeline] Metrics refresh warning: {e}")
+            logger.warning(f"[pipeline] Metrics enqueue warning: {e}")
 
     except Exception as e:
         # Crash record goes to THREE places, none of which can mask the
@@ -2100,11 +2103,13 @@ async def process_step(audit: dict, worker_id: str) -> None:
         logger.warning(f"[pipeline] {audit_id}: no handler for state '{state}'")
         return
 
-    # NB: no asyncio.wait_for wrapper. With MAX_BATCHES_PER_INVOCATION bounded
-    # and OpenAI per-call timeout at 30s, handlers return in ≤ ~5 min even in
-    # the worst case. The real watchdog is the scheduler's 45-min
-    # `pipeline_state_entered_at` check (state-duration based), which catches
-    # genuine zombies without wasting in-flight OpenAI work.
+    # NB: no tight asyncio.wait_for here. With MAX_BATCHES_PER_INVOCATION
+    # bounded and OpenAI per-call timeout at 30s, handlers return in ≤ ~5 min
+    # even in the worst case. The scheduler's 45-min
+    # `pipeline_state_entered_at` check catches genuine zombies without
+    # wasting in-flight OpenAI work, and the scheduler wraps this call in a
+    # 40-min ceiling purely so a handler wedged on a dead DB connection
+    # cannot hold one of the three concurrency slots forever.
     try:
         await handler(audit_id, worker_id)
     except Exception as e:

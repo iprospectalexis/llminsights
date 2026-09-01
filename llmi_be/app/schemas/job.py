@@ -132,6 +132,9 @@ class HealthResponse(BaseModel):
     active_jobs: int
     worker_enabled: bool = True
     scheduler_running: bool = False
+    # Liveness of the scheduler loop (last tick age etc.); None on API-only
+    # instances. A stale loop turns the whole response into 503.
+    scheduler: Optional[dict] = None
 
 
 class WebhookPayload(BaseModel):
