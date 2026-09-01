@@ -451,7 +451,13 @@ async def _scheduler_tick():
         _in_flight.add(audit_id)
         try:
             async with _semaphore:
-                claimed = await audit_pipeline.try_claim(audit_id, WORKER_ID)
+                try:
+                    claimed = await audit_pipeline.try_claim(audit_id, WORKER_ID)
+                except Exception as e:
+                    # A DB timeout here is a routine retry-next-tick case, not
+                    # an unretrieved task exception in the log.
+                    logger.warning(f"Scheduler: claim failed for {audit_id}: {type(e).__name__}: {e}")
+                    return
                 if not claimed:
                     return  # Another worker/tick owns it
 
