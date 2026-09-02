@@ -33,6 +33,22 @@ interface TimeSeriesData {
   [llm: string]: string | number | undefined;
 }
 
+// Chart 4 — ChatGPT fan-out queries using the "site:" operator.
+interface SiteOperatorPoint {
+  date: string;
+  pct_queries: number;
+  pct_responses: number;
+  queries_total: number;
+  queries_with_site: number;
+  responses_total: number;
+  responses_with_site: number;
+}
+
+const SITE_SERIES: Record<string, { name: string; color: string }> = {
+  pct_queries: { name: 'Queries with "site:"', color: '#3b82f6' },
+  pct_responses: { name: 'Responses with ≥1 "site:" query', color: '#8b5cf6' },
+};
+
 export function BarometersPage() {
   const { isDarkMode } = useTheme();
   const [loading, setLoading] = useState(true);
@@ -41,12 +57,16 @@ export function BarometersPage() {
   const [webSearchCountData, setWebSearchCountData] = useState<TimeSeriesData[]>([]);
   const [webSearchLengthData, setWebSearchLengthData] = useState<TimeSeriesData[]>([]);
   const [webSearchTriggerPercentageData, setWebSearchTriggerPercentageData] = useState<TimeSeriesData[]>([]);
+  const [siteOperatorData, setSiteOperatorData] = useState<SiteOperatorPoint[]>([]);
 
   // State to track visible lines for each chart - default all LLMs to visible
   const defaultVisible = Object.keys(LLM_COLORS).reduce((acc, k) => ({ ...acc, [k]: true }), {} as Record<string, boolean>);
   const [visibleLinesCount, setVisibleLinesCount] = useState<{ [key: string]: boolean }>(defaultVisible);
   const [visibleLinesLength, setVisibleLinesLength] = useState<{ [key: string]: boolean }>(defaultVisible);
   const [visibleLinesTrigger, setVisibleLinesTrigger] = useState<{ [key: string]: boolean }>(defaultVisible);
+  const [visibleLinesSite, setVisibleLinesSite] = useState<{ [key: string]: boolean }>(
+    Object.keys(SITE_SERIES).reduce((acc, k) => ({ ...acc, [k]: true }), {} as Record<string, boolean>)
+  );
 
   // More discreet grid color in dark mode
   const gridColor = isDarkMode ? '#374151' : '#e5e7eb';
@@ -126,6 +146,25 @@ export function BarometersPage() {
         setWebSearchTriggerPercentageData(transformedTriggerPercentageData);
       }
 
+      // Share of ChatGPT fan-out queries using the "site:" operator per time period
+      const { data: siteData, error: siteError } = await supabase
+        .rpc('get_web_search_site_operator_by_time', { date_trunc_arg: dateTrunc });
+
+      if (siteError) {
+        console.error('Error fetching site: operator share:', siteError);
+        setSiteOperatorData([]);
+      } else {
+        setSiteOperatorData((siteData || []).map((r: any) => ({
+          date: r.time_period,
+          pct_queries: Number(r.pct_queries ?? 0),
+          pct_responses: Number(r.pct_responses ?? 0),
+          queries_total: Number(r.queries_total ?? 0),
+          queries_with_site: Number(r.queries_with_site ?? 0),
+          responses_total: Number(r.responses_total ?? 0),
+          responses_with_site: Number(r.responses_with_site ?? 0),
+        })));
+      }
+
     } catch (error) {
       console.error('Error fetching barometer data:', error);
     } finally {
@@ -188,6 +227,38 @@ export function BarometersPage() {
       ...prev,
       [dataKey]: !prev[dataKey],
     }));
+  };
+
+  const handleLegendClickSite = (dataKey: string) => {
+    setVisibleLinesSite((prev) => ({
+      ...prev,
+      [dataKey]: !prev[dataKey],
+    }));
+  };
+
+  // Tooltip for the "site:" chart: percentage plus the underlying counts.
+  const SiteTooltip = ({ active, payload, label }: any) => {
+    if (!active || !payload || !payload.length) return null;
+    const point: SiteOperatorPoint | undefined = payload[0]?.payload;
+    return (
+      <div className="bg-white dark:bg-gray-800 p-4 rounded-lg shadow-lg border border-gray-200 dark:border-gray-700">
+        <p className="font-semibold text-gray-900 dark:text-white mb-2">{label}</p>
+        {payload.map((entry: any, index: number) => {
+          const key = entry.dataKey as string;
+          const counts = point
+            ? key === 'pct_queries'
+              ? `${point.queries_with_site} of ${point.queries_total} queries`
+              : `${point.responses_with_site} of ${point.responses_total} responses`
+            : '';
+          return (
+            <p key={index} style={{ color: entry.color }} className="text-sm">
+              {SITE_SERIES[key]?.name ?? key}: {entry.value?.toFixed(1) ?? 'N/A'}%
+              {counts && <span className="text-gray-500 dark:text-gray-400"> ({counts})</span>}
+            </p>
+          );
+        })}
+      </div>
+    );
   };
 
   const CustomTooltip = ({ active, payload, label }: any) => {
@@ -447,6 +518,62 @@ export function BarometersPage() {
                           activeDot={{ r: 6 }}
                           connectNulls
                           hide={!visibleLinesTrigger[llm]}
+                        />
+                      ))}
+                    </LineChart>
+                  </ResponsiveContainer>
+                ) : (
+                  <div className="flex items-center justify-center h-64 text-gray-500 dark:text-gray-400">
+                    No data available for the selected time period
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          </motion.div>
+
+          {/* Chart 4: ChatGPT fan-out queries using the "site:" operator */}
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ delay: 0.4 }}
+          >
+            <Card>
+              <CardHeader>
+                <h3 className="text-xl font-semibold text-gray-900 dark:text-white">
+                  ChatGPT web search queries using the "site:" operator
+                </h3>
+                <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">
+                  Share of SearchGPT fan-out queries that restrict the search to a domain with "site:", and share of responses with at least one such query, over time
+                </p>
+              </CardHeader>
+              <CardContent>
+                {siteOperatorData.length > 0 ? (
+                  <ResponsiveContainer width="100%" height={400}>
+                    <LineChart data={siteOperatorData}>
+                      <CartesianGrid strokeDasharray="3 3" stroke={gridColor} />
+                      <XAxis
+                        dataKey="date"
+                        tickFormatter={formatXAxis}
+                        stroke="#6b7280"
+                      />
+                      <YAxis stroke="#6b7280" label={{ value: '%', position: 'insideLeft' }} />
+                      <Tooltip content={<SiteTooltip />} />
+                      <Legend
+                        formatter={(value) => SITE_SERIES[value as string]?.name || value}
+                        onClick={(e) => handleLegendClickSite(e.dataKey)}
+                        wrapperStyle={{ cursor: 'pointer' }}
+                      />
+                      {Object.keys(SITE_SERIES).map((key) => (
+                        <Line
+                          key={key}
+                          type="monotone"
+                          dataKey={key}
+                          stroke={SITE_SERIES[key].color}
+                          strokeWidth={2}
+                          dot={{ r: 4 }}
+                          activeDot={{ r: 6 }}
+                          connectNulls
+                          hide={!visibleLinesSite[key]}
                         />
                       ))}
                     </LineChart>
