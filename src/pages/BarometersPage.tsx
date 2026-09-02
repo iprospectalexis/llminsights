@@ -58,6 +58,9 @@ export function BarometersPage() {
   const [webSearchLengthData, setWebSearchLengthData] = useState<TimeSeriesData[]>([]);
   const [webSearchTriggerPercentageData, setWebSearchTriggerPercentageData] = useState<TimeSeriesData[]>([]);
   const [siteOperatorData, setSiteOperatorData] = useState<SiteOperatorPoint[]>([]);
+  // Chart 5 — share of responses citing reddit.com, per LLM (same row shape
+  // as the other per-LLM charts: time_period / llm / value).
+  const [redditShareData, setRedditShareData] = useState<TimeSeriesData[]>([]);
 
   // State to track visible lines for each chart - default all LLMs to visible
   const defaultVisible = Object.keys(LLM_COLORS).reduce((acc, k) => ({ ...acc, [k]: true }), {} as Record<string, boolean>);
@@ -67,6 +70,7 @@ export function BarometersPage() {
   const [visibleLinesSite, setVisibleLinesSite] = useState<{ [key: string]: boolean }>(
     Object.keys(SITE_SERIES).reduce((acc, k) => ({ ...acc, [k]: true }), {} as Record<string, boolean>)
   );
+  const [visibleLinesReddit, setVisibleLinesReddit] = useState<{ [key: string]: boolean }>(defaultVisible);
 
   // More discreet grid color in dark mode
   const gridColor = isDarkMode ? '#374151' : '#e5e7eb';
@@ -165,6 +169,17 @@ export function BarometersPage() {
         })));
       }
 
+      // Share of responses citing reddit.com per LLM per time period
+      const { data: redditData, error: redditError } = await supabase
+        .rpc('get_domain_citation_share_by_time', { date_trunc_arg: dateTrunc, p_domain: 'reddit.com' });
+
+      if (redditError) {
+        console.error('Error fetching reddit.com citation share:', redditError);
+        setRedditShareData([]);
+      } else {
+        setRedditShareData(transformData(redditData || []));
+      }
+
     } catch (error) {
       console.error('Error fetching barometer data:', error);
     } finally {
@@ -231,6 +246,13 @@ export function BarometersPage() {
 
   const handleLegendClickSite = (dataKey: string) => {
     setVisibleLinesSite((prev) => ({
+      ...prev,
+      [dataKey]: !prev[dataKey],
+    }));
+  };
+
+  const handleLegendClickReddit = (dataKey: string) => {
+    setVisibleLinesReddit((prev) => ({
       ...prev,
       [dataKey]: !prev[dataKey],
     }));
@@ -574,6 +596,62 @@ export function BarometersPage() {
                           activeDot={{ r: 6 }}
                           connectNulls
                           hide={!visibleLinesSite[key]}
+                        />
+                      ))}
+                    </LineChart>
+                  </ResponsiveContainer>
+                ) : (
+                  <div className="flex items-center justify-center h-64 text-gray-500 dark:text-gray-400">
+                    No data available for the selected time period
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          </motion.div>
+
+          {/* Chart 5: Share of responses citing reddit.com */}
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ delay: 0.5 }}
+          >
+            <Card>
+              <CardHeader>
+                <h3 className="text-xl font-semibold text-gray-900 dark:text-white">
+                  Reddit.com citation share
+                </h3>
+                <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">
+                  Percentage of responses with citations that cite reddit.com (any subdomain) per LLM over time
+                </p>
+              </CardHeader>
+              <CardContent>
+                {redditShareData.length > 0 ? (
+                  <ResponsiveContainer width="100%" height={400}>
+                    <LineChart data={redditShareData}>
+                      <CartesianGrid strokeDasharray="3 3" stroke={gridColor} />
+                      <XAxis
+                        dataKey="date"
+                        tickFormatter={formatXAxis}
+                        stroke="#6b7280"
+                      />
+                      <YAxis stroke="#6b7280" label={{ value: '%', position: 'insideLeft' }} />
+                      <Tooltip content={<CustomTooltip />} />
+                      <Legend
+                        formatter={(value) => LLM_NAMES[value as keyof typeof LLM_NAMES] || value}
+                        onClick={(e) => handleLegendClickReddit(e.dataKey)}
+                        wrapperStyle={{ cursor: 'pointer' }}
+                      />
+                      {Object.keys(LLM_COLORS).map((llm) => (
+                        <Line
+                          key={llm}
+                          type="monotone"
+                          dataKey={llm}
+                          stroke={LLM_COLORS[llm as keyof typeof LLM_COLORS]}
+                          strokeWidth={2}
+                          dot={{ r: 4 }}
+                          activeDot={{ r: 6 }}
+                          connectNulls
+                          hide={!visibleLinesReddit[llm]}
                         />
                       ))}
                     </LineChart>
