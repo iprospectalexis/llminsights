@@ -15,6 +15,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -1070,6 +1071,59 @@ async def _get_audit_run_by(audit_id: str) -> Optional[str]:
 
 BATCH_APPLIED = "applied"
 
+# Terminal batch statuses whose output file (when present) carries results:
+# 'completed' all of them, 'expired' / 'cancelled' the ones done in time.
+BATCH_STATUSES_WITH_RESULTS = ("completed", "expired", "cancelled")
+
+
+async def _batch_still_pending(audit_id: str, step: str, batch, batch_id: str) -> bool:
+    """Shared polling rule for the two batch stages. Returns True while the
+    handler must keep waiting (a heartbeat has been written), False when the
+    batch reached a terminal status and its output should be applied.
+
+    Time box: OpenAI's 24h completion window is a ceiling, not a promise —
+    from 2026-09-03 batches took 7-15h or expired at 24h with half the
+    requests done, and every scheduled audit auto-failed at the pipeline's
+    6h zombie ceiling. Past `openai_batch_max_wait_hours` the batch is
+    cancelled; what it completed so far is applied on the next tick and the
+    remaining rows go through the live path (full price, minutes).
+    """
+    status = getattr(batch, "status", "unknown")
+    counts = getattr(batch, "request_counts", None)
+    done = getattr(counts, "completed", 0) if counts else 0
+    total_reqs = getattr(counts, "total", 0) if counts else 0
+
+    if status in ("validating", "in_progress", "finalizing"):
+        created = getattr(batch, "created_at", None) or 0
+        age_h = (time.time() - created) / 3600 if created else 0.0
+        max_wait = float(getattr(settings, "openai_batch_max_wait_hours", 2.0) or 0)
+        if status != "finalizing" and max_wait >= 0 and age_h >= max_wait:
+            logger.warning(
+                f"[pipeline] {audit_id}: {step} batch {batch_id} still '{status}' "
+                f"after {age_h:.1f}h ({done}/{total_reqs} done) — cancelling, "
+                "partial results will be applied and the rest processed live"
+            )
+            try:
+                await openai_client.cancel_batch(batch_id)
+            except Exception as e:  # already cancelling / transient API error
+                logger.warning(f"[pipeline] {audit_id}: {step} batch cancel request failed: {e}")
+            msg = f"OpenAI batch cancelled after {age_h:.1f}h: {done}/{total_reqs} done, rest live"
+        else:
+            msg = f"OpenAI batch {status}: {done}/{total_reqs} (age {age_h:.1f}h, limit {max_wait:g}h)"
+        await db.update_audit_step(audit_id, step, {"status": "running", "message": msg})
+        await _heartbeat(audit_id)
+        return True
+
+    if status == "cancelling":
+        await db.update_audit_step(audit_id, step, {
+            "status": "running",
+            "message": f"OpenAI batch cancelling: {done}/{total_reqs} done, rest will run live",
+        })
+        await _heartbeat(audit_id)
+        return True
+
+    return False
+
 
 def _use_openai_batch(audit_row: dict) -> bool:
     return bool(
@@ -1157,21 +1211,14 @@ async def _competitors_via_batch(audit_id: str, audit: dict, pending: list[dict]
         return True
 
     status = getattr(batch, "status", "unknown")
-    if status in ("validating", "in_progress", "finalizing", "cancelling"):
-        counts = getattr(batch, "request_counts", None)
-        done = getattr(counts, "completed", 0) if counts else 0
-        total_reqs = getattr(counts, "total", 0) if counts else 0
-        await db.update_audit_step(audit_id, "competitors", {
-            "status": "running",
-            "message": f"OpenAI batch {status}: {done}/{total_reqs}",
-        })
-        await _heartbeat(audit_id)
+    if await _batch_still_pending(audit_id, "competitors", batch, batch_id):
         return True
 
     ok: dict = {}
     errs: dict = {}
-    if status in ("completed", "expired"):
-        # An expired batch still carries partial results in its output file.
+    if status in BATCH_STATUSES_WITH_RESULTS:
+        # Expired / cancelled batches still carry partial results in their
+        # output file.
         try:
             ok, errs = await openai_client.download_batch_results(
                 batch, _ctx=cost_ctx, _operation="competitors_extract_batch"
@@ -1322,20 +1369,12 @@ async def _sentiment_via_batch(
         return True
 
     status = getattr(batch, "status", "unknown")
-    if status in ("validating", "in_progress", "finalizing", "cancelling"):
-        counts = getattr(batch, "request_counts", None)
-        done = getattr(counts, "completed", 0) if counts else 0
-        total_reqs = getattr(counts, "total", 0) if counts else 0
-        await db.update_audit_step(audit_id, "sentiment", {
-            "status": "running",
-            "message": f"OpenAI batch {status}: {done}/{total_reqs}",
-        })
-        await _heartbeat(audit_id)
+    if await _batch_still_pending(audit_id, "sentiment", batch, batch_id):
         return True
 
     ok: dict = {}
     errs: dict = {}
-    if status in ("completed", "expired"):
+    if status in BATCH_STATUSES_WITH_RESULTS:
         try:
             ok, errs = await openai_client.download_batch_results(
                 batch, _ctx=cost_ctx, _operation="sentiment_analyze_batch"

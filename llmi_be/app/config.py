@@ -69,6 +69,11 @@ class Settings(BaseSettings):
     openai_batch_for_scheduled: bool = True
     # Below this many pending rows a batch isn't worth the latency — use live.
     openai_batch_min_rows: int = 8
+    # Time box for a scheduled audit's OpenAI batch: past this age the batch is
+    # cancelled, its partial output applied and the rest processed live.
+    # 2026-09-03..07: batches took 7-15h or expired at 24h half-done while
+    # the pipeline waited at most 6h -> every scheduled audit auto-failed.
+    openai_batch_max_wait_hours: float = 2.0
 
     # OneSearch API (self or remote backend)
     onesearch_api_url: str = "http://localhost:8000"

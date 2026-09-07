@@ -230,6 +230,13 @@ async def retrieve_batch(batch_id: str):
     return await _client.batches.retrieve(batch_id)
 
 
+async def cancel_batch(batch_id: str):
+    """Ask OpenAI to cancel a batch. The status goes 'cancelling' → 'cancelled'
+    (up to ~10 min) and the output file then holds every request that had
+    completed by then, so partial results stay usable."""
+    return await _client.batches.cancel(batch_id)
+
+
 async def download_batch_results(
     batch,
     _ctx: Optional[dict] = None,

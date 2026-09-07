@@ -380,10 +380,16 @@ async def _scheduler_tick():
                         finished_at = now(),
                         locked_by = NULL,
                         locked_at = NULL,
-                        error_message = COALESCE(
-                            error_message,
-                            'Auto-failed: stuck in ' || pipeline_state || ' for >45min (handler loop)'
-                        )
+                        -- Always the real reason: COALESCE kept an older
+                        -- polling note ("... re-triggered on brightdata") and
+                        -- hid the batch ceiling on the Status page (2026-09-06).
+                        error_message = CASE
+                            WHEN (competitors_batch_id IS NOT NULL AND competitors_batch_id <> 'applied')
+                              OR (sentiment_batch_id IS NOT NULL AND sentiment_batch_id <> 'applied')
+                            THEN 'Auto-failed: stuck in ' || pipeline_state
+                                 || ' for >8h waiting on an OpenAI batch that never finished'
+                            ELSE 'Auto-failed: stuck in ' || pipeline_state || ' for >45min (handler loop)'
+                        END
                     WHERE pipeline_state IN ('extracting_competitors','analyzing_sentiment','finalizing')
                       AND pipeline_state_entered_at IS NOT NULL
                       AND pipeline_state_entered_at < now() - interval '45 minutes'
@@ -392,13 +398,15 @@ async def _scheduler_tick():
                       -- the handler heartbeats on every poll. Scheduled audits
                       -- were auto-failed at 45 min while their batches went on
                       -- to complete successfully (2026-08-25: 4 audits).
-                      -- Batch-waiting audits get a 6h ceiling instead.
+                      -- Batch-waiting audits get an 8h ceiling instead — a pure backstop
+                      -- now that _batch_still_pending() cancels a batch after
+                      -- openai_batch_max_wait_hours (2h) and finishes live.
                       AND (
                         (
                           (competitors_batch_id IS NULL OR competitors_batch_id = 'applied')
                           AND (sentiment_batch_id IS NULL OR sentiment_batch_id = 'applied')
                         )
-                        OR pipeline_state_entered_at < now() - interval '6 hours'
+                        OR pipeline_state_entered_at < now() - interval '8 hours'
                       )
                     RETURNING id, pipeline_state
                 """))
