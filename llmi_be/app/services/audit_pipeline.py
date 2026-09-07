@@ -1076,6 +1076,19 @@ BATCH_APPLIED = "applied"
 BATCH_STATUSES_WITH_RESULTS = ("completed", "expired", "cancelled")
 
 
+def _batch_applied_patch(column: str) -> dict:
+    """Mark a stage's batch as consumed AND restart the state clock.
+
+    Once the batch id reads 'applied' the zombie sweep judges the audit by
+    its 45-min rule again; without re-stamping pipeline_state_entered_at
+    (set when the stage was entered, hours earlier while the batch waited)
+    the audit was killed on the next sweep, seconds after its batch results
+    were applied and before the live remainder could finish
+    (2026-09-07 08:36: two audits with sentiment 100% done).
+    """
+    return {column: BATCH_APPLIED, "pipeline_state_entered_at": datetime.now(timezone.utc)}
+
+
 async def _batch_still_pending(audit_id: str, step: str, batch, batch_id: str) -> bool:
     """Shared polling rule for the two batch stages. Returns True while the
     handler must keep waiting (a heartbeat has been written), False when the
@@ -1177,7 +1190,7 @@ async def _competitors_via_batch(audit_id: str, audit: dict, pending: list[dict]
         if prefilter_updates:
             await db.update_competitors_batch(prefilter_updates)
         if not lines:
-            await db.update_audit(audit_id, {"competitors_batch_id": BATCH_APPLIED})
+            await db.update_audit(audit_id, _batch_applied_patch("competitors_batch_id"))
             return True
         new_id = await openai_client.create_batch(lines)
         await db.update_audit(audit_id, {"competitors_batch_id": new_id})
@@ -1207,7 +1220,7 @@ async def _competitors_via_batch(audit_id: str, audit: dict, pending: list[dict]
             f"[pipeline] {audit_id}: competitors batch retrieve failed "
             f"({batch_id}): {e} — falling back to live"
         )
-        await db.update_audit(audit_id, {"competitors_batch_id": BATCH_APPLIED})
+        await db.update_audit(audit_id, _batch_applied_patch("competitors_batch_id"))
         return True
 
     status = getattr(batch, "status", "unknown")
@@ -1248,7 +1261,7 @@ async def _competitors_via_batch(audit_id: str, audit: dict, pending: list[dict]
     for i in range(0, len(updates), CHUNK):
         await db.update_competitors_batch(updates[i:i + CHUNK])
 
-    await db.update_audit(audit_id, {"competitors_batch_id": BATCH_APPLIED})
+    await db.update_audit(audit_id, _batch_applied_patch("competitors_batch_id"))
     total = audit.get("competitors_total") or len(pending)
     await update_progress_counters(
         audit_id,
@@ -1335,7 +1348,7 @@ async def _sentiment_via_batch(
         if immediate_legacy:
             await db.update_sentiment_batch(immediate_legacy)
         if not lines:
-            await db.update_audit(audit_id, {"sentiment_batch_id": BATCH_APPLIED})
+            await db.update_audit(audit_id, _batch_applied_patch("sentiment_batch_id"))
             return True
         new_id = await openai_client.create_batch(lines)
         await db.update_audit(audit_id, {"sentiment_batch_id": new_id})
@@ -1365,7 +1378,7 @@ async def _sentiment_via_batch(
             f"[pipeline] {audit_id}: sentiment batch retrieve failed "
             f"({batch_id}): {e} — falling back to live"
         )
-        await db.update_audit(audit_id, {"sentiment_batch_id": BATCH_APPLIED})
+        await db.update_audit(audit_id, _batch_applied_patch("sentiment_batch_id"))
         return True
 
     status = getattr(batch, "status", "unknown")
@@ -1422,7 +1435,7 @@ async def _sentiment_via_batch(
     for i in range(0, len(flat_legacy), CHUNK):
         await db.update_sentiment_batch(flat_legacy[i:i + CHUNK])
 
-    await db.update_audit(audit_id, {"sentiment_batch_id": BATCH_APPLIED})
+    await db.update_audit(audit_id, _batch_applied_patch("sentiment_batch_id"))
     total = audit.get("sentiment_total") or len(pending)
     await update_progress_counters(
         audit_id,
