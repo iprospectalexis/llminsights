@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from typing import Any, Optional
 
@@ -26,6 +27,8 @@ logger = logging.getLogger(__name__)
 _RATES_CACHE: dict[tuple[str, str | None, str], dict[str, float]] = {}
 _RATES_CACHE_AT: dict[tuple[str, str | None, str], float] = {}
 _RATES_TTL_SECONDS = 300  # 5 min
+# "gpt-5-mini-2025-08-07" -> "gpt-5-mini" (dated snapshot names in batch output files)
+_MODEL_SNAPSHOT_RE = re.compile(r"-d{4}-d{2}-d{2}$")
 _RATES_LOCK = asyncio.Lock()
 
 
@@ -130,6 +133,13 @@ async def record_openai_call(
         pass
 
     rates = await _get_rates("openai", model, "chat")
+    if not rates:
+        # Batch output files name the dated snapshot ("gpt-5-mini-2025-08-07")
+        # while rates are keyed by the alias ("gpt-5-mini"); without this
+        # fallback every batch sentiment line was recorded at $0.
+        base = _MODEL_SNAPSHOT_RE.sub("", model or "")
+        if base and base != model:
+            rates = await _get_rates("openai", base, "chat")
     # Cached input tokens (when present) are billed at a discounted rate.
     # OpenAI reports prompt_tokens as the TOTAL input including cached, so we
     # subtract the cached portion from the full-rate billing.
@@ -140,6 +150,9 @@ async def record_openai_call(
         + cached          * rates.get("token_cached_input", 0.0)
         + completion_tokens * rates.get("token_output",     0.0)
     )
+    # Batch API lines are billed at 50% of the live price.
+    if metadata and metadata.get("batch"):
+        cost *= 0.5
 
     await _insert_event(
         audit_id=_ctx_value(ctx, "audit_id"),
