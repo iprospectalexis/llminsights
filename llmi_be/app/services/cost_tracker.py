@@ -28,7 +28,7 @@ _RATES_CACHE: dict[tuple[str, str | None, str], dict[str, float]] = {}
 _RATES_CACHE_AT: dict[tuple[str, str | None, str], float] = {}
 _RATES_TTL_SECONDS = 300  # 5 min
 # "gpt-5-mini-2025-08-07" -> "gpt-5-mini" (dated snapshot names in batch output files)
-_MODEL_SNAPSHOT_RE = re.compile(r"-d{4}-d{2}-d{2}$")
+_MODEL_SNAPSHOT_RE = re.compile(r"-\d{4}-\d{2}-\d{2}$")
 _RATES_LOCK = asyncio.Lock()
 
 
