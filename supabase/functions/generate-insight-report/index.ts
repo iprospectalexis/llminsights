@@ -245,15 +245,42 @@ async function generateBrandStrengthsReport(
     throw new Error(`No responses found for LLM: ${targetLlm}`);
   }
 
-  // Build prompt-answer pairs
-  const promptAnswerPairs = llmResponses.map(r => ({
-    prompt_id: r.prompt_id,
+  // Build prompt-answer pairs. Only what the analysis needs: the prompt, the
+  // answer and the brand names (answer_competitors carries per-brand
+  // metadata objects that only inflate the payload).
+  const brandNames = (v: any): string[] => {
+    if (!Array.isArray(v)) return [];
+    return v
+      .map((c: any) => (typeof c === 'string' ? c : c?.brand || c?.name || ''))
+      .filter((s: string) => typeof s === 'string' && s.length > 0);
+  };
+  let promptAnswerPairs = llmResponses.map(r => ({
     prompt_text: r.prompts?.prompt_text || '',
-    llm: r.llm,
-    audit_id: r.audit_id,
-    answer_text: r.answer_text,
-    answer_competitors: r.answer_competitors || []
+    answer_text: r.answer_text || '',
+    brands: brandNames(r.answer_competitors),
   }));
+
+  // Bound the input. A 180-prompt audit of long ChatGPT answers is ~1.1M
+  // characters of answer text; serialised with indentation it blew past the
+  // model's context window and OpenAI answered 400 (2026-09-14). Budget in
+  // characters (~3.5 chars per token in French): keep every prompt, but cap
+  // each answer to an equal share of the budget, keeping its beginning —
+  // the part that carries the recommendation and the brands named first.
+  const MAX_DATA_CHARS = 550_000;
+  const baseChars = promptAnswerPairs.reduce(
+    (n, p) => n + p.prompt_text.length + p.brands.join(', ').length + 60, 0,
+  );
+  const answerBudget = Math.max(MAX_DATA_CHARS - baseChars, 100_000);
+  const perAnswerCap = Math.max(600, Math.floor(answerBudget / Math.max(promptAnswerPairs.length, 1)));
+  let truncated = 0;
+  promptAnswerPairs = promptAnswerPairs.map(p => {
+    if (p.answer_text.length <= perAnswerCap) return p;
+    truncated++;
+    return { ...p, answer_text: p.answer_text.slice(0, perAnswerCap) + ' […]' };
+  });
+  if (truncated > 0) {
+    console.log(`Input bounded: ${truncated}/${promptAnswerPairs.length} answers truncated to ${perAnswerCap} chars`);
+  }
 
   // Extract unique competitors from answer_competitors
   const competitorsSet = new Set<string>();
@@ -292,8 +319,8 @@ DONNÉES D'ENTRÉE :
 - Nombre de réponses analysées: ${promptAnswerPairs.length}
 - Tokens analysés: ${approximateTokenCount.toLocaleString()}
 
-PROMPT-ANSWER PAIRS:
-${JSON.stringify(promptAnswerPairs, null, 2)}
+PROMPT-ANSWER PAIRS (JSON: prompt_text, answer_text, brands):
+${JSON.stringify(promptAnswerPairs)}
 
 STRUCTURE DU RAPPORT (OBLIGATOIRE):
 
@@ -371,7 +398,15 @@ IMPORTANT: Ne retournez PAS de markdown (\`\`\`json), PAS de texte explicatif, U
   if (!response.ok) {
     const error = await response.text();
     console.error('OpenAI API Error:', error);
-    throw new Error(`OpenAI API Error: ${response.status} ${response.statusText}`);
+    // Surface OpenAI's own reason (e.g. context_length_exceeded) in the
+    // report's error_message instead of a bare "400 Bad Request".
+    let reason = '';
+    try {
+      reason = JSON.parse(error)?.error?.message || '';
+    } catch (_) { /* not JSON */ }
+    throw new Error(
+      `OpenAI API Error: ${response.status} ${response.statusText}` + (reason ? ` — ${reason.slice(0, 300)}` : '')
+    );
   }
 
   const data = await response.json();
