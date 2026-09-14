@@ -179,6 +179,8 @@ Deno.serve(async (req: Request) => {
         status: 'completed',
         report_content: reportContent,
         completed_at: new Date().toISOString(),
+        // A regenerated report must not keep the error of a previous attempt.
+        error_message: null,
       })
       .eq('id', reportId);
 
