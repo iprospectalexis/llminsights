@@ -1759,11 +1759,11 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
 
     // Same cited-tier rules as the tables themselves.
     const isCited = (c: any) => {
-      if (filters.llms === 'searchgpt') return c.cited === true;
+      if (filters.llms === 'searchgpt') return c.cited !== false;
       if (filters.llms === 'all') {
-        return c.llm === 'searchgpt' ? c.cited === true : (c.cited === true || c.cited == null);
+        return c.cited !== false;
       }
-      return c.cited === true || c.cited == null;
+      return c.cited !== false;
     };
 
     // Count RESPONSES citing the item (unique audit-prompt-llm), not raw
@@ -3007,7 +3007,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
           const llmCitations = filteredCitations.filter(citation =>
             citation.prompt_id === prompt.id &&
             citation.llm === llm &&
-            citation.cited === true
+            citation.cited !== false
           );
           citationsByLlm[llm] = llmCitations.length;
         });
@@ -3247,10 +3247,10 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
         const cited = new Set<string>();
         const more = new Set<string>();
         if (r.llm === 'searchgpt') {
-          cites.filter((c: any) => c?.cited === true).forEach((c: any) => url(c) && cited.add(url(c)));
+          cites.filter((c: any) => c?.cited !== false).forEach((c: any) => url(c) && cited.add(url(c)));
           asArray(r.links_attached).forEach((l: any) => l?.url && cited.add(l.url));
         } else {
-          cites.filter((c: any) => c?.cited === true || c?.cited == null).forEach((c: any) => url(c) && cited.add(url(c)));
+          cites.filter((c: any) => c?.cited !== false.forEach((c: any) => url(c) && cited.add(url(c)));
         }
         cites.filter((c: any) => c?.cited === false).forEach((c: any) => url(c) && more.add(url(c)));
         let citedText = Array.from(cited).join('; ');
@@ -3351,9 +3351,9 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     return citations.some(citation => {
       if (!citation.llm || citation.llm !== llm || !citation.domain) return false;
 
-      // For SearchGPT: only show icon if cited=true
+      // Cited tier = cited true or NULL (the provider omits the flag on in-answer links); only cited=false ("More" tier) is excluded
       // For other LLMs: show icon if cited=true or cited=null
-      if (llm === 'searchgpt' && citation.cited !== true) {
+      if (llm === 'searchgpt' && citation.cited === false) {
         return false;
       }
 
@@ -3428,20 +3428,18 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
       }
 
       // Apply counting logic based on current filter
-      // When filter is SearchGPT: only count cited=true
+      // Cited tier = cited true or NULL for every LLM (NULL = provider omitted the flag)
       // When filter is other LLMs or All: count cited=true or null/undefined
       let shouldCountAsCited = false;
       if (filters.llms === 'searchgpt') {
-        // SearchGPT filter: only count cited=true
-        shouldCountAsCited = citation.cited === true;
+        // SearchGPT filter: cited true or NULL
+        shouldCountAsCited = citation.cited !== false;
       } else if (filters.llms === 'all') {
         // All LLMs: apply per-LLM rules for proper summation
-        shouldCountAsCited = citation.llm === 'searchgpt'
-          ? citation.cited === true
-          : (citation.cited === true || citation.cited == null); // Use == to catch both null and undefined
+        shouldCountAsCited = citation.cited !== false; // Use == to catch both null and undefined
       } else {
         // Perplexity or Gemini: count cited=true or null/undefined
-        shouldCountAsCited = (citation.cited === true || citation.cited == null); // Use == to catch both null and undefined
+        shouldCountAsCited = citation.cited !== false; // Use == to catch both null and undefined
       }
 
       if (shouldCountAsCited) {
@@ -3581,11 +3579,11 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
     const windowIds = new Set(audits.map(a => a.id));
 
     const isCited = (c: any) => {
-      if (filters.llms === 'searchgpt') return c.cited === true;
+      if (filters.llms === 'searchgpt') return c.cited !== false;
       if (filters.llms === 'all') {
-        return c.llm === 'searchgpt' ? c.cited === true : (c.cited === true || c.cited == null);
+        return c.cited !== false;
       }
-      return c.cited === true || c.cited == null;
+      return c.cited !== false;
     };
 
     const catOf = new Map<string, string>();
@@ -3846,20 +3844,18 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
       }
 
       // Apply counting logic based on current filter
-      // When filter is SearchGPT: only count cited=true
+      // Cited tier = cited true or NULL for every LLM (NULL = provider omitted the flag)
       // When filter is other LLMs or All: count cited=true or null/undefined
       let shouldCountAsCited = false;
       if (filters.llms === 'searchgpt') {
-        // SearchGPT filter: only count cited=true
-        shouldCountAsCited = citation.cited === true;
+        // SearchGPT filter: cited true or NULL
+        shouldCountAsCited = citation.cited !== false;
       } else if (filters.llms === 'all') {
         // All LLMs: apply per-LLM rules for proper summation
-        shouldCountAsCited = citation.llm === 'searchgpt'
-          ? citation.cited === true
-          : (citation.cited === true || citation.cited == null); // Use == to catch both null and undefined
+        shouldCountAsCited = citation.cited !== false; // Use == to catch both null and undefined
       } else {
         // Perplexity or Gemini: count cited=true or null/undefined
-        shouldCountAsCited = (citation.cited === true || citation.cited == null); // Use == to catch both null and undefined
+        shouldCountAsCited = citation.cited !== false; // Use == to catch both null and undefined
       }
 
       if (shouldCountAsCited) {
@@ -3890,13 +3886,11 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
 
             let shouldCountAsCited = false;
             if (filters.llms === 'searchgpt') {
-              shouldCountAsCited = c.cited === true;
+              shouldCountAsCited = c.cited !== false;
             } else if (filters.llms === 'all') {
-              shouldCountAsCited = c.llm === 'searchgpt'
-                ? c.cited === true
-                : (c.cited === true || c.cited == null); // Use == to catch both null and undefined
+              shouldCountAsCited = c.cited !== false; // Use == to catch both null and undefined
             } else {
-              shouldCountAsCited = (c.cited === true || c.cited == null); // Use == to catch both null and undefined
+              shouldCountAsCited = c.cited !== false; // Use == to catch both null and undefined
             }
 
             return shouldCountAsCited;
@@ -3921,13 +3915,11 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
 
             let shouldCountAsCited = false;
             if (filters.llms === 'searchgpt') {
-              shouldCountAsCited = c.cited === true;
+              shouldCountAsCited = c.cited !== false;
             } else if (filters.llms === 'all') {
-              shouldCountAsCited = c.llm === 'searchgpt'
-                ? c.cited === true
-                : (c.cited === true || c.cited == null); // Use == to catch both null and undefined
+              shouldCountAsCited = c.cited !== false; // Use == to catch both null and undefined
             } else {
-              shouldCountAsCited = (c.cited === true || c.cited == null); // Use == to catch both null and undefined
+              shouldCountAsCited = c.cited !== false; // Use == to catch both null and undefined
             }
 
             return shouldCountAsCited;
@@ -6454,11 +6446,9 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                                 if (!citation.url) return false;
                                 try {
                                   const citationDomain = new URL(citation.url).hostname.replace('www.', '');
-                                  // For SearchGPT: only cited=true counts
-                                  // For other LLMs: cited=true or cited=null/undefined counts
-                                  const shouldCount = llm === 'searchgpt'
-                                    ? citation.cited === true
-                                    : (citation.cited === true || citation.cited == null);
+                                  // Cited tier = cited true or NULL for every LLM (the
+                                  // provider omits the flag on in-answer links).
+                                  const shouldCount = citation.cited !== false;
                                   return citationDomain === projectDomain && shouldCount;
                                 } catch {
                                   return false;

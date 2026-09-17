@@ -150,7 +150,11 @@ def collect_citations(result: dict, response: dict) -> list[dict]:
             url = link.get("url", "")
             if url:
                 seen_urls.add(url)
-            _add(url, link.get("text") or link.get("title"), link.get("position", i + 1), link.get("cited"))
+            # links_attached ARE the sources used in the answer. Since
+            # 2026-08-31 the provider omits the `cited` key on them, which
+            # stored NULL and made every SearchGPT citation invisible to the
+            # dashboards' cited counts. Default to cited unless flagged false.
+            _add(url, link.get("text") or link.get("title"), link.get("position", i + 1), link.get("cited", True))
         more_pos = 0
         for src in result.get("search_sources_more") or []:
             url = src.get("url", "")
