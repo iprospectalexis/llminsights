@@ -3250,7 +3250,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
           cites.filter((c: any) => c?.cited !== false).forEach((c: any) => url(c) && cited.add(url(c)));
           asArray(r.links_attached).forEach((l: any) => l?.url && cited.add(l.url));
         } else {
-          cites.filter((c: any) => c?.cited !== false.forEach((c: any) => url(c) && cited.add(url(c)));
+          cites.filter((c: any) => c?.cited !== false).forEach((c: any) => url(c) && cited.add(url(c)));
         }
         cites.filter((c: any) => c?.cited === false).forEach((c: any) => url(c) && more.add(url(c)));
         let citedText = Array.from(cited).join('; ');
