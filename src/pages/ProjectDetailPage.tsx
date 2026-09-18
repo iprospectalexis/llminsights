@@ -4349,44 +4349,35 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
         ? d === projectDomain || d.endsWith(`.${projectDomain}`)
         : d === projectDomain;
     };
-    const hostOf = (url: string): string => {
-      try { return new URL(url).hostname.toLowerCase().replace(/^www\./, ''); }
-      catch { return ''; }
-    };
 
     // (audit, prompt, llm) triples that have a project-domain citation
-    // (cited !== false) in the citations table.
+    // (cited !== false) in the citations table. Orphaned rows (their prompt
+    // was deleted, prompt_id NULL) are skipped: every orphan of one audit+LLM
+    // shares the key `audit|null|llm`, so one citing orphan used to mark all
+    // of them as cited (Picto 2026-09-18: +25 per audit and LLM).
     const citedByKey = new Set<string>();
     filteredCitations.forEach((c: any) => {
       if (c.cited === false) return;
+      if (!c.audit_id || !c.prompt_id) return;
       if (!matchesProject(c.domain)) return;
       citedByKey.add(`${c.audit_id}|${c.prompt_id}|${c.llm}`);
     });
 
+    // Same base and rules as the Citation Rate / Mention Rate cards, so the
+    // columns add up to the cards: answered responses to prompts that still
+    // exist in the project, cited only through a citations-table row. The
+    // former links_attached / all_sources fallbacks are gone — all_sources
+    // holds consulted-but-not-cited sources (AI Overview organic results,
+    // Perplexity search results) that the cards never counted.
+    uniqueLlms.forEach(llm => {
+      metricsByLlm[llm] = { totalResponses: 0, citedCount: 0, mentionedCount: 0 };
+    });
     filteredLlmResponses.forEach((response: any) => {
+      if (!response.audit_id || !response.prompt_id || !isAnswered(response)) return;
       const llm = response.llm;
-      let m = metricsByLlm[llm];
-      if (!m) m = metricsByLlm[llm] = { totalResponses: 0, citedCount: 0, mentionedCount: 0 };
+      const m = metricsByLlm[llm];
       m.totalResponses++;
-
-      let cited = citedByKey.has(`${response.audit_id}|${response.prompt_id}|${llm}`);
-      if (!cited && llm === 'searchgpt' && Array.isArray(response.links_attached)) {
-        cited = response.links_attached.some((link: any) =>
-          link?.url && matchesProject(hostOf(link.url)));
-      }
-      if (!cited && response.all_sources) {
-        try {
-          const sources = Array.isArray(response.all_sources)
-            ? response.all_sources : JSON.parse(response.all_sources);
-          cited = sources.some((source: any) => {
-            if (source?.domain) return matchesProject(source.domain);
-            if (source?.url) return matchesProject(hostOf(source.url));
-            return false;
-          });
-        } catch { /* malformed all_sources — treated as not cited, as before */ }
-      }
-      if (cited) m.citedCount++;
-
+      if (citedByKey.has(`${response.audit_id}|${response.prompt_id}|${llm}`)) m.citedCount++;
       if (rowMentionsAnyName(response, ownBrands)) m.mentionedCount++;
     });
 
@@ -4604,7 +4595,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                     <div className="absolute top-full right-0 mt-2 w-72 p-3 bg-gray-900 text-white text-xs rounded-lg shadow-xl opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 pointer-events-none z-10">
                       <div className="font-semibold mb-1">Citation Rate</div>
                       <div className="mb-2">Percentage of LLM responses that include a citation from your domain.</div>
-                      <div className="text-white/70 italic">Formula: (Responses with your domain citation / Total responses) × 100</div>
+                      <div className="text-white/70 italic">Formula: (Responses with your domain citation / Answered responses) × 100. Unanswered responses and responses to deleted prompts are not counted.</div>
                     </div>
                   </div>
                   <div className="text-3xl font-bold text-white mb-2">
@@ -4624,7 +4615,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                     <div className="absolute top-full right-0 mt-2 w-72 p-3 bg-gray-900 text-white text-xs rounded-lg shadow-xl opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 pointer-events-none z-10">
                       <div className="font-semibold mb-1">Mention Rate</div>
                       <div className="mb-2">Percentage of LLM responses that mention your brand name anywhere in the answer text.</div>
-                      <div className="text-white/70 italic">Formula: (Responses mentioning your brand / Total responses) × 100</div>
+                      <div className="text-white/70 italic">Formula: (Responses mentioning your brand / Answered responses) × 100. Unanswered responses and responses to deleted prompts are not counted.</div>
                     </div>
                   </div>
                   <div className="text-3xl font-bold text-white mb-2">
@@ -4698,6 +4689,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                     <div className="absolute top-full right-0 mt-2 w-80 p-3 bg-gray-900 text-white text-xs rounded-lg shadow-xl opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 pointer-events-none z-10">
                       <div className="font-semibold mb-1">Visibility Heatmap</div>
                       <div className="mb-2">Shows your Citation Rate and Mention Rate performance across different AI engines. Darker colors indicate better performance.</div>
+                      <div className="text-white/70 italic">Same base as the cards above: answered responses to the project's current prompts, so the columns add up to the card totals.</div>
                     </div>
                   </div>
                 </div>
